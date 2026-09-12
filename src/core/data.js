@@ -10,7 +10,8 @@
     if (!Data[kind]) Data[kind] = obj && obj.id ? {} : {};
     if (!obj || !obj.id) throw new Error('Data.define(' + kind + '): object needs an id');
     if (Data[kind][obj.id] && !obj.__override) AOW.warn('Data.define: duplicate id ' + kind + '/' + obj.id + ' (overriding)');
-    obj.kind = kind;
+    // registry name is stored separately: many schemas use `kind` for their own sub-type (buff/debuff, active/passive, combat/world…)
+    obj.registry = kind;
     Data[kind][obj.id] = obj;
     return obj;
   };

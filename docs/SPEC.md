@@ -222,6 +222,16 @@ Data.define('empireSkills', { id, name, desc, affinity, tier:1..4, cost:{imperiu
 Data.define('names', { id:'city_names_feudal', list:[…] }) etc.
 ```
 
+### 3.0 Canonical shared ids (foundation data — every other data file may reference these)
+Statuses (`src/data/statuses.js`): debuffs `burning, frozen, poisoned, blighted, weakened, sundered (def−), shattered (res−), marked, stunned, blinded, bleeding, condemned, cursed, slowed, rooted, demoralized, panicked, charmed, silenced, wet, electrified, distracted, corrupted, misfortune`;
+buffs `strengthened, hastened, shielded, blessed, regenerating, fortified, inspired, enraged, concealed, spirited, zeal, warded, stone_skin, flame_weapons, frost_weapons, lightning_weapons, blight_weapons, spirit_weapons, awakened, empowered, focused`.
+Generic abilities (`src/data/abilities.js`): `defend, first_strike, charge, pike_brace, shield_wall, retaliation, heal_wounds, rally, taunt, sprint, regeneration, phase_step, flying, floating, amphibious, swimming, fearless, fast_movement, forest_stalker, mountaineer, night_vision, true_sight, concealment, bulwark, magic_bolt_attack, siege_breaker, spellcaster, inspiring_presence, war_cry, bolster, cleanse, bless, mark_target, sneak_attack, backstab, trample, ferocious, life_steal, spirit_link, resurgence, undying, dragon_breath_fire, dragon_breath_frost, dragon_breath_lightning, dragon_breath_blight, giant_stomp, seismic_slam, web_shot, poison_spit, howl, hardened, lightning_rod, arcane_focus, ranged_expert, cavalry_charge, brace, guard, sturdy, elusive, immune_fire, immune_frost, immune_lightning, immune_blight, immune_spirit, immune_physical, weak_fire, weak_frost, weak_lightning, weak_blight, weak_spirit, chant_of_valor, dark_pact, soul_harvest, plague_carrier, entangle, root_strike, vine_whip, stone_throw, fire_bolt, frost_bolt, lightning_bolt, shadow_bolt, holy_bolt, blight_bolt`.
+Any data file may ADD extra statuses/abilities it needs — use ids prefixed by the owning content (e.g. `tome_pyromancy.searing_aura`, or `ab_<unit>_<name>`) to avoid collisions — but must not redefine the canonical ones.
+
+### 3.0.1 Spell `effect` vocabulary (the engine implements these generically; unknown `special` ids are ignored gracefully)
+Combat spells (kind 'combat', target 'enemy_unit'|'ally_unit'|'unit'|'hex'|'all_enemies'|'all_allies'): `{type:'damage', channel, amount, area:0|1|2, status:{id, chance:0..100, duration}}`, `{type:'heal', amount, cleanse:true}`, `{type:'status', status, duration, chance, area}`, `{type:'summon', unit, count}`, `{type:'teleport', range}`, `{type:'resurrect', hpPct}`, `{type:'dispel'}`, `{type:'push', distance}`, `{type:'special', id}`. Combat spells cost `{mana, cp}` where cp is combat casting points (a side has `combatCasting.cpMax` per battle round; default 10 per battle, +5/round).
+World spells: kind 'unit_enchant' `{enchant:{appliesTo:[tags|'all'|'racial'], effects:{...§3.1}, attackChannel:'fire', attackStatus:{id,chance}}}`, kind 'city_enchant' `{enchant:{effects:{...}}}` target 'city', kind 'summon' `{effect:{type:'summon', unit, count}}` target 'city' (arrives next to a city) or 'hex' (in domain), kind 'transform' `{effect:{type:'terraform', terrain, feature, radius}}` target 'province', kind 'strategic' target 'army'|'city'|'province'|'player'|'empire' with effect `{type:'heal'|'status'|'resource'|'reveal'|'stability'|'damage'|'special', ...}`, kind 'empire' (permanent passive) `{effects:{...§3.1}}`. Mana upkeep for enchantments in `upkeep.mana`.
+
 ### 3.1 `effects` vocabulary (used by traits, buildings, tome passives, empire skills, enchantments, items, hero skills)
 A flat object; the Rules engine sums all applicable effects. Supported keys (extend additively, document in
 `src/game/rules.js` `EFFECT_KEYS`):
@@ -296,8 +306,10 @@ Rules.unitStats(game, unit) → {hp, maxHp, def, res, attacks:[…], mp, morale,
 Rules.heroLevelUp(game, hero, skillId); Rules.equipItem(game, hero, itemId, slot)
 Rules.disband(game, unitId)
 Rules.victoryCheck(game) → null | {type, winner}
-Turn.endTurn(game)      // human ended turn → runs AI players (AI.playTurn), then Turn.beginTurn (income, growth, production, research, spells, healing, statuses, events)
+Turn.beginGame(game)    // called once after State.create: initial visibility, first-turn setup, initial notifications
+Turn.endTurn(game)      // human ended turn → runs AI players (AI.playTurn for each alive AI, each followed by its own upkeep), advances game.turn, then Turn.beginTurn for the human (income, growth, production, research, spells, healing, statuses, events, victory check). Must be synchronous and < 1.5 s on medium maps; battles involving the human player that the AI initiates are resolved via Combat.autoResolve unless `game.settings.manualDefense` is true, in which case they are queued into game.pendingBattles and Events 'battle:start' fires for the first one (UI handles the rest sequentially).
 Turn.beginTurn(game)
+Turn.processPlayer(game, pid)  // upkeep/income/growth for one player (used by endTurn for both human and AI)
 ```
 Constants live in `Rules.C` (all balance numbers) so they are tweakable: e.g. `C.ANNEX_BASE=40, C.OUTPOST_COST=100, C.CITY_TIERS=[1,4,8,14,22,32] (pop thresholds), C.UNITS_PER_ARMY=6, C.CP_BASE=20, C.RANK_XP=[0,15,40,80,140], C.RANK_BONUS={hp:+10%/rank...}`.
 
@@ -418,8 +430,30 @@ All SFX are synthesized (oscillators, noise bursts, filtered impulses, convoluti
 ## 10. UI contract (DOM)
 
 * Root: `<div id="app">` contains `<canvas id="world">`, `<canvas id="battle">` (hidden unless in battle), `<div id="ui">` overlay.
-* `UI.init()`, `UI.showScreen(name, params)`, `UI.closeScreen()`, `UI.tooltip(el, htmlOrFn)`, `UI.modal({title, body, buttons})`, `UI.toast(kind, text)`,
-  `UI.icon(name, size)` → `<img>` from `Icons.dataURL`, `UI.el(tag, attrs, children)` helper, `UI.refresh()` (re-render HUD from game state).
+* Core API (src/ui/ui.js — owns styles/main.css theme; other UI files add their own CSS via `UI.css(cssString)`):
+```
+UI.init()                                   // builds #ui skeleton: <div id="screen-layer"> (full-screen screens/modals), <div id="hud-layer"> (persistent HUD), <div id="toast-layer">, <div id="tooltip-layer">
+UI.el(tag, attrs, ...children)              // attrs: {class, id, style (string|object), onclick, html, text, title, dataset:{}, disabled}; children: string|Node|array|null; returns element
+UI.css(cssString)                           // append a <style> once per unique string
+UI.icon(name, size=20, params) → <img class="icon">   (from Icons.dataURL; falls back to an empty span if Icons is missing)
+UI.button(label, onClick, {icon, kind:'primary'|'default'|'danger'|'ghost'|'gold', disabled, tooltip, small}) → <button class="aow-btn …">
+UI.panel({title, subtitle, cls, body, closable, onClose, width}) → <div class="aow-panel"> ornate framed panel (title bar with gold filigree; body scrolls)
+UI.tooltip(el, contentHtmlOrFn)             // parchment tooltip on hover (fn returns html or Node; re-evaluated on show)
+UI.modal({title, body, buttons:[{label, onClick, kind}], closable:true, width}) → {el, close()}   // stacks; Esc closes topmost
+UI.confirm(text, onYes)                     // convenience modal
+UI.toast(kind:'info'|'warn'|'good'|'bad', text, {icon, onClick, timeout=5000}) // also handles Events 'notify'
+UI.registerScreen(name, {open(params)→Element, close(), refresh()})   // screens live in #screen-layer; 'hud' lives in #hud-layer and stays while others open on top
+UI.showScreen(name, params); UI.closeScreen(); UI.currentScreen(); UI.isOpen(name)
+UI.refresh()                                // refresh HUD + open screen from AOW.game
+UI.tick(dt)                                 // per-frame UI animation hook
+UI.selected = {armyId:null, cityId:null, unitId:null}  ; UI.select({armyId|cityId|null}) emits select:* events and tells WorldRender.setSelection
+UI.progressBar(value, max, {color, label, height}) → element ; UI.resource(kind, value, {signed}) → inline <span> icon+number ; UI.fmt(n) ; UI.fmtSigned(n)
+UI.unitCard(unitId|unitObj, {small, selected, onClick, showStats}) → element with portrait (UnitArt.portrait), name, tier, rank chevrons, hp bar, status icons — shared by HUD, city screen, battle UI
+UI.heroPortrait(heroId, size) ; UI.tomeIcon(tomeId, size) ; UI.spellRow(spellId, {onCast}) ; UI.buildingRow(buildingId, {onBuild}) ; UI.unitTypeRow(unitTypeId, {onRecruit, city})
+UI.lang() / UI.setLang(lang)                // proxies I18n and re-renders
+```
+* File ownership: `ui.js` (core + components + theme CSS + tooltip/modal/toast + 'settings' screen with audio/language sliders), `hud.js` (screen 'hud': top resource bar, turn/end-turn, selected army/city panel, minimap, notification stack, spell quick bar, next-unit, hotkeys), `menu.js` (screens 'menu', 'newgame', 'faction', 'load'), `screens.js` (screens 'city', 'research', 'spellbook', 'hero', 'empire', 'diplomacy', 'victory', 'encyclopedia'), `combat_ui.js` (screen 'battle': unit action bar, initiative list, spell casting, auto-resolve/retreat, battle end summary).
+* Every screen renders from `AOW.game` via Rules queries and mutates ONLY through Rules/Turn/Combat functions, then calls `UI.refresh()`.
 * Screens: `menu`, `newgame` (realm settings), `faction` (create ruler: type, name, form + body/mind traits, culture + sub-choice, society traits, starting tome, portrait preview), `city`, `research`, `spellbook`, `hero`, `empire` (affinity trees), `diplomacy`, `pantheon/settings`, `victory`.
 * HUD: top resource bar with income tooltips, turn counter, end-turn button (with "units still can move" warning), left: selected army panel (unit cards with portraits, hp, actions: move, defend, disband, split/merge, found outpost, annex, attack), right: minimap (canvas, clickable), bottom-right: notifications stack, bottom-left: spell quick-cast & research progress.
 * Keyboard: Enter/Space = end turn, Esc = close, N = next army, C = center capital, F5/F9 quick save/load (localStorage), M mute.
