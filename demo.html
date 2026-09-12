@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AOW art demo</title>
+<style>
+  body { margin: 0; background: #1b1f2a; color: #ddd; font: 13px system-ui; }
+  #bar { padding: 6px 10px; background: #0f121a; border-bottom: 1px solid #333; }
+  #bar a { color: #f1d98a; margin-right: 12px; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <a href="?module=terrain">terrain</a><a href="?module=structures">structures</a><a href="?module=units">units</a>
+  <a href="?module=vfx">vfx</a><a href="?module=icons">icons</a><a href="?module=combat">combat</a><a href="?module=world">world</a>
+  <span id="info"></span>
+</div>
+<canvas id="c" width="1600" height="1600"></canvas>
+<script src="src/core/util.js"></script>
+<script src="src/core/hex.js"></script>
+<script src="src/core/events.js"></script>
+<script src="src/core/i18n.js"></script>
+<script src="src/core/data.js"></script>
+<script src="src/art/art.js"></script>
+<script src="src/art/palette.js"></script>
+<script src="src/art/terrain.js"></script>
+<script src="src/art/structures.js"></script>
+<script src="src/art/units.js"></script>
+<script src="src/art/vfx.js"></script>
+<script src="src/art/icons.js"></script>
+<script src="src/data/terrains.js"></script>
+<script src="src/data/statuses.js"></script>
+<script src="src/data/abilities.js"></script>
+<script src="src/data/forms.js"></script>
+<script src="src/data/traits.js"></script>
+<script src="src/data/cultures.js"></script>
+<script src="src/data/buildings.js"></script>
+<script src="src/data/improvements.js"></script>
+<script src="src/data/units_cultures.js"></script>
+<script src="src/data/units_tomes.js"></script>
+<script src="src/data/units_wild.js"></script>
+<script src="src/data/spells_order_chaos.js"></script>
+<script src="src/data/spells_nature_materium.js"></script>
+<script src="src/data/spells_astral_shadow.js"></script>
+<script src="src/data/tomes.js"></script>
+<script src="src/data/heroes.js"></script>
+<script src="src/data/items.js"></script>
+<script src="src/data/wonders.js"></script>
+<script src="src/data/empire.js"></script>
+<script src="src/data/names.js"></script>
+<script src="src/game/state.js"></script>
+<script src="src/game/worldgen.js"></script>
+<script src="src/game/rules.js"></script>
+<script src="src/game/turn.js"></script>
+<script src="src/game/combat.js"></script>
+<script src="src/game/diplomacy.js"></script>
+<script src="src/game/ai.js"></script>
+<script src="src/render/world_render.js"></script>
+<script src="src/render/combat_render.js"></script>
+<script>
+  // demo.html?module=<terrain|structures|units|vfx|icons|combat|world>  → calls AOW.<Module>.demo(canvas)
+  (function () {
+    const q = new URLSearchParams(location.search);
+    const mod = q.get('module') || 'terrain';
+    const map = { terrain: 'TerrainArt', structures: 'StructArt', units: 'UnitArt', vfx: 'VFX', icons: 'Icons', combat: 'CombatRender', world: 'WorldRender' };
+    const name = map[mod] || mod;
+    const cv = document.getElementById('c');
+    const info = document.getElementById('info');
+    const M = AOW[name];
+    if (!M || typeof M.demo !== 'function') { info.textContent = 'no demo for ' + name; return; }
+    try { const r = M.demo(cv, q); info.textContent = name + '.demo ok ' + (r || ''); }
+    catch (e) { info.textContent = 'demo error: ' + e.message; console.error(e); }
+  })();
+</script>
+</body>
+</html>

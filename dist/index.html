@@ -1,0 +1,1340 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Age of Godir — 신들의 시대</title>
+<style>
+/* styles/main.css — base layout; UI modules append their own styles via UI.css() or here */
+:root {
+  --bg: #151a26; --bg2: #1e2536; --bg3: #262f45; --gold: #c9a24a; --gold-light: #f1d98a; --gold-dark: #8a6a24;
+  --parchment: #efe3c6; --parchment2: #e2d1a8; --ink: #2b2116; --text: #e8e2d0; --text-dim: #a49c88; --accent: #5a7ff0;
+  --danger: #d94b3a; --good: #5fb043; --warn: #e0a72b; --border: rgba(201,162,74,0.55);
+  --font-title: "Cinzel", "Noto Serif KR", "Nanum Myeongjo", Georgia, serif;
+  --font-body: "Noto Sans KR", "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0b0e15; color: var(--text); font: 14px/1.4 var(--font-body); }
+#app { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
+#world, #battle { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+#battle[hidden] { display: none; }
+#ui { position: absolute; inset: 0; pointer-events: none; }
+#ui > * { pointer-events: auto; }
+* { box-sizing: border-box; }
+button { font-family: inherit; }
+::selection { background: rgba(201,162,74,0.35); }
+
+</style>
+</head>
+<body>
+<div id="app">
+  <canvas id="world"></canvas>
+  <canvas id="battle" hidden></canvas>
+  <div id="ui"></div>
+</div>
+<!-- core -->
+<script>
+// ==== src/core/util.js
+// src/core/util.js — RNG, noise, math and color helpers shared by every module
+(function (AOW) {
+  'use strict';
+
+  const DEBUG = { enabled: false };
+  AOW.log = function () { if (DEBUG.enabled) console.log.apply(console, arguments); };
+  AOW.warn = function () { console.warn.apply(console, arguments); };
+  AOW.DEBUG = DEBUG;
+
+  // ---------------------------------------------------------------- hashing
+  function hashString(str) {
+    // cyrb53-ish 32-bit hash
+    let h1 = 0xdeadbeef ^ 0x9e3779b9, h2 = 0x41c6ce57 ^ 0x85ebca6b;
+    for (let i = 0; i < str.length; i++) {
+      const ch = str.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0) ^ (h1 >>> 0);
+  }
+  function toSeed(seed) {
+    if (typeof seed === 'number') return seed >>> 0;
+    if (seed === undefined || seed === null) return 1;
+    return hashString(String(seed));
+  }
+
+  // ---------------------------------------------------------------- RNG
+  class RNG {
+    constructor(seed) {
+      this.seed = toSeed(seed);
+      this.s = this.seed || 0x1234567;
+    }
+    next() {
+      // mulberry32
+      let t = (this.s += 0x6D2B79F5) >>> 0;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+    float(min, max) { return min + (max - min) * this.next(); }
+    int(min, max) { return min + Math.floor(this.next() * (max - min + 1)); }
+    pick(arr) { return arr[Math.floor(this.next() * arr.length)]; }
+    chance(p) { return this.next() < p; }
+    shuffle(arr) {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(this.next() * (i + 1));
+        const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+      }
+      return arr;
+    }
+    weighted(items, weightFn) {
+      let total = 0;
+      for (const it of items) total += weightFn(it);
+      let r = this.next() * total;
+      for (const it of items) { r -= weightFn(it); if (r <= 0) return it; }
+      return items[items.length - 1];
+    }
+    gauss(mean = 0, sd = 1) {
+      const u = 1 - this.next(), v = this.next();
+      return mean + sd * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+    fork(label) { return new RNG(hashString(this.seed + ':' + label + ':' + Math.floor(this.next() * 1e9))); }
+    state() { return this.s; }
+    setState(s) { this.s = s >>> 0; }
+  }
+  AOW.RNG = RNG;
+  AOW.hashString = hashString;
+
+  // ---------------------------------------------------------------- Noise (2D simplex + fbm)
+  const permCache = new Map();
+  function permFor(seed) {
+    const key = toSeed(seed);
+    let p = permCache.get(key);
+    if (p) return p;
+    const rng = new RNG(key);
+    const base = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) base[i] = i;
+    for (let i = 255; i > 0; i--) { const j = Math.floor(rng.next() * (i + 1)); const t = base[i]; base[i] = base[j]; base[j] = t; }
+    p = new Uint8Array(512);
+    for (let i = 0; i < 512; i++) p[i] = base[i & 255];
+    if (permCache.size > 64) permCache.clear();
+    permCache.set(key, p);
+    return p;
+  }
+  const GRAD = [[1, 1], [-1, 1], [1, -1], [-1, -1], [1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]];
+  const F2 = 0.5 * (Math.sqrt(3) - 1), G2 = (3 - Math.sqrt(3)) / 6;
+  function simplex2(xin, yin, seed) {
+    const p = permFor(seed);
+    const s = (xin + yin) * F2;
+    const i = Math.floor(xin + s), j = Math.floor(yin + s);
+    const t = (i + j) * G2;
+    const x0 = xin - (i - t), y0 = yin - (j - t);
+    let i1, j1;
+    if (x0 > y0) { i1 = 1; j1 = 0; } else { i1 = 0; j1 = 1; }
+    const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+    const x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2;
+    const ii = i & 255, jj = j & 255;
+    const gi0 = p[ii + p[jj]] % 12, gi1 = p[ii + i1 + p[jj + j1]] % 12, gi2 = p[ii + 1 + p[jj + 1]] % 12;
+    let n0 = 0, n1 = 0, n2 = 0;
+    let t0 = 0.5 - x0 * x0 - y0 * y0;
+    if (t0 >= 0) { t0 *= t0; n0 = t0 * t0 * (GRAD[gi0][0] * x0 + GRAD[gi0][1] * y0); }
+    let t1 = 0.5 - x1 * x1 - y1 * y1;
+    if (t1 >= 0) { t1 *= t1; n1 = t1 * t1 * (GRAD[gi1][0] * x1 + GRAD[gi1][1] * y1); }
+    let t2 = 0.5 - x2 * x2 - y2 * y2;
+    if (t2 >= 0) { t2 *= t2; n2 = t2 * t2 * (GRAD[gi2][0] * x2 + GRAD[gi2][1] * y2); }
+    return 70 * (n0 + n1 + n2);
+  }
+  function fbm2(x, y, seed, octaves = 4, lacunarity = 2, gain = 0.5) {
+    let amp = 1, freq = 1, sum = 0, norm = 0;
+    for (let o = 0; o < octaves; o++) {
+      sum += amp * simplex2(x * freq, y * freq, seed + o * 1013);
+      norm += amp; amp *= gain; freq *= lacunarity;
+    }
+    return sum / norm;
+  }
+  // cheap value noise for texture fills
+  function value2(x, y, seed) {
+    const xi = Math.floor(x), yi = Math.floor(y);
+    const xf = x - xi, yf = y - yi;
+    const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+    const h = (a, b) => AOW.M.hash2(a + seed * 131, b + seed * 71);
+    const a = h(xi, yi), b = h(xi + 1, yi), c = h(xi, yi + 1), d = h(xi + 1, yi + 1);
+    return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+  }
+  AOW.Noise = { simplex2, fbm2, value2 };
+
+  // ---------------------------------------------------------------- Math
+  const M = {
+    clamp: (v, a, b) => v < a ? a : v > b ? b : v,
+    lerp: (a, b, t) => a + (b - a) * t,
+    smoothstep: (a, b, x) => { const t = M.clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); },
+    mod: (a, n) => ((a % n) + n) % n,
+    dist: (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1),
+    angle: (x1, y1, x2, y2) => Math.atan2(y2 - y1, x2 - x1),
+    easeInOut: t => t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t,
+    easeOut: t => 1 - (1 - t) * (1 - t),
+    easeIn: t => t * t,
+    hashInt: i => { i = Math.imul(i ^ (i >>> 16), 0x45d9f3b); i = Math.imul(i ^ (i >>> 16), 0x45d9f3b); i ^= i >>> 16; return (i >>> 0) / 4294967296; },
+    hash2: (x, y) => { let h = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263); h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; },
+    round: (v, d = 0) => { const p = Math.pow(10, d); return Math.round(v * p) / p; },
+    sign: v => v < 0 ? -1 : v > 0 ? 1 : 0,
+    TAU: Math.PI * 2,
+  };
+  AOW.M = M;
+
+  // ---------------------------------------------------------------- Color
+  function parse(c) {
+    if (Array.isArray(c)) return c.length === 3 ? [c[0], c[1], c[2], 1] : c.slice();
+    if (typeof c !== 'string') return [0, 0, 0, 1];
+    c = c.trim();
+    if (c[0] === '#') {
+      if (c.length === 4) return [parseInt(c[1] + c[1], 16), parseInt(c[2] + c[2], 16), parseInt(c[3] + c[3], 16), 1];
+      if (c.length === 7) return [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16), 1];
+      if (c.length === 9) return [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16), parseInt(c.slice(7, 9), 16) / 255];
+    }
+    const m = c.match(/rgba?\(([^)]+)\)/);
+    if (m) { const p = m[1].split(',').map(s => parseFloat(s)); return [p[0], p[1], p[2], p.length > 3 ? p[3] : 1]; }
+    const h = c.match(/hsla?\(([^)]+)\)/);
+    if (h) { const p = h[1].split(',').map(s => parseFloat(s)); return hslToRgb(p[0], p[1] / 100, p[2] / 100, p.length > 3 ? p[3] : 1); }
+    return [0, 0, 0, 1];
+  }
+  function hslToRgb(h, s, l, a = 1) {
+    h = M.mod(h, 360) / 360;
+    let r, g, b;
+    if (s === 0) { r = g = b = l; } else {
+      const q = l < 0.5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
+      const hue = (p, q, t) => { if (t < 0) t += 1; if (t > 1) t -= 1; if (t < 1 / 6) return p + (q - p) * 6 * t; if (t < 1 / 2) return q; if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6; return p; };
+      r = hue(p, q, h + 1 / 3); g = hue(p, q, h); b = hue(p, q, h - 1 / 3);
+    }
+    return [r * 255, g * 255, b * 255, a];
+  }
+  function rgbToHsl(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    let h = 0, s = 0; const l = (max + min) / 2;
+    if (max !== min) {
+      const d = max - min;
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      switch (max) {
+        case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+        case g: h = (b - r) / d + 2; break;
+        default: h = (r - g) / d + 4;
+      }
+      h *= 60;
+    }
+    return [h, s, l];
+  }
+  function toCss(c) {
+    const r = Math.round(M.clamp(c[0], 0, 255)), g = Math.round(M.clamp(c[1], 0, 255)), b = Math.round(M.clamp(c[2], 0, 255));
+    const a = c.length > 3 ? M.clamp(c[3], 0, 1) : 1;
+    return a >= 1 ? `rgb(${r},${g},${b})` : `rgba(${r},${g},${b},${M.round(a, 3)})`;
+  }
+  const Color = {
+    parse, toCss, hslToRgb, rgbToHsl,
+    hsl: (h, s, l, a = 1) => toCss(hslToRgb(h, s / 100, l / 100, a)),
+    mix: (c1, c2, t) => { const a = parse(c1), b = parse(c2); return toCss([M.lerp(a[0], b[0], t), M.lerp(a[1], b[1], t), M.lerp(a[2], b[2], t), M.lerp(a[3], b[3], t)]); },
+    shade: (c, amt) => { const p = parse(c); const t = amt < 0 ? 0 : 255; const k = Math.abs(amt); return toCss([M.lerp(p[0], t, k), M.lerp(p[1], t, k), M.lerp(p[2], t, k), p[3]]); },
+    saturate: (c, amt) => { const p = parse(c); const [h, s, l] = rgbToHsl(p[0], p[1], p[2]); return toCss(hslToRgb(h, M.clamp(s + amt, 0, 1), l, p[3])); },
+    hueShift: (c, deg) => { const p = parse(c); const [h, s, l] = rgbToHsl(p[0], p[1], p[2]); return toCss(hslToRgb(h + deg, s, l, p[3])); },
+    lighten: (c, amt) => { const p = parse(c); const [h, s, l] = rgbToHsl(p[0], p[1], p[2]); return toCss(hslToRgb(h, s, M.clamp(l + amt, 0, 1), p[3])); },
+    alpha: (c, a) => { const p = parse(c); return toCss([p[0], p[1], p[2], a]); },
+    luminance: c => { const p = parse(c); return (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]) / 255; },
+    hex: c => { const p = parse(c); return '#' + [p[0], p[1], p[2]].map(v => Math.round(M.clamp(v, 0, 255)).toString(16).padStart(2, '0')).join(''); },
+  };
+  AOW.Color = Color;
+
+  // ---------------------------------------------------------------- misc helpers
+  AOW.deepClone = obj => JSON.parse(JSON.stringify(obj));
+  AOW.assign = Object.assign;
+  AOW.sum = (arr, fn) => arr.reduce((s, x) => s + (fn ? fn(x) : x), 0);
+  AOW.uniq = arr => Array.from(new Set(arr));
+  AOW.range = n => Array.from({ length: n }, (_, i) => i);
+  AOW.pad = (n, w = 2) => String(n).padStart(w, '0');
+  AOW.fmt = n => (Math.round(n * 10) / 10).toString();
+  AOW.signed = n => (n > 0 ? '+' : '') + AOW.fmt(n);
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/core/hex.js
+// src/core/hex.js — pointy-top hex geometry, odd-r offset storage, neighbors, A* pathfinding
+(function (AOW) {
+  'use strict';
+  const SIZE = 36;
+  const SQRT3 = Math.sqrt(3);
+  const Hex = {
+    SIZE,
+    W: SQRT3 * SIZE,
+    H: 2 * SIZE,
+    ROW_H: 1.5 * SIZE,
+    // direction order: 0=E,1=SE,2=SW,3=W,4=NW,5=NE (clockwise from east)
+    DIRS: 6,
+  };
+
+  // odd-r offset: odd rows are shifted right by half a hex
+  Hex.toPixel = function (col, row) {
+    const x = SQRT3 * SIZE * (col + 0.5 * (row & 1)) + Hex.W * 0.5;
+    const y = 1.5 * SIZE * row + SIZE;
+    return { x, y };
+  };
+  Hex.toCube = function (col, row) {
+    const x = col - (row - (row & 1)) / 2;
+    const z = row;
+    return { x, y: -x - z, z };
+  };
+  Hex.fromCube = function (x, y, z) {
+    const row = z;
+    const col = x + (z - (z & 1)) / 2;
+    return { col, row };
+  };
+  function cubeRound(x, y, z) {
+    let rx = Math.round(x), ry = Math.round(y), rz = Math.round(z);
+    const dx = Math.abs(rx - x), dy = Math.abs(ry - y), dz = Math.abs(rz - z);
+    if (dx > dy && dx > dz) rx = -ry - rz;
+    else if (dy > dz) ry = -rx - rz;
+    else rz = -rx - ry;
+    return { x: rx, y: ry, z: rz };
+  }
+  Hex.fromPixel = function (px, py) {
+    const x = px - Hex.W * 0.5, y = py - SIZE;
+    const q = (SQRT3 / 3 * x - 1 / 3 * y) / SIZE;
+    const r = (2 / 3 * y) / SIZE;
+    const c = cubeRound(q, -q - r, r);
+    return Hex.fromCube(c.x, c.y, c.z);
+  };
+  Hex.corners = function (cx, cy, size = SIZE) {
+    const pts = [];
+    for (let i = 0; i < 6; i++) {
+      const a = Math.PI / 180 * (60 * i - 90);
+      pts.push({ x: cx + size * Math.cos(a), y: cy + size * Math.sin(a) });
+    }
+    return pts;
+  };
+  // edge toward direction d is between corners (d+1)%6 and (d+2)%6 (top corner is index 0, clockwise)
+  Hex.edgeCorners = function (cx, cy, d, size = SIZE) {
+    const c = Hex.corners(cx, cy, size);
+    return [c[(d + 1) % 6], c[(d + 2) % 6]];
+  };
+  Hex.edgeMid = function (cx, cy, d, size = SIZE) {
+    const a = Math.PI / 180 * (60 * d);
+    const r = size * SQRT3 / 2;
+    return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
+  };
+
+  const ODD = [[1, 0], [1, 1], [0, 1], [-1, 0], [0, -1], [1, -1]];   // E,SE,SW,W,NW,NE for odd rows
+  const EVEN = [[1, 0], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1]]; // for even rows
+  Hex.neighbor = function (col, row, d) {
+    const o = (row & 1) ? ODD[d] : EVEN[d];
+    return { col: col + o[0], row: row + o[1] };
+  };
+  Hex.neighbors = function (col, row) {
+    const out = [];
+    for (let d = 0; d < 6; d++) out.push(Hex.neighbor(col, row, d));
+    return out;
+  };
+  Hex.opposite = d => (d + 3) % 6;
+  Hex.idx = (col, row, W) => row * W + col;
+  Hex.col = (idx, W) => idx % W;
+  Hex.row = (idx, W) => Math.floor(idx / W);
+  Hex.inBounds = (col, row, W, H) => col >= 0 && row >= 0 && col < W && row < H;
+  Hex.neighborIdx = function (idx, d, W, H) {
+    const n = Hex.neighbor(idx % W, Math.floor(idx / W), d);
+    return Hex.inBounds(n.col, n.row, W, H) ? n.row * W + n.col : -1;
+  };
+  Hex.neighborsIdx = function (idx, W, H) {
+    const out = [];
+    for (let d = 0; d < 6; d++) { const n = Hex.neighborIdx(idx, d, W, H); if (n >= 0) out.push(n); }
+    return out;
+  };
+  Hex.dist = function (c1, r1, c2, r2) {
+    const a = Hex.toCube(c1, r1), b = Hex.toCube(c2, r2);
+    return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y), Math.abs(a.z - b.z));
+  };
+  Hex.distIdx = function (i, j, W) {
+    return Hex.dist(i % W, Math.floor(i / W), j % W, Math.floor(j / W));
+  };
+  Hex.dirTo = function (c1, r1, c2, r2) {
+    // direction (0-5) from hex1 toward hex2 (approximate for non-adjacent)
+    const a = Hex.toPixel(c1, r1), b = Hex.toPixel(c2, r2);
+    let ang = Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+    ang = ((ang % 360) + 360) % 360;
+    return Math.round(ang / 60) % 6;
+  };
+  Hex.ring = function (col, row, radius) {
+    if (radius === 0) return [{ col, row }];
+    const out = [];
+    let c = Hex.toCube(col, row);
+    // move to the start: radius steps in direction 4 (NW)
+    let cur = { col, row };
+    for (let i = 0; i < radius; i++) cur = Hex.neighbor(cur.col, cur.row, 4);
+    for (let d = 0; d < 6; d++) {
+      for (let i = 0; i < radius; i++) {
+        out.push({ col: cur.col, row: cur.row });
+        cur = Hex.neighbor(cur.col, cur.row, d);
+      }
+    }
+    return out;
+  };
+  Hex.spiral = function (col, row, radius) {
+    let out = [{ col, row }];
+    for (let r = 1; r <= radius; r++) out = out.concat(Hex.ring(col, row, r));
+    return out;
+  };
+  Hex.spiralIdx = function (idx, radius, W, H) {
+    return Hex.spiral(idx % W, Math.floor(idx / W), radius).filter(h => Hex.inBounds(h.col, h.row, W, H)).map(h => h.row * W + h.col);
+  };
+  Hex.ringIdx = function (idx, radius, W, H) {
+    return Hex.ring(idx % W, Math.floor(idx / W), radius).filter(h => Hex.inBounds(h.col, h.row, W, H)).map(h => h.row * W + h.col);
+  };
+  Hex.line = function (c1, r1, c2, r2) {
+    const a = Hex.toCube(c1, r1), b = Hex.toCube(c2, r2);
+    const n = Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y), Math.abs(a.z - b.z));
+    const out = [];
+    for (let i = 0; i <= n; i++) {
+      const t = n === 0 ? 0 : i / n;
+      const c = cubeRound(a.x + (b.x - a.x) * t + 1e-6, a.y + (b.y - a.y) * t + 1e-6, a.z + (b.z - a.z) * t - 2e-6);
+      out.push(Hex.fromCube(c.x, c.y, c.z));
+    }
+    return out;
+  };
+  Hex.lineIdx = function (i, j, W) {
+    return Hex.line(i % W, Math.floor(i / W), j % W, Math.floor(j / W)).map(h => h.row * W + h.col);
+  };
+
+  // ------------------------------------------------------------ binary heap
+  class Heap {
+    constructor() { this.a = []; }
+    push(item, pri) {
+      const a = this.a; a.push({ item, pri });
+      let i = a.length - 1;
+      while (i > 0) { const p = (i - 1) >> 1; if (a[p].pri <= a[i].pri) break; const t = a[p]; a[p] = a[i]; a[i] = t; i = p; }
+    }
+    pop() {
+      const a = this.a; if (!a.length) return undefined;
+      const top = a[0]; const last = a.pop();
+      if (a.length) {
+        a[0] = last; let i = 0;
+        for (;;) {
+          const l = 2 * i + 1, r = l + 1; let m = i;
+          if (l < a.length && a[l].pri < a[m].pri) m = l;
+          if (r < a.length && a[r].pri < a[m].pri) m = r;
+          if (m === i) break;
+          const t = a[m]; a[m] = a[i]; a[i] = t; i = m;
+        }
+      }
+      return top.item;
+    }
+    get size() { return this.a.length; }
+  }
+  Hex.Heap = Heap;
+
+  /**
+   * A* over hex indices. costFn(fromIdx, toIdx) returns move cost or Infinity.
+   * opts.maxCost: abort if best path exceeds; opts.heuristicWeight (default 1) ; opts.allowGoalBlocked: treat goal as enterable even if costFn is Infinity (for attacking)
+   * returns {path:[idx...], cost} or null
+   */
+  Hex.astar = function (start, goal, W, H, costFn, opts = {}) {
+    if (start === goal) return { path: [], cost: 0 };
+    const hw = opts.heuristicWeight || 1;
+    const maxCost = opts.maxCost || Infinity;
+    const gScore = new Map(); gScore.set(start, 0);
+    const came = new Map();
+    const open = new Heap();
+    open.push(start, 0);
+    const closed = new Set();
+    const gc = goal % W, gr = Math.floor(goal / W);
+    let guard = 0;
+    while (open.size) {
+      const cur = open.pop();
+      if (cur === goal) {
+        const path = []; let n = goal;
+        while (n !== start) { path.push(n); n = came.get(n); }
+        path.reverse();
+        return { path, cost: gScore.get(goal) };
+      }
+      if (closed.has(cur)) continue;
+      closed.add(cur);
+      if (++guard > 200000) break;
+      const gcur = gScore.get(cur);
+      for (let d = 0; d < 6; d++) {
+        const n = Hex.neighborIdx(cur, d, W, H);
+        if (n < 0 || closed.has(n)) continue;
+        let c = costFn(cur, n);
+        if (!isFinite(c)) { if (opts.allowGoalBlocked && n === goal) c = 1; else continue; }
+        const g = gcur + c;
+        if (g > maxCost) continue;
+        if (g < (gScore.has(n) ? gScore.get(n) : Infinity)) {
+          gScore.set(n, g); came.set(n, cur);
+          const h = Hex.dist(n % W, Math.floor(n / W), gc, gr) * hw;
+          open.push(n, g + h);
+        }
+      }
+    }
+    return null;
+  };
+
+  /** Dijkstra flood within budget. returns Map(idx -> cost) including start (0) */
+  Hex.reachable = function (start, W, H, budget, costFn) {
+    const dist = new Map(); dist.set(start, 0);
+    const open = new Heap(); open.push(start, 0);
+    while (open.size) {
+      const cur = open.pop();
+      const dc = dist.get(cur);
+      for (let d = 0; d < 6; d++) {
+        const n = Hex.neighborIdx(cur, d, W, H);
+        if (n < 0) continue;
+        const c = costFn(cur, n);
+        if (!isFinite(c)) continue;
+        const g = dc + c;
+        if (g > budget) continue;
+        if (g < (dist.has(n) ? dist.get(n) : Infinity)) { dist.set(n, g); open.push(n, g); }
+      }
+    }
+    return dist;
+  };
+
+  AOW.Hex = Hex;
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/core/events.js
+// src/core/events.js — tiny synchronous event bus
+(function (AOW) {
+  'use strict';
+  const listeners = new Map();
+  const Events = {
+    on(name, fn) {
+      if (!listeners.has(name)) listeners.set(name, []);
+      listeners.get(name).push(fn);
+      return () => Events.off(name, fn);
+    },
+    once(name, fn) {
+      const off = Events.on(name, (p) => { off(); fn(p); });
+      return off;
+    },
+    off(name, fn) {
+      const arr = listeners.get(name);
+      if (!arr) return;
+      const i = arr.indexOf(fn);
+      if (i >= 0) arr.splice(i, 1);
+    },
+    emit(name, payload) {
+      const arr = listeners.get(name);
+      if (arr) {
+        for (const fn of arr.slice()) {
+          try { fn(payload); } catch (e) { console.error('[Events]', name, e); }
+        }
+      }
+      const any = listeners.get('*');
+      if (any) for (const fn of any.slice()) { try { fn(name, payload); } catch (e) { console.error(e); } }
+    },
+    clear() { listeners.clear(); },
+  };
+  AOW.Events = Events;
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/core/i18n.js
+// src/core/i18n.js — bilingual (ko default / en) string tables
+(function (AOW) {
+  'use strict';
+  const dict = { ko: {}, en: {} };
+  const I18n = {
+    lang: 'ko',
+    add(tables) {
+      for (const lang of Object.keys(tables)) {
+        if (!dict[lang]) dict[lang] = {};
+        Object.assign(dict[lang], tables[lang]);
+      }
+    },
+    has(key) { return key in dict[I18n.lang] || key in dict.en; },
+    setLang(lang) {
+      if (!dict[lang]) return;
+      I18n.lang = lang;
+      try { localStorage.setItem('aow.lang', lang); } catch (e) { /* ignore */ }
+      if (AOW.Events) AOW.Events.emit('i18n:changed', { lang });
+    },
+    dict,
+  };
+  try { const saved = localStorage.getItem('aow.lang'); if (saved && (saved === 'ko' || saved === 'en')) I18n.lang = saved; } catch (e) { /* ignore */ }
+
+  AOW.t = function (key, params) {
+    let s = dict[I18n.lang][key];
+    if (s === undefined) s = dict.en[key];
+    if (s === undefined) s = key;
+    if (params) s = s.replace(/\{(\w+)\}/g, (m, k) => (params[k] !== undefined ? params[k] : m));
+    return s;
+  };
+  AOW.L = function (obj, params) {
+    if (obj == null) return '';
+    if (typeof obj === 'string') return AOW.t(obj, params);
+    let s = obj[I18n.lang] || obj.en || obj.ko || '';
+    if (params) s = s.replace(/\{(\w+)\}/g, (m, k) => (params[k] !== undefined ? params[k] : m));
+    return s;
+  };
+  AOW.I18n = I18n;
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/core/data.js
+// src/core/data.js — content registry with cross-reference validation
+(function (AOW) {
+  'use strict';
+  const KINDS = ['forms', 'cultures', 'traits', 'buildings', 'improvements', 'abilities', 'statuses', 'units', 'tomes', 'spells',
+    'heroSkills', 'heroClasses', 'items', 'wonders', 'names', 'empireSkills', 'rulerTypes', 'terrains', 'features', 'realmTraits', 'transformations'];
+  const Data = {};
+  for (const k of KINDS) Data[k] = {};
+
+  Data.define = function (kind, obj) {
+    if (!Data[kind]) Data[kind] = obj && obj.id ? {} : {};
+    if (!obj || !obj.id) throw new Error('Data.define(' + kind + '): object needs an id');
+    if (Data[kind][obj.id] && !obj.__override) AOW.warn('Data.define: duplicate id ' + kind + '/' + obj.id + ' (overriding)');
+    obj.kind = kind;
+    Data[kind][obj.id] = obj;
+    return obj;
+  };
+  Data.defineAll = function (kind, list) { for (const o of list) Data.define(kind, o); };
+  Data.list = function (kind) { return Object.values(Data[kind] || {}); };
+  Data.has = function (kind, id) { return !!(Data[kind] && Data[kind][id]); };
+  Data.get = function (kind, id) {
+    const o = Data[kind] && Data[kind][id];
+    if (!o) throw new Error('Data.get: missing ' + kind + '/' + id);
+    return o;
+  };
+  Data.find = function (kind, pred) { return Data.list(kind).filter(pred); };
+  Data.KINDS = KINDS;
+
+  const LANG_OBJ = o => o && typeof o === 'object' && (o.ko || o.en);
+
+  Data.validate = function () {
+    const errors = [];
+    const err = (s) => errors.push(s);
+    const ref = (kind, id, ctx) => { if (id && !Data.has(kind, id)) err(ctx + ': missing ' + kind + '/' + id); };
+    for (const kind of KINDS) {
+      for (const o of Data.list(kind)) {
+        if (kind !== 'names' && o.name !== undefined && !LANG_OBJ(o.name)) err(kind + '/' + o.id + ': name must be {ko,en}');
+      }
+    }
+    for (const c of Data.list('cultures')) {
+      for (const u of c.units || []) ref('units', u, 'cultures/' + c.id + '.units');
+      for (const b of c.buildings || []) ref('buildings', b, 'cultures/' + c.id + '.buildings');
+    }
+    for (const u of Data.list('units')) {
+      for (const a of u.abilities || []) ref('abilities', a, 'units/' + u.id + '.abilities');
+      for (const a of u.passives || []) ref('abilities', a, 'units/' + u.id + '.passives');
+      if (!u.attacks || !u.attacks.length) if (!(u.tags || []).includes('noncombat')) err('units/' + u.id + ': needs at least one attack');
+      for (const at of u.attacks || []) for (const e of at.effects || []) ref('statuses', e.status, 'units/' + u.id + '.attacks');
+      if (!u.look) err('units/' + u.id + ': missing look');
+      if (!(u.tier >= 1 && u.tier <= 5)) err('units/' + u.id + ': bad tier');
+    }
+    for (const t of Data.list('tomes')) {
+      for (const c of t.contents || []) {
+        const kindMap = { spell: 'spells', unit: 'units', improvement: 'improvements', skill: 'heroSkills', transformation: 'transformations', empire: 'empireSkills', building: 'buildings' };
+        const k = kindMap[c.type];
+        if (!k) err('tomes/' + t.id + ': bad content type ' + c.type);
+        else ref(k, c.id, 'tomes/' + t.id + '.contents');
+      }
+    }
+    for (const s of Data.list('spells')) {
+      if (!s.kind) err('spells/' + s.id + ': missing kind');
+      if (!s.cost) err('spells/' + s.id + ': missing cost');
+    }
+    for (const a of Data.list('abilities')) {
+      if (a.effect && a.effect.status) ref('statuses', a.effect.status, 'abilities/' + a.id);
+    }
+    for (const h of Data.list('heroSkills')) {
+      if (h.ability) ref('abilities', h.ability, 'heroSkills/' + h.id);
+      for (const p of h.prereq || []) ref('heroSkills', p, 'heroSkills/' + h.id + '.prereq');
+    }
+    for (const w of Data.list('wonders')) {
+      for (const u of (w.guard && w.guard.pool) || []) ref('units', u, 'wonders/' + w.id + '.guard');
+    }
+    for (const b of Data.list('buildings')) for (const p of b.prereq || []) ref('buildings', p, 'buildings/' + b.id + '.prereq');
+    for (const e of Data.list('empireSkills')) for (const p of e.prereq || []) ref('empireSkills', p, 'empireSkills/' + e.id + '.prereq');
+    return errors;
+  };
+
+  AOW.Data = Data;
+})(window.AOW = window.AOW || {});
+
+</script>
+<!-- art -->
+<script>
+// ==== src/art/art.js
+// src/art/art.js — sprite cache and shared procedural drawing helpers
+(function (AOW) {
+  'use strict';
+  const Art = {};
+  const generators = new Map();
+  const cache = new Map();
+  let cacheCount = 0;
+  const MAX_CACHE = 6000;
+
+  Art.canvas = function (w, h) {
+    const cv = document.createElement('canvas');
+    cv.width = Math.max(1, Math.ceil(w)); cv.height = Math.max(1, Math.ceil(h));
+    const ctx = cv.getContext('2d');
+    return { cv, ctx };
+  };
+
+  /** register a sprite generator */
+  Art.sprite = function (key, w, h, drawFn, opts = {}) {
+    generators.set(key, { w, h, drawFn, anchor: opts.anchor || { x: 0.5, y: 1 }, sizeFn: opts.sizeFn || null });
+  };
+  Art.has = key => generators.has(key);
+
+  function paramKey(params) {
+    if (!params) return '';
+    if (typeof params === 'string' || typeof params === 'number') return String(params);
+    try { return JSON.stringify(params); } catch (e) { return String(params); }
+  }
+
+  /** get (and cache) a rendered sprite canvas. returns {cv, w, h, ax, ay} */
+  Art.get = function (key, params) {
+    const g = generators.get(key);
+    if (!g) throw new Error('Art.get: unknown sprite ' + key);
+    const ck = key + '|' + paramKey(params);
+    let e = cache.get(ck);
+    if (e) return e;
+    let w = g.w, h = g.h;
+    if (g.sizeFn) { const s = g.sizeFn(params || {}); w = s.w; h = s.h; }
+    const { cv, ctx } = Art.canvas(w, h);
+    ctx.save();
+    try { g.drawFn(ctx, w, h, params || {}); } catch (err) { console.error('Art sprite failed: ' + key, err); }
+    ctx.restore();
+    e = { cv, w, h, ax: g.anchor.x * w, ay: g.anchor.y * h };
+    if (cacheCount > MAX_CACHE) { cache.clear(); cacheCount = 0; }
+    cache.set(ck, e); cacheCount++;
+    return e;
+  };
+  Art.clearCache = function (prefix) {
+    if (!prefix) { cache.clear(); cacheCount = 0; return; }
+    for (const k of Array.from(cache.keys())) if (k.startsWith(prefix)) cache.delete(k);
+  };
+
+  /** draw a sprite with its anchor at (x,y) */
+  Art.draw = function (ctx, key, x, y, params, o) {
+    const s = Art.get(key, params);
+    const scale = (o && o.scale) || 1, alpha = o && o.alpha !== undefined ? o.alpha : 1;
+    const flip = o && o.flip, rot = (o && o.rotation) || 0;
+    if (scale === 1 && alpha === 1 && !flip && !rot) {
+      ctx.drawImage(s.cv, Math.round(x - s.ax), Math.round(y - s.ay));
+      return;
+    }
+    ctx.save();
+    ctx.globalAlpha *= alpha;
+    ctx.translate(x, y);
+    if (rot) ctx.rotate(rot);
+    ctx.scale(flip ? -scale : scale, scale);
+    ctx.drawImage(s.cv, -s.ax, -s.ay);
+    ctx.restore();
+  };
+
+  // ------------------------------------------------------------- path helpers
+  Art.hexPath = function (ctx, cx, cy, size) {
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const a = Math.PI / 180 * (60 * i - 90);
+      const x = cx + size * Math.cos(a), y = cy + size * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  };
+  Art.rrect = function (ctx, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  };
+  Art.ellipse = function (ctx, cx, cy, rx, ry, rot = 0) {
+    ctx.beginPath(); ctx.ellipse(cx, cy, Math.max(0.01, rx), Math.max(0.01, ry), rot, 0, Math.PI * 2); ctx.closePath();
+  };
+  Art.circle = function (ctx, cx, cy, r) { ctx.beginPath(); ctx.arc(cx, cy, Math.max(0.01, r), 0, Math.PI * 2); ctx.closePath(); };
+  Art.poly = function (ctx, pts, close = true) {
+    ctx.beginPath();
+    pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+    if (close) ctx.closePath();
+  };
+  /** smooth closed/open curve through points using quadratic midpoints */
+  Art.curve = function (ctx, pts, close = false) {
+    if (pts.length < 2) return;
+    ctx.beginPath();
+    if (close) {
+      const n = pts.length;
+      let mx = (pts[0][0] + pts[n - 1][0]) / 2, my = (pts[0][1] + pts[n - 1][1]) / 2;
+      ctx.moveTo(mx, my);
+      for (let i = 0; i < n; i++) {
+        const p = pts[i], q = pts[(i + 1) % n];
+        ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2);
+      }
+      ctx.closePath();
+    } else {
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length - 1; i++) {
+        const p = pts[i], q = pts[i + 1];
+        ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2);
+      }
+      const l = pts[pts.length - 1];
+      ctx.lineTo(l[0], l[1]);
+    }
+  };
+  Art.star = function (ctx, cx, cy, rOuter, rInner, points = 5, rot = -Math.PI / 2) {
+    ctx.beginPath();
+    for (let i = 0; i < points * 2; i++) {
+      const r = i % 2 ? rInner : rOuter;
+      const a = rot + i * Math.PI / points;
+      const x = cx + r * Math.cos(a), y = cy + r * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  };
+
+  // ------------------------------------------------------------- gradients
+  Art.grad = function (ctx, x0, y0, x1, y1, stops) {
+    const g = ctx.createLinearGradient(x0, y0, x1, y1);
+    for (const [t, c] of stops) g.addColorStop(AOW.M.clamp(t, 0, 1), c);
+    return g;
+  };
+  Art.rgrad = function (ctx, x, y, r0, r1, stops) {
+    const g = ctx.createRadialGradient(x, y, Math.max(0, r0), x, y, Math.max(0.01, r1));
+    for (const [t, c] of stops) g.addColorStop(AOW.M.clamp(t, 0, 1), c);
+    return g;
+  };
+
+  // ------------------------------------------------------------- textures
+  const noiseTex = new Map();
+  /** cached grayscale noise tile (alpha varies) used for texture overlays */
+  Art.noiseTile = function (seed = 0, size = 64, scale = 8, octaves = 3) {
+    const k = seed + ':' + size + ':' + scale + ':' + octaves;
+    let t = noiseTex.get(k);
+    if (t) return t;
+    const { cv, ctx } = Art.canvas(size, size);
+    const img = ctx.createImageData(size, size);
+    const d = img.data;
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      // tileable-ish by sampling on a torus
+      const ang1 = x / size * Math.PI * 2, ang2 = y / size * Math.PI * 2;
+      const nx = Math.cos(ang1) * scale / 4, ny = Math.sin(ang1) * scale / 4, nz = Math.cos(ang2) * scale / 4, nw = Math.sin(ang2) * scale / 4;
+      const v = AOW.Noise.fbm2(nx + nz * 1.7, ny + nw * 1.3, seed, octaves) * 0.5 + 0.5;
+      const i = (y * size + x) * 4;
+      const g = Math.round(v * 255);
+      d[i] = g; d[i + 1] = g; d[i + 2] = g; d[i + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    t = cv; noiseTex.set(k, t);
+    return t;
+  };
+  /**
+   * fill current clip/rect with a two-color noise blend. o={seed,scale,colors:[c1,c2],alpha,size}
+   * Draws c1 then overlays noise-modulated c2 using 'source-over' with the noise tile as alpha via a temp canvas.
+   */
+  Art.noiseFill = function (ctx, x, y, w, h, o = {}) {
+    const seed = o.seed || 0, size = o.size || 64, scale = o.scale || 8;
+    const c1 = (o.colors && o.colors[0]) || '#000', c2 = (o.colors && o.colors[1]) || '#fff';
+    const alpha = o.alpha === undefined ? 1 : o.alpha;
+    const tile = Art.noiseTile(seed, size, scale, o.octaves || 3);
+    const k = 'nf:' + seed + ':' + size + ':' + scale + ':' + c1 + ':' + c2 + ':' + (o.octaves || 3);
+    let e = cache.get(k);
+    if (!e) {
+      const { cv, ctx: c } = Art.canvas(size, size);
+      c.fillStyle = c1; c.fillRect(0, 0, size, size);
+      // use noise luminance as mask for c2
+      const { cv: m, ctx: mc } = Art.canvas(size, size);
+      mc.drawImage(tile, 0, 0);
+      mc.globalCompositeOperation = 'source-in';
+      mc.fillStyle = c2; mc.fillRect(0, 0, size, size);
+      // luminance→alpha: approximate by drawing tile with 'destination-in'
+      const { cv: m2, ctx: m2c } = Art.canvas(size, size);
+      m2c.fillStyle = c2; m2c.fillRect(0, 0, size, size);
+      m2c.globalCompositeOperation = 'destination-in';
+      // convert grayscale to alpha
+      const img = tile.getContext('2d').getImageData(0, 0, size, size);
+      const out = m2c.createImageData(size, size);
+      const p = AOW.Color.parse(c2);
+      for (let i = 0; i < img.data.length; i += 4) { out.data[i] = p[0]; out.data[i + 1] = p[1]; out.data[i + 2] = p[2]; out.data[i + 3] = img.data[i]; }
+      m2c.globalCompositeOperation = 'source-over';
+      m2c.putImageData(out, 0, 0);
+      c.drawImage(m2, 0, 0);
+      e = { cv }; cache.set(k, e);
+    }
+    ctx.save();
+    ctx.globalAlpha *= alpha;
+    const pat = ctx.createPattern(e.cv, 'repeat');
+    ctx.fillStyle = pat;
+    ctx.translate(x, y);
+    ctx.fillRect(0, 0, w, h);
+    ctx.restore();
+  };
+  /** soft elliptical ground shadow centered at (x,y) */
+  Art.shadow = function (ctx, x, y, w, h, alpha = 0.35) {
+    ctx.save();
+    ctx.fillStyle = Art.rgrad(ctx, x, y, 0, Math.max(w, h) / 2, [[0, 'rgba(10,8,20,' + alpha + ')'], [0.6, 'rgba(10,8,20,' + alpha * 0.5 + ')'], [1, 'rgba(10,8,20,0)']]);
+    ctx.beginPath(); ctx.ellipse(x, y, w / 2, h / 2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  };
+  Art.outline = function (ctx, pathFn, color, width) {
+    ctx.save(); pathFn(); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineJoin = 'round'; ctx.stroke(); ctx.restore();
+  };
+  Art.text = function (ctx, str, x, y, o = {}) {
+    ctx.save();
+    const size = o.size || 12;
+    ctx.font = (o.weight || '600') + ' ' + size + 'px ' + (o.font || '"Noto Sans KR", "Segoe UI", system-ui, sans-serif');
+    ctx.textAlign = o.align || 'center';
+    ctx.textBaseline = o.baseline || 'middle';
+    if (o.shadow) { ctx.shadowColor = 'rgba(0,0,0,0.7)'; ctx.shadowBlur = o.shadow === true ? 3 : o.shadow; ctx.shadowOffsetY = 1; }
+    if (o.stroke) { ctx.lineWidth = o.strokeWidth || 3; ctx.strokeStyle = o.stroke; ctx.lineJoin = 'round'; ctx.strokeText(str, x, y); }
+    ctx.fillStyle = o.color || '#fff';
+    ctx.fillText(str, x, y);
+    ctx.restore();
+  };
+  Art.hash = AOW.hashString;
+
+  /** shading helpers: draw a sphere-like highlight/shade over a shape already filled (call inside clip) */
+  Art.sphereShade = function (ctx, cx, cy, r, light = 0.35, dark = 0.35) {
+    ctx.save();
+    ctx.fillStyle = Art.rgrad(ctx, cx - r * 0.35, cy - r * 0.4, 0, r * 1.2, [[0, 'rgba(255,255,255,' + light + ')'], [0.5, 'rgba(255,255,255,0)'], [1, 'rgba(0,0,30,' + dark + ')']]);
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  };
+  /** vertical gradient shade for tall shapes (clip first) */
+  Art.rimLight = function (ctx, x, y, w, h, color = 'rgba(255,255,255,0.35)') {
+    ctx.save();
+    ctx.fillStyle = Art.grad(ctx, x, y, x + w, y + h, [[0, color], [0.5, 'rgba(255,255,255,0)'], [1, 'rgba(0,0,40,0.3)']]);
+    ctx.fillRect(x, y, w, h);
+    ctx.restore();
+  };
+
+  /** deterministic per-sprite rng from seed */
+  Art.rng = seed => new AOW.RNG(seed === undefined ? 1 : seed);
+
+  AOW.Art = Art;
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/art/palette.js
+// src/art/palette.js — shared color palette for biomes, affinities, cultures and UI
+(function (AOW) {
+  'use strict';
+  const Palette = {
+    affinity: {
+      order: '#e8c357', chaos: '#e0452b', nature: '#5fb043', materium: '#c07a2a', astral: '#5a7ff0', shadow: '#7b3fa0',
+    },
+    affinityDark: {
+      order: '#8a6a1c', chaos: '#7a1e12', nature: '#2c5e1c', materium: '#6a3f12', astral: '#27357a', shadow: '#3a1a52',
+    },
+    affinityLight: {
+      order: '#fff0b8', chaos: '#ffb39e', nature: '#c5f0a8', materium: '#ffd9a8', astral: '#c0ceff', shadow: '#d6b3f0',
+    },
+    channel: { physical: '#c8c2b4', fire: '#ff7a2a', frost: '#7ad8ff', lightning: '#ffe86a', blight: '#8ad34a', spirit: '#d9c4ff' },
+    biome: {
+      ocean: ['#123c66', '#1b5a8a'], coast: ['#2f8bb8', '#4fb0d4'], lake: ['#2b6f9c', '#3f95c4'],
+      grass: ['#6f9a3c', '#8fb54a'], forest: ['#3f7030', '#5c8f3d'], hills: ['#8c9a4a', '#a9b25e'],
+      mountain: ['#7d7a74', '#a39e95'], desert: ['#d6b16a', '#e8cf8f'], snow: ['#dfe7ee', '#f4f8fb'],
+      swamp: ['#4b6a3a', '#5f7f47'], volcanic: ['#3d2b2b', '#5a3a30'],
+    },
+    tree: { leaf: '#3f7a2f', leafLight: '#6faa48', leafDark: '#25501e', pine: '#2f5a33', pineLight: '#4d8451', trunk: '#5a3b23', autumn: '#c8772a', snowLeaf: '#d7e3e8' },
+    rock: { base: '#7a746c', light: '#a8a196', dark: '#4c4742', snow: '#eef3f6' },
+    water: { deep: '#0f3557', shallow: '#3b95c0', foam: 'rgba(255,255,255,0.75)', river: '#4ea1d4' },
+    ui: {
+      bg: '#151a26', bg2: '#1e2536', bg3: '#262f45', gold: '#c9a24a', goldLight: '#f1d98a', goldDark: '#8a6a24',
+      parchment: '#efe3c6', parchment2: '#e2d1a8', ink: '#2b2116', text: '#e8e2d0', textDim: '#a49c88', accent: '#5a7ff0',
+      danger: '#d94b3a', good: '#5fb043', warn: '#e0a72b', border: 'rgba(201,162,74,0.55)',
+    },
+    resource: { gold: '#f2c94c', mana: '#6ea8ff', knowledge: '#c9a0ff', imperium: '#ffd27a', food: '#9bd35a', production: '#e08a3c', draft: '#e3e3e3', stability: '#7fd4b6', pop: '#f4e2c2' },
+    players: ['#3f7fe0', '#d8402f', '#2fa85a', '#e0b83a', '#8f4fd0', '#f07d2c', '#2ab7c8', '#d94fa3'],
+    players2: ['#c9d9ff', '#ffd0c8', '#c9f5d3', '#fff2b8', '#e6cdff', '#ffd9bd', '#c6f0f5', '#ffd0ee'],
+    skin: { fair: '#e6bf9a', tan: '#c99a70', dark: '#7a5030', pale: '#efe0d0', grey: '#9aa0a8', green: '#6d9a4e', blue: '#6d8fb8', gold: '#d3b07a' },
+    metal: { steel: '#b9bec8', steelDark: '#6d7480', gold: '#e8c357', bronze: '#b47a3a', iron: '#5c5f66', silver: '#dfe3ea', obsidian: '#2a2431' },
+  };
+  Palette.playerColor = i => Palette.players[i % Palette.players.length];
+  Palette.playerColor2 = i => Palette.players2[i % Palette.players2.length];
+  AOW.Palette = Palette;
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/art/terrain.js
+// src/art/terrain.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.TerrainArt = AOW.TerrainArt || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/art/structures.js
+// src/art/structures.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.StructArt = AOW.StructArt || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/art/units.js
+// src/art/units.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.UnitArt = AOW.UnitArt || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/art/vfx.js
+// src/art/vfx.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.VFX = AOW.VFX || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/art/icons.js
+// src/art/icons.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.Icons = AOW.Icons || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<!-- data -->
+<script>
+// ==== src/data/terrains.js
+// src/data/terrains.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/statuses.js
+// src/data/statuses.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/abilities.js
+// src/data/abilities.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/forms.js
+// src/data/forms.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/traits.js
+// src/data/traits.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/cultures.js
+// src/data/cultures.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/buildings.js
+// src/data/buildings.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/improvements.js
+// src/data/improvements.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/units_cultures.js
+// src/data/units_cultures.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/units_tomes.js
+// src/data/units_tomes.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/units_wild.js
+// src/data/units_wild.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/spells_order_chaos.js
+// src/data/spells_order_chaos.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/spells_nature_materium.js
+// src/data/spells_nature_materium.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/spells_astral_shadow.js
+// src/data/spells_astral_shadow.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/tomes.js
+// src/data/tomes.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/heroes.js
+// src/data/heroes.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/items.js
+// src/data/items.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/wonders.js
+// src/data/wonders.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/empire.js
+// src/data/empire.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/data/names.js
+// src/data/names.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<!-- game -->
+<script>
+// ==== src/game/state.js
+// src/game/state.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.State = AOW.State || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/game/worldgen.js
+// src/game/worldgen.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.WorldGen = AOW.WorldGen || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/game/rules.js
+// src/game/rules.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.Rules = AOW.Rules || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/game/turn.js
+// src/game/turn.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.Turn = AOW.Turn || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/game/combat.js
+// src/game/combat.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.Combat = AOW.Combat || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/game/diplomacy.js
+// src/game/diplomacy.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.Diplomacy = AOW.Diplomacy || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/game/ai.js
+// src/game/ai.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.AI = AOW.AI || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<!-- render -->
+<script>
+// ==== src/render/world_render.js
+// src/render/world_render.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.WorldRender = AOW.WorldRender || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/render/combat_render.js
+// src/render/combat_render.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.CombatRender = AOW.CombatRender || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<!-- audio -->
+<script>
+// ==== src/audio/synth.js
+// src/audio/synth.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.Synth = AOW.Synth || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/audio/music.js
+// src/audio/music.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.Music = AOW.Music || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/audio/songs/index.js
+// src/audio/songs/index.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.Songs = AOW.Songs || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/audio/sfx.js
+// src/audio/sfx.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.SFX = AOW.SFX || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<!-- ui -->
+<script>
+// ==== src/ui/ui.js
+// src/ui/ui.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+  AOW.UI = AOW.UI || {};
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/ui/menu.js
+// src/ui/menu.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/ui/hud.js
+// src/ui/hud.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/ui/screens.js
+// src/ui/screens.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<script>
+// ==== src/ui/combat_ui.js
+// src/ui/combat_ui.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+<!-- main -->
+<script>
+// ==== src/main.js
+// src/main.js — STUB (to be implemented)
+(function (AOW) {
+  'use strict';
+})(window.AOW = window.AOW || {});
+
+</script>
+</body>
+</html>

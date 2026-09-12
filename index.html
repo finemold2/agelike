@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Age of Godir — 신들의 시대</title>
+<link rel="stylesheet" href="styles/main.css">
+</head>
+<body>
+<div id="app">
+  <canvas id="world"></canvas>
+  <canvas id="battle" hidden></canvas>
+  <div id="ui"></div>
+</div>
+<!-- core -->
+<script src="src/core/util.js"></script>
+<script src="src/core/hex.js"></script>
+<script src="src/core/events.js"></script>
+<script src="src/core/i18n.js"></script>
+<script src="src/core/data.js"></script>
+<!-- art -->
+<script src="src/art/art.js"></script>
+<script src="src/art/palette.js"></script>
+<script src="src/art/terrain.js"></script>
+<script src="src/art/structures.js"></script>
+<script src="src/art/units.js"></script>
+<script src="src/art/vfx.js"></script>
+<script src="src/art/icons.js"></script>
+<!-- data -->
+<script src="src/data/terrains.js"></script>
+<script src="src/data/statuses.js"></script>
+<script src="src/data/abilities.js"></script>
+<script src="src/data/forms.js"></script>
+<script src="src/data/traits.js"></script>
+<script src="src/data/cultures.js"></script>
+<script src="src/data/buildings.js"></script>
+<script src="src/data/improvements.js"></script>
+<script src="src/data/units_cultures.js"></script>
+<script src="src/data/units_tomes.js"></script>
+<script src="src/data/units_wild.js"></script>
+<script src="src/data/spells_order_chaos.js"></script>
+<script src="src/data/spells_nature_materium.js"></script>
+<script src="src/data/spells_astral_shadow.js"></script>
+<script src="src/data/tomes.js"></script>
+<script src="src/data/heroes.js"></script>
+<script src="src/data/items.js"></script>
+<script src="src/data/wonders.js"></script>
+<script src="src/data/empire.js"></script>
+<script src="src/data/names.js"></script>
+<!-- game -->
+<script src="src/game/state.js"></script>
+<script src="src/game/worldgen.js"></script>
+<script src="src/game/rules.js"></script>
+<script src="src/game/turn.js"></script>
+<script src="src/game/combat.js"></script>
+<script src="src/game/diplomacy.js"></script>
+<script src="src/game/ai.js"></script>
+<!-- render -->
+<script src="src/render/world_render.js"></script>
+<script src="src/render/combat_render.js"></script>
+<!-- audio -->
+<script src="src/audio/synth.js"></script>
+<script src="src/audio/music.js"></script>
+<script src="src/audio/notation.js"></script>
+<script src="src/audio/songs/set_a.js"></script>
+<script src="src/audio/songs/set_b.js"></script>
+<script src="src/audio/songs/set_c.js"></script>
+<script src="src/audio/songs/set_d.js"></script>
+<script src="src/audio/sfx.js"></script>
+<!-- ui -->
+<script src="src/ui/ui.js"></script>
+<script src="src/ui/menu.js"></script>
+<script src="src/ui/hud.js"></script>
+<script src="src/ui/screens.js"></script>
+<script src="src/ui/combat_ui.js"></script>
+<!-- main -->
+<script src="src/main.js"></script>
+</body>
+</html>

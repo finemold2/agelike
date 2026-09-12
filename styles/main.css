@@ -1,0 +1,17 @@
+/* styles/main.css — base layout; UI modules append their own styles via UI.css() or here */
+:root {
+  --bg: #151a26; --bg2: #1e2536; --bg3: #262f45; --gold: #c9a24a; --gold-light: #f1d98a; --gold-dark: #8a6a24;
+  --parchment: #efe3c6; --parchment2: #e2d1a8; --ink: #2b2116; --text: #e8e2d0; --text-dim: #a49c88; --accent: #5a7ff0;
+  --danger: #d94b3a; --good: #5fb043; --warn: #e0a72b; --border: rgba(201,162,74,0.55);
+  --font-title: "Cinzel", "Noto Serif KR", "Nanum Myeongjo", Georgia, serif;
+  --font-body: "Noto Sans KR", "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0b0e15; color: var(--text); font: 14px/1.4 var(--font-body); }
+#app { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
+#world, #battle { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+#battle[hidden] { display: none; }
+#ui { position: absolute; inset: 0; pointer-events: none; }
+#ui > * { pointer-events: auto; }
+* { box-sizing: border-box; }
+button { font-family: inherit; }
+::selection { background: rgba(201,162,74,0.35); }
