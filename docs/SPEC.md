@@ -306,8 +306,10 @@ Rules.unitStats(game, unit) → {hp, maxHp, def, res, attacks:[…], mp, morale,
 Rules.heroLevelUp(game, hero, skillId); Rules.equipItem(game, hero, itemId, slot)
 Rules.disband(game, unitId)
 Rules.victoryCheck(game) → null | {type, winner}
-Turn.endTurn(game)      // human ended turn → runs AI players (AI.playTurn), then Turn.beginTurn (income, growth, production, research, spells, healing, statuses, events)
+Turn.beginGame(game)    // called once after State.create: initial visibility, first-turn setup, initial notifications
+Turn.endTurn(game)      // human ended turn → runs AI players (AI.playTurn for each alive AI, each followed by its own upkeep), advances game.turn, then Turn.beginTurn for the human (income, growth, production, research, spells, healing, statuses, events, victory check). Must be synchronous and < 1.5 s on medium maps; battles involving the human player that the AI initiates are resolved via Combat.autoResolve unless `game.settings.manualDefense` is true, in which case they are queued into game.pendingBattles and Events 'battle:start' fires for the first one (UI handles the rest sequentially).
 Turn.beginTurn(game)
+Turn.processPlayer(game, pid)  // upkeep/income/growth for one player (used by endTurn for both human and AI)
 ```
 Constants live in `Rules.C` (all balance numbers) so they are tweakable: e.g. `C.ANNEX_BASE=40, C.OUTPOST_COST=100, C.CITY_TIERS=[1,4,8,14,22,32] (pop thresholds), C.UNITS_PER_ARMY=6, C.CP_BASE=20, C.RANK_XP=[0,15,40,80,140], C.RANK_BONUS={hp:+10%/rank...}`.
 
@@ -428,8 +430,30 @@ All SFX are synthesized (oscillators, noise bursts, filtered impulses, convoluti
 ## 10. UI contract (DOM)
 
 * Root: `<div id="app">` contains `<canvas id="world">`, `<canvas id="battle">` (hidden unless in battle), `<div id="ui">` overlay.
-* `UI.init()`, `UI.showScreen(name, params)`, `UI.closeScreen()`, `UI.tooltip(el, htmlOrFn)`, `UI.modal({title, body, buttons})`, `UI.toast(kind, text)`,
-  `UI.icon(name, size)` → `<img>` from `Icons.dataURL`, `UI.el(tag, attrs, children)` helper, `UI.refresh()` (re-render HUD from game state).
+* Core API (src/ui/ui.js — owns styles/main.css theme; other UI files add their own CSS via `UI.css(cssString)`):
+```
+UI.init()                                   // builds #ui skeleton: <div id="screen-layer"> (full-screen screens/modals), <div id="hud-layer"> (persistent HUD), <div id="toast-layer">, <div id="tooltip-layer">
+UI.el(tag, attrs, ...children)              // attrs: {class, id, style (string|object), onclick, html, text, title, dataset:{}, disabled}; children: string|Node|array|null; returns element
+UI.css(cssString)                           // append a <style> once per unique string
+UI.icon(name, size=20, params) → <img class="icon">   (from Icons.dataURL; falls back to an empty span if Icons is missing)
+UI.button(label, onClick, {icon, kind:'primary'|'default'|'danger'|'ghost'|'gold', disabled, tooltip, small}) → <button class="aow-btn …">
+UI.panel({title, subtitle, cls, body, closable, onClose, width}) → <div class="aow-panel"> ornate framed panel (title bar with gold filigree; body scrolls)
+UI.tooltip(el, contentHtmlOrFn)             // parchment tooltip on hover (fn returns html or Node; re-evaluated on show)
+UI.modal({title, body, buttons:[{label, onClick, kind}], closable:true, width}) → {el, close()}   // stacks; Esc closes topmost
+UI.confirm(text, onYes)                     // convenience modal
+UI.toast(kind:'info'|'warn'|'good'|'bad', text, {icon, onClick, timeout=5000}) // also handles Events 'notify'
+UI.registerScreen(name, {open(params)→Element, close(), refresh()})   // screens live in #screen-layer; 'hud' lives in #hud-layer and stays while others open on top
+UI.showScreen(name, params); UI.closeScreen(); UI.currentScreen(); UI.isOpen(name)
+UI.refresh()                                // refresh HUD + open screen from AOW.game
+UI.tick(dt)                                 // per-frame UI animation hook
+UI.selected = {armyId:null, cityId:null, unitId:null}  ; UI.select({armyId|cityId|null}) emits select:* events and tells WorldRender.setSelection
+UI.progressBar(value, max, {color, label, height}) → element ; UI.resource(kind, value, {signed}) → inline <span> icon+number ; UI.fmt(n) ; UI.fmtSigned(n)
+UI.unitCard(unitId|unitObj, {small, selected, onClick, showStats}) → element with portrait (UnitArt.portrait), name, tier, rank chevrons, hp bar, status icons — shared by HUD, city screen, battle UI
+UI.heroPortrait(heroId, size) ; UI.tomeIcon(tomeId, size) ; UI.spellRow(spellId, {onCast}) ; UI.buildingRow(buildingId, {onBuild}) ; UI.unitTypeRow(unitTypeId, {onRecruit, city})
+UI.lang() / UI.setLang(lang)                // proxies I18n and re-renders
+```
+* File ownership: `ui.js` (core + components + theme CSS + tooltip/modal/toast + 'settings' screen with audio/language sliders), `hud.js` (screen 'hud': top resource bar, turn/end-turn, selected army/city panel, minimap, notification stack, spell quick bar, next-unit, hotkeys), `menu.js` (screens 'menu', 'newgame', 'faction', 'load'), `screens.js` (screens 'city', 'research', 'spellbook', 'hero', 'empire', 'diplomacy', 'victory', 'encyclopedia'), `combat_ui.js` (screen 'battle': unit action bar, initiative list, spell casting, auto-resolve/retreat, battle end summary).
+* Every screen renders from `AOW.game` via Rules queries and mutates ONLY through Rules/Turn/Combat functions, then calls `UI.refresh()`.
 * Screens: `menu`, `newgame` (realm settings), `faction` (create ruler: type, name, form + body/mind traits, culture + sub-choice, society traits, starting tome, portrait preview), `city`, `research`, `spellbook`, `hero`, `empire` (affinity trees), `diplomacy`, `pantheon/settings`, `victory`.
 * HUD: top resource bar with income tooltips, turn counter, end-turn button (with "units still can move" warning), left: selected army panel (unit cards with portraits, hp, actions: move, defend, disband, split/merge, found outpost, annex, attack), right: minimap (canvas, clickable), bottom-right: notifications stack, bottom-left: spell quick-cast & research progress.
 * Keyboard: Enter/Space = end turn, Esc = close, N = next army, C = center capital, F5/F9 quick save/load (localStorage), M mute.
