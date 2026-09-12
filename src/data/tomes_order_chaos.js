@@ -1,4 +1,4 @@
-// src/data/spells_astral_shadow.js — STUB (to be implemented)
+// src/data/tomes_order_chaos.js — STUB
 (function (AOW) {
   'use strict';
 })(window.AOW = window.AOW || {});
