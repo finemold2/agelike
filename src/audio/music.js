@@ -6,6 +6,11 @@
 //   Music.playlist(mood?) → ids for a mood (or {mood:[ids]} for all moods)
 //   Music.getMood(), Music.previewNotes(notes, instrumentName, bpm) (raw [[beat,midi,dur,vel]] test playback)
 //   Music.position() → seconds into the current song
+//   Music.renderOffline(songId, seconds, ctx) → Promise<AudioBuffer>  binds AOW.Audio to `ctx` (an
+//     OfflineAudioContext; rebinds with {force:true} if AOW.Audio already points elsewhere), schedules
+//     the notes of `songId` that start within [0, seconds) through the same event-building/scheduling
+//     code Music.play() uses, then returns ctx.startRendering(). For tests only — does not touch the
+//     live playlist (current/mood/history are untouched).
 //   Listens to Events 'audio:mood' {mood} as an alternative to calling setMood directly.
 (function (AOW) {
   'use strict';
@@ -266,6 +271,22 @@
     return end;
   };
   Music.demo = Music.previewNotes;
+  /** schedule the first `seconds` of `songId` and render it offline (for tests — see header). */
+  Music.renderOffline = function (songId, seconds, ctx) {
+    const A = AOW.Audio;
+    if (A.ctx !== ctx) A.init({ ctx: ctx, force: true });
+    const song = songById(songId);
+    if (!song) return Promise.reject(new Error('Music.renderOffline: unknown song "' + songId + '"'));
+    const entry = createEntry(song, ctx.currentTime + 0.02, 0);
+    const cutoff = ctx.currentTime + Math.max(0, seconds || 0);
+    for (const e of entry.events) {
+      const at = entry.startTime + e.t;
+      if (at >= cutoff) break;
+      const inst = entry.instruments.get(e.inst);
+      if (inst) inst.noteOn(e.midi, at, e.vel, e.dur);
+    }
+    return ctx.startRendering();
+  };
 
   // ------------------------------------------------------------------ environment hooks
   if (typeof document !== 'undefined' && document.addEventListener) {

@@ -1,7 +1,9 @@
 // src/audio/synth.js — AOW.Audio (context, buses, reverb, volumes) + AOW.Synth (Web Audio instruments)
 //
 // Additive helpers beyond SPEC §8 (documented here):
-//   Audio.init({ctx})            optional context (tests pass an OfflineAudioContext)
+//   Audio.init({ctx, force})     optional context (tests pass an OfflineAudioContext); force:true tears down
+//                                and rebinds an already-initialised graph to a new ctx (tests only — lets one
+//                                page render several OfflineAudioContexts in sequence)
 //   Audio.getVolume()            → {master, music, sfx}
 //   Audio.setMuted(b)/toggleMute()/isMuted()
 //   Audio.resume()/suspend()     page-visibility helpers; Audio.ready → bool; Audio.onReady(cb)
@@ -39,14 +41,30 @@
   }
   function clamp01(x) { return x < 0 ? 0 : x > 1 ? 1 : (isFinite(x) ? x : 0); }
 
-  /** create the audio graph. Idempotent. opts.ctx lets tests inject an OfflineAudioContext. */
+  /** create the audio graph. Idempotent. opts.ctx lets tests inject an OfflineAudioContext.
+   *  opts.force + a different opts.ctx tears down the current graph and rebinds it to the new
+   *  context (tests only: lets one page render through several OfflineAudioContexts in turn). */
   Audio.init = function (opts) {
-    if (Audio.ctx) return Audio.ctx;
+    const wantCtx = opts && opts.ctx;
+    if (Audio.ctx) {
+      if (!(opts && opts.force) || Audio.ctx === wantCtx) return Audio.ctx;
+      try {
+        for (const n of [Audio.master, Audio.mix, Audio.musicBus, Audio.sfxBus, Audio.compressor,
+          Audio.reverbIn, Audio.preDelay, Audio.reverb, Audio.reverbLP, Audio.reverbReturn]) {
+          if (n && n.disconnect) n.disconnect();
+        }
+      } catch (e) { /* ignore */ }
+      for (const v of voices) killVoice(v, 0);
+      voices.clear();
+      shared.clear();
+      waveCache.clear(); // defensive: periodic waves are cached per-key, harmless to rebuild on a fresh ctx
+      Audio.ctx = null; Audio.ready = false;
+    }
     const AC = window.AudioContext || window.webkitAudioContext;
-    const ctx = (opts && opts.ctx) || (AC ? new AC({ latencyHint: 'interactive' }) : null);
+    const ctx = wantCtx || (AC ? new AC({ latencyHint: 'interactive' }) : null);
     if (!ctx) return null;
     Audio.ctx = ctx;
-    Audio.offline = !!(opts && opts.ctx);
+    Audio.offline = !!wantCtx;
     // buses: music/sfx → mix → compressor → master(user volume) → destination
     Audio.master = ctx.createGain();
     Audio.mix = ctx.createGain();
@@ -77,7 +95,7 @@
     Audio.reverbReturn.connect(Audio.mix);
     applyVolumes(true);
     Audio.ready = true;
-    if (ctx.state === 'suspended' && ctx.resume) { try { ctx.resume(); } catch (e) { /* needs gesture */ } }
+    if (!Audio.offline && ctx.state === 'suspended' && ctx.resume) { try { ctx.resume().catch(() => {}); } catch (e) { /* needs gesture */ } }
     installVisibility();
     const cbs = readyCbs.splice(0);
     for (const cb of cbs) { try { cb(ctx); } catch (e) { console.error('[Audio]', e); } }
@@ -113,7 +131,11 @@
   Audio.isMuted = function () { return muted; };
   Audio.resume = function () {
     const ctx = Audio.ctx;
-    if (ctx && ctx.state !== 'running' && ctx.resume) { try { return ctx.resume(); } catch (e) { /* ignore */ } }
+    // OfflineAudioContext has no user-gesture suspend/resume cycle — resuming it before
+    // startRendering() throws (rejects), so tests (Audio.offline) skip this entirely.
+    if (ctx && !Audio.offline && ctx.state !== 'running' && ctx.resume) {
+      try { return ctx.resume().catch(() => {}); } catch (e) { return Promise.resolve(); }
+    }
     return Promise.resolve();
   };
   Audio.suspend = function () {

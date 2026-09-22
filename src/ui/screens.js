@@ -95,6 +95,8 @@
       'enc.guard': '수호자', 'enc.rewards': '보상', 'enc.kind': '종류', 'enc.duration': '지속', 'enc.range': '사거리', 'enc.ap': '행동력', 'enc.cooldown': '재사용', 'enc.signature': '전용 기술',
       // cities
       'cities.title': '도시 목록', 'cities.goto': '이동', 'cities.open': '열기', 'cities.production': '생산', 'cities.idle': '유휴', 'cities.none': '도시가 없습니다.',
+      // shared resource labels missing from the base vocabulary (production/draft/stability, used in yield/upkeep tooltips)
+      'resource.production': '생산력', 'resource.draft': '징집력', 'resource.stability': '안정도',
     },
     en: {
       'sc.close': 'Close', 'sc.noGame': 'No game in progress.', 'sc.notFound': 'Target not found.', 'sc.turns': '{n} turns', 'sc.turn': 'turn',
@@ -154,6 +156,7 @@
       'enc.passives': 'Passives', 'enc.tags': 'Tags', 'enc.move': 'Movement', 'enc.source': 'Source', 'enc.units': 'Units', 'enc.subChoices': 'Sub-choices', 'enc.traits': 'Traits', 'enc.roster': 'Unit roster',
       'enc.guard': 'Guardians', 'enc.rewards': 'Rewards', 'enc.kind': 'Kind', 'enc.duration': 'Duration', 'enc.range': 'Range', 'enc.ap': 'AP', 'enc.cooldown': 'Cooldown', 'enc.signature': 'Signature skills',
       'cities.title': 'Cities', 'cities.goto': 'Go to', 'cities.open': 'Open', 'cities.production': 'Production', 'cities.idle': 'Idle', 'cities.none': 'No cities.',
+      'resource.production': 'Production', 'resource.draft': 'Draft', 'resource.stability': 'Stability',
     },
   });
 
@@ -560,8 +563,23 @@
     for (const l of lines || []) { if (l === null || l === undefined || l === '') continue; box.appendChild(typeof l === 'string' ? mk('p', null, l) : l); }
     return box;
   }
+  /** Human-readable reason text for a Rules/Diplomacy `{ok:false,...}` result: prefers `.text` (Rules' own
+   *  already-localized message), falls back to translating a short `.reason` key ('rules.reason.<k>' then
+   *  the raw key), or localizing a `{ko,en}` reason object (Diplomacy's shape). Never returns a raw i18n key. */
+  function reasonText(r) {
+    if (!r) return '';
+    if (r.text) return typeof r.text === 'object' ? L(r.text) : String(r.text);
+    if (r.reason !== undefined && r.reason !== null) {
+      if (typeof r.reason === 'object') return L(r.reason);
+      const key = String(r.reason);
+      if (AOW.I18n && AOW.I18n.has && AOW.I18n.has('rules.reason.' + key)) return t('rules.reason.' + key);
+      if (AOW.I18n && AOW.I18n.has && AOW.I18n.has(key)) return t(key);
+      return key;
+    }
+    return '';
+  }
   function result(r, okText) {
-    if (r && typeof r === 'object' && r.ok === false) { toast('warn', r.reason ? (t(r.reason) === r.reason ? r.reason : t(r.reason)) : t('sc.unavailable')); return false; }
+    if (r && typeof r === 'object' && r.ok === false) { toast('warn', reasonText(r) || t('sc.unavailable')); return false; }
     if (r === false) { toast('warn', t('sc.unavailable')); return false; }
     if (okText) toast('good', okText);
     return true;
@@ -737,8 +755,8 @@
       const row = mk('div', { class: 'sc-row' + (ok.ok === false ? ' disabled' : '') }, Screens.unitPortrait(id, 52, { pid: city.owner }),
         mk('div', { class: 'grow' }, mk('div', { class: 'name' }, L(id.name), ' ', mk('span', { class: 'sc-badge' }, 'T' + id.tier), ' ', icon('role_' + id.role, 16), mk('span', { class: 'sub' }, ' ' + t('role.' + id.role))), unitStatsLine(id)),
         mk('div', null, costRow(id.cost), mk('div', { class: 'sub', style: 'text-align:right' }, turnsText(turnsFor(itemCost(g, city, { type: 'unit', id: id.id }), perTurn)))),
-        isOwn ? btn(t('city.recruit'), () => { const f = fn('Rules', 'enqueue'); if (!f) { toast('warn', t('sc.unavailable')); return; } result(f(g, city, { type: 'unit', id: id.id })); sfx('recruit'); after('city'); }, { kind: 'primary', small: true, disabled: ok.ok === false, tooltip: ok.ok === false ? (ok.reason || '') : '' }) : null);
-      tip(row, () => { const b = unitTip(id); if (ok.ok === false && ok.reason) b.appendChild(mk('p', { class: 'bad' }, t('sc.reason') + ': ' + (t(ok.reason) || ok.reason))); return b; });
+        isOwn ? btn(t('city.recruit'), () => { const f = fn('Rules', 'enqueue'); if (!f) { toast('warn', t('sc.unavailable')); return; } result(f(g, city, { type: 'unit', id: id.id })); sfx('recruit'); after('city'); }, { kind: 'primary', small: true, disabled: ok.ok === false, tooltip: ok.ok === false ? reasonText(ok) : '' }) : null);
+      tip(row, () => { const b = unitTip(id); if (ok.ok === false) b.appendChild(mk('p', { class: 'bad' }, t('sc.reason') + ': ' + reasonText(ok))); return b; });
       box.appendChild(row);
     }
     return box;
@@ -890,6 +908,594 @@
     },
   });
 
+  // ================================================================ RESEARCH
+  const AFF_SCALE = 24;
+  function itemTypeIcon(type) { return { spell: 'spellbook', unit: 'draft', improvement: 'node', skill: 'star', empire: 'empire', building: 'city', transformation: 'star' }[type] || 'scroll'; }
+  function contentDef(c) {
+    const kindMap = { spell: 'spells', unit: 'units', improvement: 'improvements', skill: 'heroSkills', empire: 'empireSkills', building: 'buildings', transformation: 'transformations' };
+    const kind = kindMap[c.type];
+    return kind && has(kind, c.id) ? get(kind, c.id) : null;
+  }
+  function researchAffinityBars(g, player) {
+    const box = mk('div', { class: 'sc-affbars' });
+    for (const a of AFFS) {
+      const v = num(player.affinity && player.affinity[a]);
+      box.appendChild(mk('div', { class: 'sc-affbar' }, icon(a, 20), mk('span', { class: 'sub', style: 'min-width:82px;white-space:nowrap' }, t('affinity.' + a)), mk('div', { style: 'flex:1;min-width:60px' }, progress(Math.min(v, AFF_SCALE), AFF_SCALE, { color: null, label: String(v), height: 12 }))));
+    }
+    return box;
+  }
+  function tomesByTier() {
+    const byTier = {};
+    for (const tm of D().list('tomes')) (byTier[tm.tier] = byTier[tm.tier] || []).push(tm);
+    for (const k of Object.keys(byTier)) byTier[k].sort((a, b) => L(a.name).localeCompare(L(b.name)));
+    return byTier;
+  }
+  function tomeState(g, player, tome) {
+    const owned = (player.tomes || []).includes(tome.id);
+    let locked = false, reason = '';
+    const f = fn('Rules', 'tomeLockReason');
+    if (!owned && f) {
+      try { const r = f(g, player, tome.id); if (r) { locked = true; reason = typeof r === 'object' ? L(r) : (AOW.I18n && AOW.I18n.has && AOW.I18n.has(r) ? t(r) : r); } }
+      catch (e) { /* ignore */ }
+    }
+    return { owned, locked, reason };
+  }
+  function tomeShelf(ctx, g, player) {
+    const byTier = tomesByTier();
+    const box = mk('div', { class: 'sc-shelf' });
+    for (let tier = 1; tier <= 5; tier++) {
+      const list = byTier[tier]; if (!list || !list.length) continue;
+      const row = mk('div', { class: 'sc-shelf-row' }, mk('div', { class: 'sc-shelf-tier' }, t('research.tierRow', { n: tier })));
+      for (const tm of list) {
+        const st = tomeState(g, player, tm);
+        const b = mk('div', { class: 'sc-book' + (st.owned ? ' owned' : '') + (st.locked ? ' locked' : ''), onclick: () => { ctx.state.viewTome = tm.id; refreshScreen('research'); } },
+          tomeIcon(tm.id, 44), mk('div', { class: 'affs' }, affIcons(tm.affinity, 9)),
+          st.locked ? mk('span', { class: 'lock' }, icon('lock', 12)) : null,
+          mk('div', { class: 'bname' }, L(tm.name)));
+        tip(b, () => tipBox(L(tm.name), [L(tm.desc), tm.passive && tm.passive.desc ? mk('p', null, mk('b', null, t('research.passive') + ': '), L(tm.passive.desc)) : null,
+          st.locked && st.reason ? mk('p', { class: 'bad' }, st.reason) : null]));
+        row.appendChild(b);
+      }
+      box.appendChild(row);
+    }
+    return box;
+  }
+  function tomeContentsPanel(ctx, g, player) {
+    const tomeId = ctx.state.viewTome || (player.research && player.research.current && player.research.current.tomeId) || (player.tomes || [])[0];
+    const tome = tomeId ? get('tomes', tomeId) : null;
+    const box = mk('div');
+    if (!tome) { box.appendChild(emptyNote(t('research.pickTome'))); return box; }
+    box.appendChild(mk('div', { class: 'sc-h' }, L(tome.name), ' ', mk('span', { class: 'sc-badge' }, t('research.tierRow', { n: tome.tier }))));
+    box.appendChild(mk('div', { class: 'sub' }, L(tome.desc)));
+    if (tome.passive && tome.passive.desc) box.appendChild(mk('div', { class: 'sub gold', style: 'margin-top:4px' }, t('research.passive') + ': ' + L(tome.passive.desc)));
+    const owned = (player.tomes || []).includes(tome.id);
+    if (!owned) {
+      const st = tomeState(g, player, tome);
+      box.appendChild(btn(t('research.select'), () => {
+        const f = fn('Rules', 'selectTome');
+        if (!f) { toast('warn', t('sc.unavailable')); return; }
+        if (result(f(g, player, tome.id))) sfx('coin');
+        after('research');
+      }, { kind: 'primary', disabled: st.locked, tooltip: st.locked ? st.reason : t('research.selectTip'), style: 'margin-top:8px' }));
+    }
+    box.appendChild(mk('div', { class: 'sc-h', style: 'margin-top:12px' }, t('research.contents')));
+    const done = new Set((player.research && player.research.done) || []);
+    const current = player.research && player.research.current;
+    if (!(tome.contents || []).length) box.appendChild(emptyNote(t('sc.none')));
+    for (const c of tome.contents || []) {
+      const d = contentDef(c);
+      const isDone = done.has(c.id);
+      const isCurrent = !!(current && current.tomeId === tome.id && current.contentId === c.id);
+      const row = mk('div', { class: 'sc-row' + (isDone ? ' disabled' : '') }, icon(itemTypeIcon(c.type), 28),
+        mk('div', { class: 'grow' }, mk('div', { class: 'name' }, d ? L(d.name) : c.id, ' ', mk('span', { class: 'sc-badge' }, t('research.type.' + c.type))),
+          isCurrent ? progress(num(player.research.progress), c.cost, { color: '#e08a3c', label: fmt(num(player.research.progress)) + ' / ' + fmt(c.cost), height: 14 })
+            : mk('div', { class: 'sub' }, res('knowledge', c.cost, { size: 14 }))),
+        isDone ? mk('span', { class: 'sc-badge good' }, t('research.researched'))
+          : (owned ? btn(isCurrent ? t('research.current') : t('research.start'), () => {
+              const f = fn('Rules', 'startResearch'); if (!f) { toast('warn', t('sc.unavailable')); return; }
+              if (result(f(g, player, tome.id, c.id))) sfx('ui_click'); after('research');
+            }, { kind: 'primary', small: true, disabled: isCurrent }) : null));
+      if (d) tip(row, () => tipBox(L(d.name), [L(d.desc), d.effects ? mk('p', null, Screens.effectsText(d.effects)) : null]));
+      box.appendChild(row);
+    }
+    return box;
+  }
+  defineScreen('research', {
+    title: () => t('research.title'), width: 1180,
+    build(ctx) {
+      const g = game(); if (!g) return emptyNote(t('sc.noGame'));
+      const player = human(g); if (!player) return emptyNote(t('sc.notFound'));
+      return mk('div', { class: 'sc-cols' },
+        mk('div', { class: 'sc-col' }, researchAffinityBars(g, player), mk('div', { class: 'sc-h' }, t('research.tomes')), tomeShelf(ctx, g, player)),
+        mk('div', { class: 'sc-col sc-col-side' }, tomeContentsPanel(ctx, g, player)));
+    },
+  });
+
+  // ================================================================ SPELLBOOK
+  const SPELL_KIND_ORDER = ['combat', 'world', 'unit_enchant', 'city_enchant', 'summon', 'transform', 'empire', 'strategic'];
+  defineScreen('spellbook', {
+    title: () => t('spell.title'), width: 1000,
+    build(ctx) {
+      const g = game(); if (!g) return emptyNote(t('sc.noGame'));
+      const player = human(g); if (!player) return emptyNote(t('sc.notFound'));
+      const known = (player.spells && player.spells.known) || [];
+      const active = (player.spells && player.spells.active) || [];
+      const body = [mk('div', { class: 'sc-h' }, t('spell.known') + ' (' + known.length + ')')];
+      if (!known.length) body.push(emptyNote(t('spell.noneKnown')));
+      else {
+        const byKind = {};
+        for (const id of known) { const sp = get('spells', id); if (sp) (byKind[sp.kind] = byKind[sp.kind] || []).push(sp); }
+        for (const k of SPELL_KIND_ORDER) {
+          const list = byKind[k]; if (!list || !list.length) continue;
+          body.push(mk('div', { class: 'sc-catname' }, t('spell.kind.' + k)));
+          for (const sp of list.sort((a, b) => a.tier - b.tier)) {
+            const isActive = active.some(a => a.spellId === sp.id);
+            const combatOnly = sp.kind === 'combat';
+            const reason = combatOnly ? t('spell.combatOnly') : (isActive ? t('rules.reason.alreadyActive') : '');
+            body.push(spellRow(sp.id, {
+              custom: true, disabled: isActive || combatOnly, reason,
+              onCast: () => {
+                const castFn = fn('Rules', 'castSpell'); if (!castFn) { toast('warn', t('sc.unavailable')); return; }
+                if (combatOnly) { toast('warn', t('spell.combatOnly')); return; }
+                const canFn = fn('Rules', 'canCast');
+                const target = { playerId: player.id };
+                if (canFn) { const c = canFn(g, player, sp.id, target); if (c && c.ok === false) { toast('warn', reasonText(c)); return; } }
+                if (result(castFn(g, player, sp.id, target))) sfx('spell_cast_' + (AFFS.find(a => sp.affinity && sp.affinity[a]) || 'astral'));
+                after('spellbook');
+              },
+            }));
+          }
+        }
+      }
+      body.push(mk('div', { class: 'sc-h', style: 'margin-top:12px' }, t('spell.active') + ' (' + active.length + ')'));
+      if (!active.length) body.push(emptyNote(t('spell.noneActive')));
+      else for (const a of active) body.push(spellRow(a.spellId, { custom: true, onDispel: () => { const f = fn('Rules', 'dispel'); if (!f) { toast('warn', t('sc.unavailable')); return; } result(f(g, player, a.spellId, a.target)); after('spellbook'); } }));
+      return body;
+    },
+  });
+
+  // ================================================================ HERO
+  const HERO_SLOTS = ['weapon', 'offhand', 'armor', 'helm', 'trinket', 'mount'];
+  function heroList(g, player) { return S() && S().playerHeroes ? S().playerHeroes(g, player.id) : g.heroes.filter(h => h.owner === player.id); }
+  function heroXpNeed(g, hero) {
+    const f = fn('Rules', 'heroXpForLevel');
+    if (f) { try { const n = f(g, hero); if (n > 0) return n; } catch (e) { /* ignore */ } }
+    const C = rulesC();
+    return Math.round(num(C.HERO_XP_PER_LEVEL, 60) * Math.pow(1.15, Math.max(0, (hero.level || 1) - 1)));
+  }
+  function heroSkillsFor(hero) {
+    const all = D().list('heroSkills');
+    return {
+      classList: all.filter(s => s.class === hero.classId),
+      generalList: all.filter(s => !s.class && !s.rulerType),
+      rulerList: hero.isRuler ? all.filter(s => s.rulerType && s.rulerType === hero.rulerType) : [],
+    };
+  }
+  function heroAvailable(game, hero, skillId) {
+    const f = fn('Rules', 'heroAvailableSkills');
+    if (f) {
+      try { const list = f(game, hero); if (Array.isArray(list)) return list.map(x => (typeof x === 'string' ? x : x.id)).includes(skillId); }
+      catch (e) { /* ignore */ }
+    }
+    const sk = get('heroSkills', skillId); if (!sk) return false;
+    if ((hero.skills || []).includes(skillId)) return false;
+    if (num(hero.skillPoints) <= 0) return false;
+    if ((hero.level || 1) < (sk.minLevel || 1)) return false;
+    return (sk.prereq || []).every(p => (hero.skills || []).includes(p));
+  }
+  function heroStatsRow(g, hero, unit) {
+    let s = null;
+    const f1 = fn('Rules', 'heroStats'); if (f1) { try { s = f1(g, hero); } catch (e) { s = null; } }
+    if (!s && unit) { const f2 = fn('Rules', 'unitStats'); if (f2) { try { s = f2(g, unit); } catch (e) { s = null; } } }
+    const type = unit ? S().unitType(unit) : null;
+    const maxHp = (s && (s.maxHp || s.hp)) || (unit && unit.maxHp) || (type && type.hp) || 0;
+    const cur = unit ? unit.hp : maxHp;
+    const def = (s && s.def !== undefined) ? s.def : (type ? type.def : 0);
+    const resV = (s && s.res !== undefined) ? s.res : (type ? type.res : 0);
+    const mp = (s && s.mp !== undefined) ? s.mp : (type ? type.mp : 0);
+    const atk = (s && s.attacks && s.attacks[0]) || (type && type.attacks && type.attacks[0]) || null;
+    const chip = (iconName, value) => mk('span', { class: 'sc-yield' }, icon(iconName, 20), mk('b', null, String(value)));
+    return mk('div', { class: 'sc-yields' }, chip('hp', fmt(cur) + '/' + fmt(maxHp)), chip('def', def), chip('res', resV), chip('move', mp), atk ? chip(atk.channel || 'physical', atk.damage) : null);
+  }
+  function skillCard(game, hero, sk) {
+    const learned = (hero.skills || []).includes(sk.id);
+    const avail = !learned && heroAvailable(game, hero, sk.id);
+    const cls = 'sc-skill' + (learned ? ' learned' : '') + (avail ? ' available' : (!learned ? ' locked' : '')) + (sk.signature ? ' signature' : '');
+    const abilDef = sk.ability ? get('abilities', sk.ability) : null;
+    let lockReason = '';
+    if (!learned && !avail) {
+      if ((hero.level || 1) < (sk.minLevel || 1)) lockReason = t('hero.minLevel', { n: sk.minLevel || 1 });
+      else if ((sk.prereq || []).some(p => !(hero.skills || []).includes(p))) lockReason = t('hero.needPrereq');
+      else if (num(hero.skillPoints) <= 0) lockReason = t('hero.noPoints');
+    }
+    const card = mk('div', { class: cls },
+      mk('div', { class: 'sname' }, sk.signature ? icon('star', 12) : null, ' ', L(sk.name)),
+      mk('div', { class: 'sdesc' }, L(sk.desc)),
+      learned ? mk('span', { class: 'sc-badge good' }, t('hero.learned'))
+        : btn(t('hero.learn'), () => { const f = fn('Rules', 'heroLevelUp'); if (!f) { toast('warn', t('sc.unavailable')); return; } if (result(f(game, hero, sk.id))) sfx('level_up'); after('hero'); },
+          { kind: 'primary', small: true, disabled: !avail, tooltip: lockReason }));
+    tip(card, () => tipBox(L(sk.name), [L(sk.desc), abilDef ? mk('p', null, mk('b', null, t('hero.grants') + ': '), L(abilDef.name)) : (sk.effects && Object.keys(sk.effects).length ? mk('p', null, Screens.effectsText(sk.effects)) : null),
+      mk('p', { class: 'dim' }, t('hero.minLevel', { n: sk.minLevel || 1})), lockReason ? mk('p', { class: 'bad' }, lockReason) : null]));
+    return card;
+  }
+  function skillColumns(game, hero, list) {
+    const cols = mk('div', { class: 'sc-skillcols' });
+    for (let tier = 1; tier <= 3; tier++) {
+      const col = mk('div', { class: 'sc-skillcol' });
+      for (const sk of list.filter(s => (s.tier || 1) === tier && !s.signature)) col.appendChild(skillCard(game, hero, sk));
+      cols.appendChild(col);
+    }
+    return cols;
+  }
+  function signatureRow(game, hero, list) {
+    const sigs = list.filter(s => s.signature);
+    if (!sigs.length) return null;
+    return mk('div', null, mk('div', { class: 'sc-h' }, t('hero.signature')), mk('div', { class: 'sc-skillcols' }, mk('div', { class: 'sc-skillcol' }, sigs.map(sk => skillCard(game, hero, sk)))));
+  }
+  function equipmentPanel(ctx, game, player, hero) {
+    const box = mk('div', { class: 'sc-slots' });
+    for (const slot of HERO_SLOTS) {
+      const itemId = hero.items && hero.items[slot];
+      const item = itemId ? get('items', itemId) : null;
+      const cell = mk('div', { class: 'sc-slot' + (item ? ' rar-' + item.rarity : ''), onclick: () => { ctx.state.slotPick = ctx.state.slotPick === slot ? null : slot; refreshScreen('hero'); } },
+        icon(item ? (item.icon || ('item_' + slot)) : ('item_' + slot), 26),
+        mk('div', { class: 'sname' }, t('hero.slot.' + slot)),
+        mk('div', { class: 'iname' + (item ? ' c-' + item.rarity : '') }, item ? L(item.name) : t('sc.none')));
+      if (item) tip(cell, () => tipBox(L(item.name), [t('rarity.' + item.rarity), L(item.desc), Object.keys(item.effects || {}).length ? mk('p', null, Screens.effectsText(item.effects)) : null]));
+      box.appendChild(cell);
+    }
+    return box;
+  }
+  function inventoryPanel(ctx, game, player, hero) {
+    const items = (player.items || []).map(id => get('items', id)).filter(Boolean);
+    const slot = ctx.state.slotPick;
+    const list = slot ? items.filter(it => it.slot === slot) : items;
+    const box = mk('div', null, mk('div', { class: 'sc-h' }, t('hero.inventory') + (slot ? ' — ' + t('hero.slot.' + slot) : '')));
+    if (!list.length) { box.appendChild(emptyNote(t('hero.inventoryEmpty'))); return box; }
+    for (const it of list) {
+      const equippedHere = hero.items && hero.items[it.slot] === it.id;
+      const row = mk('div', { class: 'sc-row' }, icon(it.icon || ('item_' + it.slot), 30),
+        mk('div', { class: 'grow' }, mk('div', { class: 'name c-' + it.rarity }, L(it.name), ' ', mk('span', { class: 'sc-badge' }, t('rarity.' + it.rarity))), mk('div', { class: 'sub' }, Screens.effectsText(it.effects) || L(it.desc))),
+        equippedHere
+          ? btn(t('hero.unequip'), () => { const f = fn('Rules', 'unequipItem'); if (!f) { toast('warn', t('sc.unavailable')); return; } result(f(game, hero, it.slot)); after('hero'); }, { small: true, kind: 'danger' })
+          : btn(t('hero.equip'), () => { const f = fn('Rules', 'equipItem'); if (!f) { toast('warn', t('sc.unavailable')); return; } if (result(f(game, hero, it.id, it.slot))) sfx('ui_click'); after('hero'); }, { small: true, kind: 'primary' }));
+      box.appendChild(row);
+    }
+    return box;
+  }
+  function heroTabs(ctx, game, heroes, activeId) {
+    const box = mk('div', { class: 'sc-herotabs' });
+    for (const h of heroes) {
+      box.appendChild(mk('div', { class: 'sc-herotab' + (h.id === activeId ? ' active' : ''), onclick: () => { ctx.state.heroId = h.id; ctx.state.slotPick = null; refreshScreen('hero'); } },
+        heroPortrait(h, 40), mk('div', { class: 'grow' }, mk('div', { class: 'name' }, h.name, h.isRuler ? icon('crown', 12) : null),
+          mk('div', { class: 'sub' }, t('sc.level') + ' ' + h.level, h.dead ? mk('span', { class: 'bad' }, ' · ' + t('hero.dead')) : null))));
+    }
+    return box;
+  }
+  defineScreen('hero', {
+    title: () => t('hero.title'), width: 1200,
+    build(ctx) {
+      const g = game(); if (!g) return emptyNote(t('sc.noGame'));
+      const player = human(g); if (!player) return emptyNote(t('sc.notFound'));
+      const heroes = heroList(g, player);
+      if (!heroes.length) return emptyNote(t('hero.none'));
+      if (ctx.params.heroId !== undefined && ctx.state.heroId === undefined) ctx.state.heroId = ctx.params.heroId;
+      let hero = (ctx.state.heroId !== undefined ? S().hero(g, ctx.state.heroId) : null) || heroes.find(h => h.isRuler) || heroes[0];
+      if (!hero || hero.owner !== player.id) return emptyNote(t('sc.notFound'));
+      const unit = hero.unitId >= 0 ? S().unit(g, hero.unitId) : null;
+      const { classList, generalList, rulerList } = heroSkillsFor(hero);
+      const cls = get('heroClasses', hero.classId);
+      const left = mk('div', { class: 'sc-col-side' }, heroTabs(ctx, g, heroes, hero.id));
+      const midParts = [
+        mk('div', { class: 'sc-city-head' }, heroPortrait(hero, 72),
+          mk('div', { class: 'grow' }, mk('div', { class: 'sc-city-name' }, hero.name, hero.isRuler ? mk('span', { class: 'sc-badge' }, icon('crown', 12), ' ' + t('hero.ruler')) : null),
+            mk('div', { class: 'sub' }, (cls ? L(cls.name) : hero.classId) + ' · ' + t('sc.level') + ' ' + hero.level, hero.dead ? mk('span', { class: 'bad' }, ' · ' + t('hero.dead')) : null)),
+          !hero.dead ? mk('div', { style: 'flex:1;min-width:160px' }, progress(hero.xp, heroXpNeed(g, hero), { color: '#5a7ff0', label: fmt(hero.xp) + ' / ' + fmt(heroXpNeed(g, hero)), height: 14 })) : null),
+        heroStatsRow(g, hero, unit),
+        mk('div', { class: 'sc-h' }, t('hero.skillPoints') + ': ' + num(hero.skillPoints)),
+        mk('div', { class: 'sc-h' }, t('hero.class') + ': ' + (cls ? L(cls.name) : hero.classId)), skillColumns(g, hero, classList), signatureRow(g, hero, classList),
+      ];
+      if (generalList.length) midParts.push(mk('div', { class: 'sc-h' }, t('hero.general')), skillColumns(g, hero, generalList));
+      if (rulerList.length) midParts.push(mk('div', { class: 'sc-h' }, t('hero.ruler')), skillColumns(g, hero, rulerList));
+      const mid = mk('div', { class: 'sc-col' }, midParts);
+      const right = mk('div', { class: 'sc-col-side' }, mk('div', { class: 'sc-h' }, t('hero.equipment')), equipmentPanel(ctx, g, player, hero), inventoryPanel(ctx, g, player, hero));
+      return mk('div', { class: 'sc-cols' }, left, mid, right);
+    },
+  });
+
+  // ================================================================ EMPIRE
+  const EMPIRE_TREES = ['general'].concat(AFFS);
+  function empireAffinityMeets(player, n) {
+    if (!n.affinityReq) return true;
+    if (n.tree === 'general') { let sum = 0; for (const a of AFFS) sum += num(player.affinity && player.affinity[a]); return sum >= n.affinityReq; }
+    return num(player.affinity && player.affinity[n.tree]) >= n.affinityReq;
+  }
+  function empireTreeGrid(ctx, g, player, tree) {
+    const nodes = D().list('empireSkills').filter(n => n.tree === tree);
+    if (!nodes.length) return emptyNote(t('sc.unavailable'));
+    let maxCol = 0, maxRow = 0;
+    for (const n of nodes) { maxCol = Math.max(maxCol, n.col || 0); maxRow = Math.max(maxRow, n.row || 0); }
+    const CW = 168, RH = 96, PAD = 16, NODE_W = 156;
+    const width = PAD * 2 + (maxCol + 1) * CW, height = PAD * 2 + (maxRow + 1) * RH;
+    const owned = new Set(player.empireSkills || []);
+    const pos = {}; for (const n of nodes) pos[n.id] = { x: PAD + (n.col || 0) * CW, y: PAD + (n.row || 0) * RH };
+    // real SVG nodes (createElementNS) — a plain document.createElement('svg')/innerHTML would create HTML
+    // "unknown elements" instead of actual shapes, so the connector lines must be built this way to render.
+    const SVGNS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(SVGNS, 'svg');
+    svg.setAttribute('width', width); svg.setAttribute('height', height);
+    for (const n of nodes) for (const p of n.prereq || []) if (pos[p]) {
+      const a = pos[p], b = pos[n.id], on = owned.has(p) && owned.has(n.id);
+      const line = document.createElementNS(SVGNS, 'line');
+      line.setAttribute('x1', a.x + NODE_W / 2); line.setAttribute('y1', a.y + 58);
+      line.setAttribute('x2', b.x + NODE_W / 2); line.setAttribute('y2', b.y);
+      line.setAttribute('stroke', on ? '#c9a24a' : 'rgba(201,162,74,.35)'); line.setAttribute('stroke-width', '2');
+      svg.appendChild(line);
+    }
+    const wrap = mk('div', { class: 'sc-tree', style: { width: width + 'px', height: (height + 8) + 'px' } });
+    wrap.appendChild(svg);
+    for (const n of nodes) {
+      const isOwned = owned.has(n.id);
+      const prereqOk = (n.prereq || []).every(p => owned.has(p));
+      const affOk = empireAffinityMeets(player, n);
+      const canBuy = !isOwned && prereqOk && affOk;
+      const cell = mk('div', { class: 'sc-node' + (isOwned ? ' owned' : (canBuy ? ' available' : ' locked')) + (n.rite ? ' rite' : ''), style: { left: pos[n.id].x + 'px', top: pos[n.id].y + 'px' } },
+        mk('div', { class: 'nname' }, n.rite ? icon('star', 12) : null, L(n.name)),
+        mk('div', { class: 'nsub' }, res('imperium', n.cost && n.cost.imperium, { size: 12 })),
+        isOwned ? mk('span', { class: 'sc-badge good' }, t('sc.owned'))
+          : btn(t('empire.buy'), () => { const f = fn('Rules', 'buyEmpireSkill'); if (!f) { toast('warn', t('empire.noBuy')); return; } if (result(f(g, player, n.id))) sfx('coin'); after('empire'); },
+            { small: true, kind: 'primary', disabled: !canBuy }));
+      const reason = !isOwned && !prereqOk ? t('empire.needPrereq') : (!isOwned && !affOk ? t('empire.affinityReq', { aff: tree === 'general' ? t('empire.tree.general') : t('affinity.' + tree), n: n.affinityReq }) : '');
+      tip(cell, () => tipBox(L(n.name), [L(n.desc), Object.keys(n.effects || {}).length ? mk('p', null, Screens.effectsText(n.effects)) : null, reason ? mk('p', { class: 'bad' }, reason) : null]));
+      wrap.appendChild(cell);
+    }
+    return wrap;
+  }
+  defineScreen('empire', {
+    title: () => t('empire.title'), width: 1220,
+    build(ctx) {
+      const g = game(); if (!g) return emptyNote(t('sc.noGame'));
+      const player = human(g); if (!player) return emptyNote(t('sc.notFound'));
+      const tree = ctx.state.tree || 'general';
+      const setTree = (id) => { ctx.state.tree = id; refreshScreen('empire'); };
+      const tabList = EMPIRE_TREES.map(id => ({ id, label: id === 'general' ? t('empire.tree.general') : t('affinity.' + id), icon: id === 'general' ? 'gear' : id }));
+      const header = mk('div', { class: 'sc-yields' }, res('imperium', num(player.resources && player.resources.imperium), { size: 20 }), researchAffinityBars(g, player));
+      return [header, tabs(tabList, tree, setTree), empireTreeGrid(ctx, g, player, tree)];
+    },
+  });
+
+  // ================================================================ DIPLOMACY
+  function stateBadgeClass(state) { return state === 'war' ? 'war' : (state === 'alliance' || state === 'defensive_pact') ? 'good' : ''; }
+  function dipProposeTerms(kind) { return kind === 'gift' ? { gold: 50 } : kind === 'trade' ? { give: { gold: 30 }, get: { mana: 25 }, turns: 10 } : {}; }
+  function dipButtons(g, player, other, s) {
+    const bar = mk('div', { class: 'sc-dip-btns' });
+    const propose = (kind) => () => {
+      const f = fn('Diplomacy', 'propose'); if (!f) { toast('warn', t('sc.unavailable')); return; }
+      const r = f(g, player.id, other.id, kind, dipProposeTerms(kind));
+      if (!r || r.ok === false) { toast('warn', (r && (r.reason || r.text)) ? reasonText(r) : t('dip.failed')); return; }
+      toast(r.accepted ? 'good' : 'info', r.accepted ? t('dip.accepted', { name: other.name }) : (r.pending ? t('dip.sent') : t('dip.rejected', { name: other.name })));
+      after('diplomacy');
+    };
+    const can = k => !s || s.canPropose[k] !== false;
+    if (s && s.state === 'war') {
+      bar.appendChild(btn(t('dip.propose.peace'), propose('peace'), { small: true, kind: 'gold', disabled: !can('peace') }));
+    } else {
+      bar.appendChild(btn(t('dip.propose.non_aggression'), propose('non_aggression'), { small: true, disabled: !can('non_aggression') }));
+      bar.appendChild(btn(t('dip.propose.defensive_pact'), propose('defensive_pact'), { small: true, disabled: !can('defensive_pact') }));
+      bar.appendChild(btn(t('dip.propose.alliance'), propose('alliance'), { small: true, disabled: !can('alliance') }));
+      bar.appendChild(btn(t('dip.declareWar'), () => confirm(t('dip.confirmWar', { name: other.name }), () => {
+        const f = fn('Diplomacy', 'declareWar'); if (!f) { toast('warn', t('sc.unavailable')); return; }
+        result(f(g, player.id, other.id, {})); after('diplomacy');
+      }), { small: true, kind: 'danger', disabled: !can('declare_war') }));
+    }
+    bar.appendChild(btn(t('dip.gift'), () => giftModal(g, player, other), { small: true, kind: 'ghost' }));
+    return bar;
+  }
+  function giftModal(g, player, other) {
+    const maxGold = Math.max(0, num(player.resources && player.resources.gold));
+    const input = mk('input', { class: 'sc-input', type: 'number', min: 0, max: maxGold, value: Math.min(50, maxGold) });
+    modal({
+      title: t('dip.gift') + ' — ' + other.name,
+      body: mk('div', null, mk('div', { class: 'sub' }, t('dip.giftAmount')), input),
+      buttons: [{ label: t('sc.cancel') }, {
+        label: t('sc.ok'), kind: 'primary', onClick: () => {
+          const v = Math.max(0, Math.round(+input.value || 0));
+          const f = fn('Diplomacy', 'propose'); if (!f) { toast('warn', t('sc.unavailable')); return; }
+          const r = f(g, player.id, other.id, 'gift', { gold: v });
+          if (result(r)) toast('good', t('dip.sent'));
+          after('diplomacy');
+        },
+      }],
+    });
+  }
+  function diploRow(ctx, g, player, other) {
+    const sumFn = fn('Diplomacy', 'summary');
+    const s = sumFn ? sumFn(g, player.id, other.id) : null;
+    const opinion = s ? s.opinion : 0;
+    const state = s ? s.state : 'peace';
+    const row = mk('div', { class: 'sc-row sc-dip-row' },
+      mk('div', { class: 'sc-banner', style: { background: other.color || '#3a4460', borderColor: other.color2 || 'rgba(255,255,255,.35)' } }, (other.name || '?').slice(0, 1)),
+      mk('div', { class: 'grow' },
+        mk('div', { class: 'name' }, other.name, ' ', mk('span', { class: 'sc-badge ' + stateBadgeClass(state) }, s ? L(s.stateName) : t('dip.state.peace')), other.alive === false ? mk('span', { class: 'sc-badge' }, t('dip.dead')) : null),
+        mk('div', { class: 'sub' }, t('dip.personality.' + (other.personality || 'expansionist')), ' · ', t('dip.ruler') + ': ' + (other.rulerName || ''), ' · ', t('dip.opinion') + ': ', mk('b', null, String(opinion)), s ? ' (' + L(s.opinionLabel) + ')' : ''),
+        s && s.treaties.length ? mk('div', { class: 'sub' }, t('dip.treaties') + ': ' + s.treaties.map(tr => L(tr.name)).join(', ')) : null,
+        state === 'war' ? mk('div', { class: 'sub warn' }, t('dip.warScore') + ': ' + (s ? s.warScore : 0)) : null,
+        other.alive === false ? null : dipButtons(g, player, other, s)));
+    if (s) tip(row, () => tipBox(t('dip.breakdown'), s.factors.map(f => mk('div', null, L(f.label) + ': ' + fmtSigned(f.value)))));
+    return row;
+  }
+  function pendingProposalsPanel(g, player) {
+    const pendFn = fn('Diplomacy', 'pending');
+    const list = pendFn ? pendFn(g, player.id) : [];
+    if (!list.length) return null;
+    const kindNameFn = fn('Diplomacy', 'kindName');
+    const wrap = mk('div', null, mk('div', { class: 'sc-h' }, t('dip.incoming', { name: '' })));
+    for (const p of list) {
+      const from = g.players[p.from];
+      const row = mk('div', { class: 'sc-row' },
+        mk('div', { class: 'grow' }, mk('div', { class: 'name' }, from ? from.name : '?'), mk('div', { class: 'sub' }, kindNameFn ? L(kindNameFn(p.kind)) : p.kind)),
+        btn(t('dip.accept'), () => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, p, true); after('diplomacy'); }, { small: true, kind: 'primary' }),
+        btn(t('dip.decline'), () => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, p, false); after('diplomacy'); }, { small: true, kind: 'ghost' }));
+      wrap.appendChild(row);
+    }
+    return wrap;
+  }
+  /** opens the accept/decline modal for an incoming proposal (used by Events 'diplomacy:proposal' and the pending list). */
+  Screens.showProposal = function (proposal) {
+    const g = game(); if (!g || !proposal) return;
+    const from = g.players[proposal.from];
+    const kindNameFn = fn('Diplomacy', 'kindName');
+    modal({
+      title: t('dip.incoming', { name: from ? from.name : '?' }), icon: 'diplomacy', width: 420,
+      body: mk('div', null, mk('div', { class: 'sc-h' }, kindNameFn ? L(kindNameFn(proposal.kind)) : proposal.kind)),
+      buttons: [
+        { label: t('dip.decline'), kind: 'ghost', onClick: () => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, proposal, false); refreshUI(); refreshScreen('diplomacy'); } },
+        { label: t('dip.accept'), kind: 'primary', onClick: () => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, proposal, true); refreshUI(); refreshScreen('diplomacy'); } },
+      ],
+    });
+  };
+  defineScreen('diplomacy', {
+    title: () => t('dip.title'), width: 1040,
+    build(ctx) {
+      const g = game(); if (!g) return emptyNote(t('sc.noGame'));
+      const player = human(g); if (!player) return emptyNote(t('sc.notFound'));
+      const others = g.players.filter(p => p.id !== player.id);
+      if (!others.length) return emptyNote(t('dip.noOthers'));
+      const pend = pendingProposalsPanel(g, player);
+      const rows = others.map(o => diploRow(ctx, g, player, o));
+      return pend ? [pend, mk('div', { class: 'aow-divider' }), ...rows] : rows;
+    },
+  });
+
+  // ================================================================ VICTORY
+  defineScreen('victory', {
+    title: () => t('vic.victory'), fullscreen: true,
+    build(ctx) {
+      const g = game();
+      const p = ctx.params || {};
+      const winner = g && p.winner !== undefined && p.winner !== null ? g.players[p.winner] : null;
+      const humanP = g ? human(g) : null;
+      const won = !!(humanP && winner && humanP.id === winner.id);
+      const box = mk('div', { class: 'sc-victory' + (won ? '' : ' lose') });
+      box.appendChild(mk('h1', null, won ? t('vic.victory') : t('vic.defeat')));
+      box.appendChild(mk('h2', null, t('vic.type.' + (p.type || 'score'))));
+      box.appendChild(mk('div', { class: 'orn' }));
+      box.appendChild(mk('div', { class: 'sub', style: 'font-size:16px;margin-bottom:10px;max-width:520px;text-align:center' }, t(won ? 'vic.subtitle.win' : 'vic.subtitle.lose', { name: winner ? winner.name : '?' })));
+      if (g) {
+        const rows = [mk('tr', null, mk('th', null, t('vic.player')), mk('th', null, t('vic.cities')), mk('th', null, t('vic.units')), mk('th', null, t('vic.territory')), mk('th', null, t('vic.score')))];
+        for (const pl of g.players) {
+          const isWinner = winner && pl.id === winner.id;
+          rows.push(mk('tr', null,
+            mk('td', { style: isWinner ? 'color:var(--gold-light);font-weight:700' : '' }, pl.name + (isWinner ? ' ★' : '')),
+            mk('td', null, String(num(pl.stats && pl.stats.cities))), mk('td', null, String(num(pl.stats && pl.stats.units))),
+            mk('td', null, String(num(pl.stats && pl.stats.territory))), mk('td', null, String(num(pl.stats && pl.stats.score)))));
+        }
+        box.appendChild(mk('div', { class: 'sub' }, t('vic.turns') + ': ' + g.turn));
+        box.appendChild(mk('table', null, rows));
+      }
+      box.appendChild(mk('div', { class: 'aow-row', style: 'display:flex;gap:12px;margin-top:6px' },
+        btn(t('vic.continue'), () => closeScreen(), { kind: 'gold', large: true }),
+        btn(t('vic.menu'), () => { const f = fn('UI', 'quitToMenu'); if (f) f(); else closeScreen(); }, { large: true })));
+      return box;
+    },
+  });
+
+  // ================================================================ ENCYCLOPEDIA
+  const ENC_CATS = ['cultures', 'forms', 'units', 'tomes', 'spells', 'buildings', 'heroClasses', 'improvements', 'wonders', 'items', 'abilities', 'statuses', 'empireSkills', 'traits', 'rulerTypes'];
+  function encEntryIcon(cat, d) {
+    if (cat === 'units') return Screens.unitPortrait(d, 28);
+    if (cat === 'tomes') return tomeIcon(d.id, 26);
+    if (cat === 'items') return icon(d.icon || 'item_trinket', 22);
+    if (cat === 'spells') return icon(AFFS.find(a => d.affinity && d.affinity[a]) || 'spellbook', 20);
+    if (cat === 'buildings') return icon(CAT_ICON[d.category] || 'city', 20);
+    if (cat === 'heroClasses') return icon('hero_star', 20);
+    if (cat === 'wonders') return icon('wonder', 20);
+    if (cat === 'cultures') return icon('flag', 20);
+    return icon('scroll', 18);
+  }
+  function encDetail(cat, d) {
+    if (!d) return emptyNote(t('enc.pick'));
+    const box = mk('div', { class: 'sc-enc-detail' });
+    box.appendChild(mk('h3', null, L(d.name)));
+    if (d.desc) box.appendChild(mk('p', null, L(d.desc)));
+    const kv = mk('div', { class: 'sc-kv' });
+    const addKv = (k, v) => { if (v === null || v === undefined || v === '') return; kv.appendChild(mk('div', { class: 'k' }, k)); kv.appendChild(mk('div', null, String(v))); };
+    if (cat === 'units') {
+      addKv(t('sc.tier'), tierRoman(d.tier)); addKv(t('ui.role'), t('role.' + d.role)); addKv(t('enc.move'), (d.move || '') + ' (' + num(d.mp) + ')');
+      addKv(t('ui.hp'), d.hp); addKv(t('ui.def'), d.def); addKv(t('ui.res'), d.res);
+      if (d.tags && d.tags.length) addKv(t('enc.tags'), d.tags.join(', '));
+      box.appendChild(kv);
+      if (d.attacks && d.attacks.length) {
+        box.appendChild(mk('div', { class: 'sc-h' }, t('enc.attacks')));
+        for (const a of d.attacks) box.appendChild(mk('p', null, L(a.name) + ': ' + a.damage + ' ' + t('channel.' + (a.channel || 'physical')) + (a.range > 1 ? ' / ' + t('stat.range') + ' ' + a.range : '')));
+      }
+      const abil = (d.abilities || []).concat(d.passives || []);
+      if (abil.length) { box.appendChild(mk('div', { class: 'sc-h' }, t('enc.abilities'))); box.appendChild(mk('p', null, abil.map(a => { const ad = get('abilities', a); return ad ? L(ad.name) : a; }).join(', '))); }
+    } else if (cat === 'tomes') {
+      addKv(t('sc.tier'), tierRoman(d.tier)); addKv(t('research.affinity'), affText(d.affinity)); box.appendChild(kv);
+      if (d.passive) box.appendChild(mk('p', null, mk('b', null, t('research.passive') + ': '), L(d.passive.desc)));
+      if (d.contents && d.contents.length) {
+        box.appendChild(mk('div', { class: 'sc-h' }, t('research.contents')));
+        for (const c of d.contents) { const cd = contentDef(c); box.appendChild(mk('p', null, (cd ? L(cd.name) : c.id) + ' — ' + t('research.type.' + c.type))); }
+      }
+    } else if (cat === 'spells') {
+      addKv(t('sc.tier'), tierRoman(d.tier)); addKv(t('research.affinity'), affText(d.affinity)); box.appendChild(kv);
+      box.appendChild(mk('p', null, t('spell.kind.' + d.kind)));
+      if (d.cost) box.appendChild(mk('p', null, t('sc.cost') + ': ' + Object.keys(d.cost).filter(k => d.cost[k]).map(k => d.cost[k] + ' ' + (k === 'cp' ? t('spell.cp') : t('resource.' + k))).join(', ')));
+      if (d.enchant && d.enchant.effects) box.appendChild(mk('p', null, Screens.effectsText(d.enchant.effects)));
+    } else if (cat === 'buildings') {
+      addKv(t('sc.tier'), d.tier); addKv(t('sc.cost'), d.cost && d.cost.production); box.appendChild(kv);
+      if (d.effects) box.appendChild(mk('p', null, Screens.effectsText(d.effects)));
+    } else if (cat === 'improvements') {
+      if (d.yields) box.appendChild(mk('p', null, Screens.effectsText(d.yields)));
+    } else if (cat === 'heroClasses') {
+      if (d.signature && d.signature.length) { box.appendChild(mk('div', { class: 'sc-h' }, t('enc.signature'))); box.appendChild(mk('p', null, d.signature.map(id => { const s = get('heroSkills', id); return s ? L(s.name) : id; }).join(', '))); }
+    } else if (cat === 'wonders') {
+      addKv(t('sc.tier'), tierRoman(d.tier)); box.appendChild(kv);
+      if (d.rewards) box.appendChild(mk('p', null, mk('b', null, t('enc.rewards') + ': '), Screens.effectsText(d.rewards)));
+    } else if (cat === 'items') {
+      box.appendChild(mk('p', { class: 'c-' + d.rarity }, t('rarity.' + d.rarity) + ' · ' + t('hero.slot.' + d.slot)));
+      if (d.effects) box.appendChild(mk('p', null, Screens.effectsText(d.effects)));
+    } else if (cat === 'empireSkills') {
+      addKv(t('sc.tier'), d.tier); addKv(t('sc.cost'), d.cost && d.cost.imperium); box.appendChild(kv);
+      if (d.effects) box.appendChild(mk('p', null, Screens.effectsText(d.effects)));
+    } else if (cat === 'cultures') {
+      if (d.units && d.units.length) { box.appendChild(mk('div', { class: 'sc-h' }, t('enc.roster'))); box.appendChild(mk('p', null, d.units.map(id => { const u = get('units', id); return u ? L(u.name) : id; }).join(', '))); }
+      if (d.subChoices && d.subChoices.length) { box.appendChild(mk('div', { class: 'sc-h' }, t('enc.subChoices'))); box.appendChild(mk('p', null, d.subChoices.map(s => L(s.name)).join(', '))); }
+    } else if (cat === 'traits' || cat === 'abilities' || cat === 'statuses' || cat === 'forms' || cat === 'rulerTypes') {
+      if (d.kind) box.appendChild(mk('p', null, t('enc.kind') + ': ' + d.kind));
+      if (d.effects && Object.keys(d.effects).length) box.appendChild(mk('p', null, Screens.effectsText(d.effects)));
+    }
+    return box;
+  }
+  defineScreen('encyclopedia', {
+    title: () => t('enc.title'), width: 1220,
+    build(ctx) {
+      const cat = ctx.state.cat && D().list(ctx.state.cat) ? ctx.state.cat : (ENC_CATS.find(c => D().list(c).length) || ENC_CATS[0]);
+      ctx.state.cat = cat;
+      const catsCol = mk('div', { class: 'sc-enc-cats' });
+      for (const c of ENC_CATS) {
+        catsCol.appendChild(mk('div', { class: 'sc-enc-cat' + (c === cat ? ' active' : ''), onclick: () => { ctx.state.cat = c; ctx.state.sel = null; refreshScreen('encyclopedia'); } },
+          t('enc.cat.' + c) + ' (' + D().list(c).length + ')'));
+      }
+      const list = D().list(cat).slice().sort((a, b) => L(a.name).localeCompare(L(b.name)));
+      const search = mk('input', { class: 'sc-input', placeholder: t('sc.search'), style: 'width:100%;margin-bottom:6px' });
+      const listBox = mk('div', { class: 'sc-enc-list' });
+      const sel = (ctx.state.sel && list.find(d => d.id === ctx.state.sel)) || list[0] || null;
+      for (const d of list) {
+        const item = mk('div', { class: 'sc-enc-item' + (sel && d.id === sel.id ? ' active' : ''), dataset: { name: L(d.name).toLowerCase() }, onclick: () => { ctx.state.sel = d.id; refreshScreen('encyclopedia'); } }, encEntryIcon(cat, d), mk('span', null, L(d.name)));
+        listBox.appendChild(item);
+      }
+      search.addEventListener('input', () => {
+        const q = search.value.toLowerCase();
+        for (const item of listBox.children) item.style.display = (!q || (item.dataset.name || '').includes(q)) ? '' : 'none';
+      });
+      const listCol = mk('div', null, search, listBox);
+      const detailCol = encDetail(cat, sel);
+      return mk('div', { class: 'sc-enc' }, catsCol, listCol, detailCol);
+    },
+  });
+
   // ================================================================ CITIES LIST
   defineScreen('cities', {
     title: () => t('cities.title'), cls: 'sc-panel-narrow',
@@ -916,6 +1522,12 @@
   if (AOW.Events) {
     AOW.Events.on('game:new', () => Screens.registerAll());
     AOW.Events.on('ui:screen', () => Screens.registerAll());
+    // incoming diplomatic proposal → show the accept/decline modal for the human recipient
+    AOW.Events.on('diplomacy:proposal', (p) => {
+      const g = game(); if (!g || !p) return;
+      const me = human(g); if (!me || p.to !== me.id) return;
+      Screens.showProposal(p.proposal || p);
+    });
   }
   Screens.registerAll();
 })(window.AOW = window.AOW || {});

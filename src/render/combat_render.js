@@ -93,7 +93,12 @@
   function vfxText(x, y, str, o) {
     o = o || {};
     if (has('VFX', 'text')) { try { AOW.VFX.text(x, y, str, o); return; } catch (e) { /* fall through */ } }
-    texts.push({ x, y, str, color: o.color || '#fff', size: o.size || 14, crit: !!o.crit, t: 0, dur: o.rise === false ? 0.8 : 1.1, rise: 34 });
+    // avoid stacking illegible text when two separate events (e.g. a retaliation and a ranged
+    // shot) land on the same unit within the same beat — fan newer ones out from the spot
+    let stack = 0;
+    for (const f of texts) { if (f.t < 0.35 && Math.abs(f.x - x) < 30 && Math.abs(f.y - y) < 26) stack++; }
+    const jx = stack ? (stack % 2 ? -1 : 1) * Math.ceil(stack / 2) * 13 : 0;
+    texts.push({ x: x + jx, y: y - stack * 15, str, color: o.color || '#fff', size: o.size || 14, crit: !!o.crit, t: 0, dur: o.rise === false ? 0.8 : 1.1, rise: 34 });
   }
   function L(obj, fallback) { if (!obj) return fallback || ''; if (typeof obj === 'string') return obj; return AOW.L ? AOW.L(obj) : (obj.en || obj.ko || fallback || ''); }
   function t(key, fallback, params) {

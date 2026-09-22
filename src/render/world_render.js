@@ -17,7 +17,11 @@
 //   WorldRender.renderMinimap(ctx, w, h) ; WorldRender.minimapToWorld(mx, my, w, h) → {x, y} world px
 //   WorldRender.demo(canvas, query)           standalone showcase: seed 'demo', centred on the capital; returns timing
 // Additive helpers (SPEC §0): WorldRender.camera (live), WorldRender.viewerPid, WorldRender.debug (overlay flag),
-//   WorldRender.edgeScroll (bool), WorldRender.followMoves (bool), WorldRender.stats() → last frame timings,
+//   WorldRender.edgeScroll (bool), WorldRender.followMoves (bool), WorldRender.stats() → last frame timings
+//   {frameMs, fps, builds, fogBuilds (chunk/fog rebuilds THIS frame, budget-capped), totalChunkBuilds,
+//    totalFogBuilds (lifetime), chunkMsMax, lastChunkMs, lastFogMs, chunks, drawn:{chunks,structs,armies},
+//    t:{chunks,water,borders,entities,vfx,fog,clouds,labels,vignette} per-section ms (ewma, indicative only —
+//    a software/SwiftShader canvas backend can defer rasterization past the section that recorded it)},
 //   WorldRender.resize(), WorldRender.setZoom(z, sx, sy), WorldRender.hoverIdx, WorldRender.chunkCount().
 // Events emitted: 'hex:hover' {idx}, 'hex:click' {idx, button, shift, ctrl, alt, x, y}, 'hex:dblclick' {idx}.
 //
@@ -26,7 +30,7 @@
 (function (AOW) {
   'use strict';
   const WR = {};
-  const CHUNK = 8;                       // hexes per chunk side
+  const CHUNK = 6;                       // hexes per chunk side
   const ZOOM_MIN = 0.35, ZOOM_MAX = 2.2;
   const LOD_ZOOM = 0.7;                  // zoom ≥ LOD_ZOOM → detailed chunks, else simplified half-res chunks
   const LOD_SCALE = [0.5, 1];            // canvas scale per LOD
@@ -45,12 +49,21 @@
   let dpr = 1, viewW = 1, viewH = 1;
   let time = 0, frameNo = 0;
   const cam = { x: 0, y: 0, zoom: 1, tz: 1, vx: 0, vy: 0 };   // tz = target zoom, vx/vy = inertia (world px/s)
+  // device-pixel-snapped camera position used only for the big image layers (terrain/fog/water/clouds): keeps the
+  // world→screen transform's translation an integer number of device px so drawImage never falls into the
+  // (much slower, software-rasterizer) resampling path for an effectively 1:1 blit. Hit-testing / worldToScreen
+  // keep using the exact `cam` so clicks stay pixel-accurate; the < 0.5px/zoom draw offset this introduces is
+  // imperceptible and never accumulates (recomputed fresh every frame).
+  const camSnap = { x: 0, y: 0 };
+  function updateCamSnap() { camSnap.x = Math.round(cam.x * cam.zoom) / cam.zoom; camSnap.y = Math.round(cam.y * cam.zoom) / cam.zoom; }
   const zoomAnchor = { active: false, sx: 0, sy: 0, wx: 0, wy: 0 };
   const camTween = { active: false, t: 0, dur: 0.45, x0: 0, y0: 0, x1: 0, y1: 0 };
   const shake = { t: 0, dur: 0, amp: 0, x: 0, y: 0 };
   const keys = new Set();
   const pointer = { down: false, button: 0, sx: 0, sy: 0, lx: 0, ly: 0, dragging: false, x: -1, y: -1, inside: false, lastT: 0, vx: 0, vy: 0 };
-  const stats = { frameMs: 0, fps: 60, chunkBuilds: 0, fogBuilds: 0, chunkMsMax: 0, lastChunkMs: 0, drawn: { chunks: 0, structs: 0, armies: 0 } };
+  // builds/fogBuilds: chunk (re)builds THIS frame (the ≤MAX_CHUNK_BUILDS/MAX_FOG_BUILDS budget); totalChunkBuilds/
+  // totalFogBuilds: lifetime counters for diagnostics. t: last frame's per-section ms (ewma) — see WR.render.
+  const stats = { frameMs: 0, fps: 60, builds: 0, fogBuilds: 0, totalChunkBuilds: 0, totalFogBuilds: 0, chunkMsMax: 0, lastChunkMs: 0, drawn: { chunks: 0, structs: 0, armies: 0 }, t: {} };
   const chunkMaps = [new Map(), new Map()];   // per LOD: key → chunk
   let chunkSerial = 0;
   let hoverIdx = -1;
@@ -292,7 +305,7 @@
     c.restore();
     ch.built = true; ch.dirty = false; ch.serial = ++chunkSerial;
     ch.buildMs = performance.now() - t0;
-    stats.lastChunkMs = ch.buildMs; stats.chunkMsMax = Math.max(stats.chunkMsMax, ch.buildMs); stats.chunkBuilds++;
+    stats.lastChunkMs = ch.buildMs; stats.chunkMsMax = Math.max(stats.chunkMsMax, ch.buildMs); stats.totalChunkBuilds++;
   }
 
   WR.invalidate = function (idx) {
@@ -399,7 +412,9 @@
     if (!game) { drawVignette(); return; }
     updateCamera(dt);
     updateMoveAnims(dt);
+    if (hasFn('VFX', 'update')) { try { AOW.VFX.update(dt); } catch (e) { /* ignore */ } }
     computeView();
+    updateCamSnap();
     const lod = cam.zoom >= LOD_ZOOM ? 1 : 0;
     // ---- terrain chunks
     const cx0 = Math.floor(view.c0 / CHUNK), cx1 = Math.floor(view.c1 / CHUNK), cy0 = Math.floor(view.r0 / CHUNK), cy1 = Math.floor(view.r1 / CHUNK);
@@ -410,7 +425,7 @@
     ctx.save();
     ctx.translate(viewW / 2 + shake.x, viewH / 2 + shake.y);
     ctx.scale(cam.zoom, cam.zoom);
-    ctx.translate(-cam.x, -cam.y);
+    ctx.translate(-camSnap.x, -camSnap.y);
     ctx.imageSmoothingEnabled = true;
     stats.drawn.chunks = 0;
     for (let i = 0; i < order.length; i += 2) {
@@ -431,20 +446,26 @@
     }
     ctx.restore();
     if (builds) evictChunks();
+    const __t = stats.t;
+    let __p = mark('chunks', t0);
     // ---- water shimmer (cached layer, ≤ 15 Hz)
     if (cam.zoom >= 0.6) drawWaterLayer();
+    __p = mark('water', __p);
     // ---- world-space overlays (borders, structures, armies, highlights, fog …)
     ctx.save();
     ctx.translate(viewW / 2 + shake.x, viewH / 2 + shake.y);
     ctx.scale(cam.zoom, cam.zoom);
-    ctx.translate(-cam.x, -cam.y);
+    ctx.translate(-camSnap.x, -camSnap.y);
     drawBorders(lod, cx0, cx1, cy0, cy1);
+    __p = mark('borders', __p);
     if (hasFn('VFX', 'draw')) { try { AOW.VFX.draw(ctx, 'below'); } catch (e) { /* ignore */ } }
     drawHighlights();
     drawEntities();
+    __p = mark('entities', __p);
     drawPathPreview();
     if (hasFn('VFX', 'draw')) { try { AOW.VFX.draw(ctx, 'above'); } catch (e) { /* ignore */ } }
     drawRingFx(dt);
+    __p = mark('vfx', __p);
     // fog (needs the chunk fog canvases)
     for (let i = 0; i < order.length; i += 2) {
       const ch = getChunk(lod, order[i], order[i + 1], false);
@@ -452,13 +473,18 @@
       if (ch.fogDirty && (fogBuilds < MAX_FOG_BUILDS || buildAll)) { buildFog(ch); fogBuilds++; }
       if (ch.fogBuilt) drawFogChunk(ch);
     }
+    __p = mark('fog', __p);
     if (cam.zoom >= 0.8) drawCloudShadows();
+    __p = mark('clouds', __p);
     ctx.restore();
     // ---- screen space
     drawLabels();
+    __p = mark('labels', __p);
     drawVignette();
+    __p = mark('vignette', __p);
     if (hasFn('VFX', 'drawScreen')) { try { ctx.setTransform(dpr, 0, 0, dpr, 0, 0); AOW.VFX.drawScreen(ctx, viewW, viewH); } catch (e) { /* ignore */ } }
     if (WR.debug) drawDebug();
+    function mark(name, prev) { const now = performance.now(); __t[name] = (__t[name] || 0) * 0.9 + (now - prev) * 0.1; return now; }
     const ms = performance.now() - t0;
     stats.frameMs = stats.frameMs * 0.9 + ms * 0.1;
     stats.fps = stats.fps * 0.95 + (1 / Math.max(1e-3, dt)) * 0.05;
@@ -495,7 +521,7 @@
       const c = waterLayer.ctx, g = game, Hx = Hex(), T = State().TERRAINS, WM = State().WATER_MAX;
       c.setTransform(1, 0, 0, 1, 0, 0);
       c.clearRect(0, 0, w, h);
-      c.translate(viewW / 2, viewH / 2); c.scale(cam.zoom, cam.zoom); c.translate(-cam.x, -cam.y);
+      c.translate(viewW / 2, viewH / 2); c.scale(cam.zoom, cam.zoom); c.translate(-camSnap.x, -camSnap.y);
       const info = scratchInfo; info.size = Hx.SIZE; info.neighbors = null;
       const tt = stamp / 15;
       const vis = g.visible[viewerPid], ex = g.explored[viewerPid];
@@ -992,7 +1018,15 @@
       if ('filter' in target) target.filter = 'none';
       target.globalCompositeOperation = 'source-over';
     };
-    // ---- dim layer: cool grey, alpha = feathered coverage of explored-but-unseen hexes
+    // both layers are pre-composited into one canvas (ch.fogOut) so the hot per-frame draw path is a single
+    // drawImage per chunk instead of two — halves the fog draw-call count (draw calls, not pixel fill, are the
+    // dominant per-frame cost measured under software rendering). Purely additive alpha-over compositing, so
+    // building them in this order into an intermediate canvas is visually identical to drawing them in sequence
+    // straight onto the main canvas.
+    if (!ch.fogOut) ch.fogOut = Art().canvas(ch.w, ch.h);
+    const out = ch.fogOut.ctx;
+    out.setTransform(1, 0, 0, 1, 0, 0); out.clearRect(0, 0, ch.w, ch.h);
+    // ---- dim layer: cool grey wash, alpha = feathered coverage of explored-but-unseen hexes
     if (anyDim) {
       if (!ch.fogDim) ch.fogDim = Art().canvas(ch.w, ch.h);
       const d = ch.fogDim.ctx;
@@ -1000,6 +1034,9 @@
       d.fillStyle = 'rgb(118,122,138)'; d.fillRect(0, 0, ch.w, ch.h);
       buildMask(i => ex[i] && vis && !vis[i], FOG_MASK_GROW);
       applyMask(d);
+      out.globalAlpha = 0.55;
+      out.drawImage(ch.fogDim.cv, 0, 0, ch.w, ch.h);
+      out.globalAlpha = 1;
     }
     // ---- cloud layer: unexplored parchment-storm texture (drawn a ring wider so it bleeds softly over explored ground)
     if (anyCloud) {
@@ -1019,24 +1056,16 @@
       k.restore();
       buildMask(i => !ex[i], FOG_MASK_GROW + 6);
       applyMask(k);
+      out.drawImage(ch.fogCloud.cv, 0, 0, ch.w, ch.h);
     }
-    stats.fogBuilds++;
+    stats.totalFogBuilds++;
     stats.lastFogMs = performance.now() - t0;
   }
   function drawFogChunk(ch) {
-    if (!ch.fogHasDim && !ch.fogHasCloud) return;
+    if ((!ch.fogHasDim && !ch.fogHasCloud) || !ch.fogOut) return;
     const s = ch.scale;
     const sx = (ch.cutX0 - ch.ox) * s, sy = (ch.cutY0 - ch.oy) * s, sw = ch.cutW * s, sh = ch.cutH * s;
-    if (ch.fogHasDim && ch.fogDim) {
-      ctx.globalCompositeOperation = 'saturation';
-      ctx.drawImage(ch.fogDim.cv, sx, sy, sw, sh, ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
-      ctx.globalCompositeOperation = 'multiply';
-      ctx.globalAlpha = 0.72;
-      ctx.drawImage(ch.fogDim.cv, sx, sy, sw, sh, ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
-      ctx.globalAlpha = 1;
-      ctx.globalCompositeOperation = 'source-over';
-    }
-    if (ch.fogHasCloud && ch.fogCloud) ctx.drawImage(ch.fogCloud.cv, sx, sy, sw, sh, ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
+    ctx.drawImage(ch.fogOut.cv, sx, sy, sw, sh, ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
   }
 
   // ================================================================ cloud shadows, vignette, labels, debug
@@ -1360,16 +1389,40 @@
     const tBuild = performance.now() - t1;
     let frames = 0, tSum = 0;
     for (let i = 0; i < 8; i++) { const a = performance.now(); WR.render(0.016); tSum += performance.now() - a; frames++; }
+    drawDemoMinimap();
     const info = { gen: tGen.toFixed(0), build: tBuild.toFixed(0), frame: (tSum / frames).toFixed(2), chunks: WR.chunkCount(), lastChunk: stats.lastChunkMs.toFixed(1), maxChunk: stats.chunkMsMax.toFixed(1), fog: (stats.lastFogMs || 0).toFixed(1) };
     WR._demoInfo = info;
     // keep animating (banners, water, clouds) so screenshots capture the live look
     if (get('anim', '1') === '1') {
       let last = performance.now();
-      const loop = (t) => { const dt = Math.min(0.1, (t - last) / 1000); last = t; try { WR.render(dt); } catch (e) { console.error(e); return; } requestAnimationFrame(loop); };
+      const loop = (t) => { const dt = Math.min(0.1, (t - last) / 1000); last = t; try { WR.render(dt); drawDemoMinimap(); } catch (e) { console.error(e); return; } requestAnimationFrame(loop); };
       requestAnimationFrame(loop);
     }
     return 'gen ' + info.gen + 'ms, chunks ' + info.chunks + ' built in ' + info.build + 'ms (last ' + info.lastChunk + ', max ' + info.maxChunk + '), fog ' + info.fog + 'ms, frame ' + info.frame + 'ms @zoom ' + cam.zoom.toFixed(2);
   };
+
+  // ---- demo-only minimap inset (verifies WR.renderMinimap/minimapToWorld visually; SPEC's real HUD minimap lives
+  // in src/ui/hud.js — this is not drawn during normal gameplay, only from WR.demo's own loop).
+  let demoMM = null;
+  function drawDemoMinimap() {
+    if (!ctx || !game) return;
+    const w = 240, h = 160, pad = 10;
+    if (!demoMM) demoMM = Art().canvas(w, h);
+    try { WR.renderMinimap(demoMM.ctx, w, h); } catch (e) { AOW.warn('WR.demo: renderMinimap failed', e); return; }
+    const x = viewW - w - pad, y = viewH - h - pad;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 10;
+    Art().rrect(ctx, x - 4, y - 4, w + 8, h + 8, 6);
+    ctx.fillStyle = 'rgba(16,18,28,0.92)'; ctx.fill();
+    ctx.restore();
+    ctx.save();
+    Art().rrect(ctx, x - 1, y - 1, w + 2, h + 2, 3); ctx.clip();
+    ctx.drawImage(demoMM.cv, x, y);
+    ctx.restore();
+    Art().rrect(ctx, x - 2, y - 2, w + 4, h + 4, 4);
+    ctx.strokeStyle = 'rgba(201,162,74,0.9)'; ctx.lineWidth = 1.6; ctx.stroke();
+  }
 
   AOW.WorldRender = WR;
 })(window.AOW = window.AOW || {});
