@@ -229,14 +229,18 @@
   let pn = 0;
   function newPart() {
     return { x: 0, y: 0, vx: 0, vy: 0, ax: 0, ay: 0, drag: 0, life: 1, max: 1, s0: 8, s1: 8, sc: 0, a0: 1, a1: 0, fin: 0, flick: 0,
-      rot: 0, rv: 0, sp: null, add: false, below: false, wob: 0, wf: 0, ph: 0, mode: 0, ox: 0, oy: 0, orr: 0, orv: 0, orb: 0, ell: 1, str: 0, die: 0 };
+      rot: 0, rv: 0, sp: null, add: false, below: false, wob: 0, wf: 0, ph: 0, mode: 0, ox: 0, oy: 0, orr: 0, orv: 0, orb: 0, ell: 1, str: 0, die: 0, sy: 1 };
   }
+  // particle fields: s0/s1 size start→end with curve sc (0 linear, 1 ease-out, 2 grow-then-shrink, 3 ease-in); a0/a1 alpha, fin = fade-in
+  // fraction, flick = flicker amount; rot/rv rotation; add = additive; below = ground layer; wob/wf sideways wobble amplitude/frequency;
+  // mode 1 = orbit around (ox,oy) with radius orr (Δ orv/s), angular speed orb, vertical squash ell; str = stretch along velocity;
+  // die = spawn something on death (1 rain splash, 2 bubble pop); sy = draw-height squash (ground-plane rings/decals).
   const T = newPart();    // spawn template (reset by P(), copied into the pool by add())
   function P(x, y, sp, life) {
     const p = T;
     p.x = x; p.y = y; p.vx = 0; p.vy = 0; p.ax = 0; p.ay = 0; p.drag = 0; p.life = p.max = life;
     p.s0 = 8; p.s1 = 8; p.sc = 0; p.a0 = 1; p.a1 = 0; p.fin = 0; p.flick = 0; p.rot = 0; p.rv = 0; p.sp = sp; p.add = false; p.below = false;
-    p.wob = 0; p.wf = 0; p.ph = 0; p.mode = 0; p.ox = x; p.oy = y; p.orr = 0; p.orv = 0; p.orb = 0; p.ell = 1; p.str = 0; p.die = 0;
+    p.wob = 0; p.wf = 0; p.ph = 0; p.mode = 0; p.ox = x; p.oy = y; p.orr = 0; p.orv = 0; p.orb = 0; p.ell = 1; p.str = 0; p.die = 0; p.sy = 1;
     return p;
   }
   function add() {
