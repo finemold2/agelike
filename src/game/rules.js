@@ -58,6 +58,11 @@
   const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
   const L = (ko, en) => ({ ko, en });
   Rules.L = L;
+  // Korean particle after a (possibly bilingual) name, e.g. J(city.name, '이/가') → '하늘성이'
+  const J = (w, pair) => AOW.I18n.josa(w, pair);
+  const KO = o => (o && typeof o === 'object' ? (o.ko || o.en || '') : String(o === null || o === undefined ? '' : o));
+  const EN = o => (o && typeof o === 'object' ? (o.en || o.ko || '') : String(o === null || o === undefined ? '' : o));
+  const tIn = (lang, key) => ((AOW.I18n.dict[lang] || {})[key] || AOW.t(key));
 
   // ------------------------------------------------------------------ i18n
   AOW.I18n.add({
@@ -232,16 +237,28 @@
   };
 
   // ------------------------------------------------------------------ notifications (shared with Turn)
-  /** Push a notification {turn, pid, kind, text:{ko,en}, icon, ref}; emits 'notify' for human players. */
-  Rules.notify = function (game, pid, kind, text, icon, ref) {
-    const n = { id: S().newId(game, 'notification'), turn: game.turn, pid, kind, text, icon: icon || null, ref: ref || null };
+  /**
+   * Push a notification {turn, pid, kind, text:{ko,en}, icon, ref, low} for the HUMAN player and emit 'notify'.
+   * Events about AI realms, free cities or marauders (pid < 0 / non-human pid) are dropped here — they never
+   * reach the human's feed (and never evict the human's own entries from the capped list). Realm-wide events
+   * everyone should see go through Rules.notifyWorld. opts.low = routine news (rank-ups, production done…)
+   * that only belongs in the HUD list, not in a centre-screen toast.
+   */
+  Rules.notify = function (game, pid, kind, text, icon, ref, opts) {
+    opts = opts || {};
+    const world = !!opts.world;
+    const p = pid >= 0 ? game.players[pid] : null;
+    if (!world && !(p && p.isHuman)) return null;
+    game.notifications = game.notifications || [];
+    const n = { id: S().newId(game, 'notification'), turn: game.turn, pid: world ? -1 : pid, kind, text, icon: icon || null, ref: ref || null, low: !!opts.low };
     game.notifications.push(n);
     if (game.notifications.length > C.NOTIFICATION_KEEP) game.notifications.splice(0, game.notifications.length - C.NOTIFICATION_KEEP);
-    const p = pid >= 0 ? game.players[pid] : null;
-    // pid < 0 = a world event everyone sees
-    if ((pid < 0 || (p && p.isHuman)) && Events()) Events().emit('notify', { kind, text: AOW.L(text), icon: n.icon, ref: n.ref, notification: n });
+    if (Events()) Events().emit('notify', { kind, text: AOW.L(text), icon: n.icon, ref: n.ref, notification: n, low: n.low });
     return n;
   };
+  /** A world event every realm sees (eliminations, victory rituals, the winner). */
+  Rules.notifyWorld = function (game, kind, text, icon, ref) { return Rules.notify(game, -1, kind, text, icon, ref, { world: true }); };
+  const LOW = { low: true };
   function log(game, text) { game.log.push({ turn: game.turn, text }); if (game.log.length > 500) game.log.splice(0, game.log.length - 500); }
   Rules.log = log;
 
@@ -653,14 +670,14 @@
       const b = get('buildings', it.id);
       if (b && b.effects && b.effects.walls) city.walls = Math.max(city.walls || 0, b.effects.walls);
       Rules.invalidate(city.owner);
-      Rules.notify(game, city.owner, 'good', L(`${city.name}: ${b ? b.name.ko : it.id} 완공`, `${city.name}: ${b ? b.name.en : it.id} completed`), 'production', { cityId: city.id });
+      Rules.notify(game, city.owner, 'good', L(`${city.name}: ${b ? b.name.ko : it.id} 완공`, `${city.name}: ${b ? b.name.en : it.id} completed`), 'production', { cityId: city.id }, LOW);
     } else if (it.type === 'unit') {
       const army = Rules.garrisonArmy(game, city, true);
       const unit = Rules.createUnitFor(game, city.owner, it.id, army.id);
       if (unit) {
         const t = S().unitType(unit);
         if (Events()) Events().emit('unit:recruited', { unitId: unit.id, cityId: city.id });
-        Rules.notify(game, city.owner, 'good', L(`${city.name}: ${t.name.ko} 모집 완료`, `${city.name}: ${t.name.en} recruited`), 'recruit', { cityId: city.id, unitId: unit.id });
+        Rules.notify(game, city.owner, 'good', L(`${city.name}: ${t.name.ko} 모집 완료`, `${city.name}: ${t.name.en} recruited`), 'recruit', { cityId: city.id, unitId: unit.id }, LOW);
       }
     } else if (it.type === 'improvement') {
       Rules.placeImprovement(game, city, it.pid, it.id);
@@ -812,7 +829,7 @@
     const imp = get('improvements', id); if (!imp) return fail('unknownImprovement');
     prov.improvement = id;
     Rules.invalidate(city.owner);
-    Rules.notify(game, city.owner, 'good', L(`${city.name}: ${AOW.L(imp.name)} 건설 완료`, `${city.name}: ${AOW.L(imp.name)} built`), 'production', { cityId: city.id, provinceId: pid });
+    Rules.notify(game, city.owner, 'good', L(`${city.name}: ${KO(imp.name)} 건설 완료`, `${city.name}: ${EN(imp.name)} built`), 'production', { cityId: city.id, provinceId: pid }, LOW);
     if (Events()) Events().emit('city:changed', { cityId: city.id });
     return { ok: true, improvement: id };
   };
@@ -895,12 +912,12 @@
       st.owner = player.id;
       if (!player.annexedWonders.includes(st.id)) player.annexedWonders.push(st.id);
       const w = get('wonders', st.refId);
-      if (w) Rules.notify(game, player.id, 'good', L(`${AOW.L(w.name)} 합병 — 제국 보너스 획득`, `${AOW.L(w.name)} annexed — empire bonus gained`), 'star', { cityId: city.id, structureId: st.id });
+      if (w) Rules.notify(game, player.id, 'good', L(`${KO(w.name)} 합병 — 제국 보너스 획득`, `${EN(w.name)} annexed — empire bonus gained`), 'star', { cityId: city.id, structureId: st.id });
     }
     player.stats.territory = game.provinces.filter(p => p.owner === player.id).length;
     Rules.invalidate(player.id);
     Rules.recomputeVisibility(game, player.id);
-    Rules.notify(game, player.id, 'good', L(`${city.name}: 새 지방을 병합했습니다.`, `${city.name}: province annexed.`), 'stability', { cityId: city.id, provinceId: pid });
+    Rules.notify(game, player.id, 'good', L(`${city.name}: 새 지방을 병합했습니다.`, `${city.name}: province annexed.`), 'stability', { cityId: city.id, provinceId: pid }, LOW);
     if (Events()) Events().emit('city:changed', { cityId: city.id });
     return { ok: true, cost, provinceId: pid };
   };
@@ -944,7 +961,7 @@
     player.stats.territory = game.provinces.filter(p => p.owner === player.id).length;
     Rules.invalidate(player.id);
     Rules.recomputeVisibility(game, player.id);
-    Rules.notify(game, player.id, 'good', L(`전초기지 ${name} 건설`, `Outpost ${name} founded`), 'city', { cityId: city.id });
+    Rules.notify(game, player.id, 'good', L(`전초기지 ${name} 건설`, `Outpost ${name} founded`), 'city', { cityId: city.id }, LOW);
     if (Events()) { Events().emit('city:founded', { cityId: city.id }); Events().emit('city:changed', { cityId: city.id }); }
     return { ok: true, cityId: city.id, city };
   };
@@ -965,7 +982,7 @@
     if (st) st.kind = 'city';
     player.stats.cities = Rules.cityCount(game, player.id);
     Rules.invalidate(player.id);
-    Rules.notify(game, player.id, 'good', L(`${city.name}이(가) 도시로 성장했습니다.`, `${city.name} has grown into a city.`), 'city', { cityId: city.id });
+    Rules.notify(game, player.id, 'good', L(`${J(city.name, '이/가')} 도시로 성장했습니다.`, `${city.name} has grown into a city.`), 'city', { cityId: city.id });
     if (Events()) { Events().emit('city:founded', { cityId: city.id }); Events().emit('city:changed', { cityId: city.id }); }
     return { ok: true, cost: { imperium: cost } };
   };
@@ -1174,8 +1191,9 @@
     if (promoted) {
       Rules.syncUnit(game, unit);
       const type = S().unitType(unit);
-      Rules.notify(game, unit.owner, 'good', L(`${AOW.L(type.name)}이(가) ${Rules.rankName(unit.rank)}(으)로 승급했습니다.`,
-        `${AOW.L(type.name)} promoted to ${Rules.rankName(unit.rank)}.`), 'star', { unitId: unit.id });
+      const rk = 'rules.rank.' + clamp(unit.rank | 0, 0, C.RANK_MAX);
+      Rules.notify(game, unit.owner, 'good', L(`${J(unit.name || KO(type.name), '이/가')} ${J(tIn('ko', rk), '으로/로')} 승급했습니다.`,
+        `${unit.name || EN(type.name)} promoted to ${tIn('en', rk)}.`), 'star', { unitId: unit.id }, LOW);
     }
     if (unit.heroId !== null && unit.heroId >= 0) {
       const hero = S().hero(game, unit.heroId);
@@ -1619,7 +1637,7 @@
       hero.dead = true; hero.unitId = -1;
       hero.respawnTurns = C.HERO_RESPAWN_TURNS;
       hero.respawnAt = game.turn + C.HERO_RESPAWN_TURNS;
-      Rules.notify(game, hero.owner, 'bad', L(`${hero.name}이(가) 쓰러졌습니다.`, `${hero.name} has fallen.`), 'skull', { heroId: hero.id });
+      Rules.notify(game, hero.owner, 'bad', L(`${J(hero.name, '이/가')} 쓰러졌습니다.`, `${hero.name} has fallen.`), 'skull', { heroId: hero.id });
     }
     S().removeUnit(game, unit.id);
     return true;
@@ -1703,7 +1721,7 @@
     player.tomes.push(tomeId);
     for (const k of Object.keys(tome.affinity || {})) player.affinity[k] = (player.affinity[k] || 0) + tome.affinity[k];
     Rules.invalidate(player.id);
-    Rules.notify(game, player.id, 'good', L(`${AOW.L(tome.name)}을(를) 서고에 추가했습니다.`, `${AOW.L(tome.name)} added to your book.`), 'knowledge', { tomeId });
+    Rules.notify(game, player.id, 'good', L(`${J(KO(tome.name), '을/를')} 서고에 추가했습니다.`, `${EN(tome.name)} added to your book.`), 'knowledge', { tomeId });
     if (!player.research.current) {
       const opts = Rules.researchOptions(game, player).filter(o => o.tomeId === tomeId);
       if (opts.length) Rules.startResearch(game, player, tomeId, opts[0].contentId);
@@ -1785,7 +1803,7 @@
     player.research.progress = 0;
     Rules.invalidate(player.id);
     if (Events()) Events().emit('research:complete', { pid: player.id, tomeId, contentId });
-    Rules.notify(game, player.id, 'good', L(`연구 완료: ${def ? AOW.L(def.name) : contentId}`, `Research complete: ${def ? AOW.L(def.name) : contentId}`), 'knowledge', { tomeId, contentId });
+    Rules.notify(game, player.id, 'good', L(`연구 완료: ${def ? KO(def.name) : contentId}`, `Research complete: ${def ? EN(def.name) : contentId}`), 'knowledge', { tomeId, contentId });
     log(game, `[research] p${player.id} ${contentId}`);
     return { ok: true, contentId, type, def };
   };
@@ -1938,10 +1956,10 @@
       player.casting.current = null;
       const r = Rules.applySpellEffect(game, player, sp, t);
       if (Events()) Events().emit('spell:cast', { pid: player.id, spellId, target: t });
-      Rules.notify(game, player.id, 'good', L(`${AOW.L(sp.name)} 시전`, `${AOW.L(sp.name)} cast`), 'mana', { spellId, target: t });
+      Rules.notify(game, player.id, 'good', L(`${KO(sp.name)} 시전`, `${EN(sp.name)} cast`), 'mana', { spellId, target: t }, LOW);
       return Object.assign({ ok: true, cast: true, cost }, r || {});
     }
-    Rules.notify(game, player.id, 'info', L(`${AOW.L(sp.name)} 시전 중… (${cur.progress}/${cur.need})`, `Casting ${AOW.L(sp.name)}… (${cur.progress}/${cur.need})`), 'mana', { spellId });
+    Rules.notify(game, player.id, 'info', L(`${KO(sp.name)} 시전 중… (${cur.progress}/${cur.need})`, `Casting ${EN(sp.name)}… (${cur.progress}/${cur.need})`), 'mana', { spellId }, LOW);
     return { ok: true, casting: true, progress: cur.progress, need: cur.need, cost };
   };
   /** Abort a multi-turn cast (mana is not refunded). */
@@ -1965,7 +1983,7 @@
     if (!sp) return null;
     const r = Rules.applySpellEffect(game, player, sp, cur.target);
     if (Events()) Events().emit('spell:cast', { pid: player.id, spellId: sp.id, target: cur.target });
-    Rules.notify(game, player.id, 'good', L(`${AOW.L(sp.name)} 시전 완료`, `${AOW.L(sp.name)} completed`), 'mana', { spellId: sp.id });
+    Rules.notify(game, player.id, 'good', L(`${KO(sp.name)} 시전 완료`, `${EN(sp.name)} completed`), 'mana', { spellId: sp.id });
     return Object.assign({ cast: true }, r || {});
   };
 
@@ -2201,7 +2219,7 @@
     for (const k of Object.keys(sk.affinity || {})) player.affinity[k] = (player.affinity[k] || 0) + sk.affinity[k];
     Rules.invalidate(player.id);
     for (const u of S().allUnitsOfPlayer(game, player.id)) Rules.syncUnit(game, u);
-    Rules.notify(game, player.id, 'good', L(`제국 기술 습득: ${AOW.L(sk.name)}`, `Empire skill learned: ${AOW.L(sk.name)}`), 'imperium', { empireSkill: id });
+    Rules.notify(game, player.id, 'good', L(`제국 기술 습득: ${KO(sk.name)}`, `Empire skill learned: ${EN(sk.name)}`), 'imperium', { empireSkill: id }, LOW);
     return { ok: true, cost: r.cost, id };
   };
   Rules.unlockEmpireSkill = function (game, player, id) { return Rules.buyEmpireSkill(game, player, id); };
@@ -2233,7 +2251,7 @@
       city.freeCity.opinion = city.freeCity.opinion || {};
       city.freeCity.opinion[pid] = C.FC.VASSAL_OPINION;
       city.freeCity.warWith = (city.freeCity.warWith || []).filter(p => p !== pid);
-      Rules.notify(game, pid, 'good', L(`${city.name}이(가) 봉신이 되었습니다.`, `${city.name} is now your vassal.`), 'crown', { cityId: city.id });
+      Rules.notify(game, pid, 'good', L(`${J(city.name, '이/가')} 봉신이 되었습니다.`, `${city.name} is now your vassal.`), 'crown', { cityId: city.id });
       if (Events()) Events().emit('city:captured', { cityId: city.id, from, to: pid, mode });
       return { ok: true, mode };
     }
@@ -2251,7 +2269,7 @@
       if (i >= 0) game.cities.splice(i, 1);
       if (game._maps) delete game._maps.cities;
       if (from >= 0) { const op = S().player(game, from); if (op) { op.stats.cities = Rules.cityCount(game, from); Rules.invalidate(from); } }
-      Rules.notify(game, pid, 'warn', L(`${city.name}을(를) 파괴했습니다.`, `${city.name} has been razed.`), 'skull', { hexIdx: hex });
+      Rules.notify(game, pid, 'warn', L(`${J(city.name, '을/를')} 파괴했습니다.`, `${city.name} has been razed.`), 'skull', { hexIdx: hex });
       if (Events()) Events().emit('city:captured', { cityId: city.id, from, to: pid, mode });
       return { ok: true, mode };
     }
@@ -2279,14 +2297,14 @@
         op.stats.territory = game.provinces.filter(p => p.owner === from).length;
         if (op.capitalId === city.id) { const next = game.cities.find(c => c.owner === from); op.capitalId = next ? next.id : -1; if (next) next.isCapital = true; }
         Rules.invalidate(from);
-        Rules.notify(game, from, 'bad', L(`${city.name}을(를) 빼앗겼습니다.`, `${city.name} has been lost!`), 'skull', { cityId: city.id });
+        Rules.notify(game, from, 'bad', L(`${J(city.name, '을/를')} 빼앗겼습니다.`, `${city.name} has been lost!`), 'skull', { cityId: city.id });
       }
     }
     player.stats.cities = Rules.cityCount(game, pid);
     player.stats.territory = game.provinces.filter(p => p.owner === pid).length;
     Rules.invalidate(pid);
     Rules.recomputeVisibility(game, pid);
-    Rules.notify(game, pid, 'good', L(`${city.name}을(를) 점령했습니다!`, `${city.name} captured!`), 'crown', { cityId: city.id });
+    Rules.notify(game, pid, 'good', L(`${J(city.name, '을/를')} 점령했습니다!`, `${city.name} captured!`), 'crown', { cityId: city.id });
     log(game, `[capture] city ${city.id} ${from} → ${pid}`);
     if (Events()) { Events().emit('city:captured', { cityId: city.id, from, to: pid, mode }); Events().emit('city:changed', { cityId: city.id }); }
     return { ok: true, mode, cityId: city.id };
@@ -2326,7 +2344,7 @@
         player.resources.gold -= gold;
         const gain = Math.max(1, Math.round(C.FC.GIFT_OPINION * gold / C.FC.GIFT_GOLD));
         setFcOpinion(game, city, player.id, op + gain);
-        Rules.notify(game, player.id, 'info', L(`${city.name}에 선물을 보냈습니다 (+${gain})`, `Gift sent to ${city.name} (+${gain})`), 'gold', { cityId: city.id });
+        Rules.notify(game, player.id, 'info', L(`${city.name}에 선물을 보냈습니다 (+${gain})`, `Gift sent to ${city.name} (+${gain})`), 'gold', { cityId: city.id }, LOW);
         return { ok: true, opinion: Rules.freeCityOpinion(game, city, player.id) };
       }
       case 'whisper': {
@@ -2334,7 +2352,7 @@
         const used = Rules.freeCities(game).filter(c => (c.freeCity.stones || []).includes(player.id)).length;
         if (used >= (player.whisperStones || 0)) return fail('notEnoughImperium');
         fc.stones.push(player.id);
-        Rules.notify(game, player.id, 'info', L(`${city.name}에 속삭임의 돌을 보냈습니다.`, `A whispering stone was sent to ${city.name}.`), 'mana', { cityId: city.id });
+        Rules.notify(game, player.id, 'info', L(`${city.name}에 속삭임의 돌을 보냈습니다.`, `A whispering stone was sent to ${city.name}.`), 'mana', { cityId: city.id }, LOW);
         return { ok: true, stones: fc.stones.slice() };
       }
       case 'vassalize': {
@@ -2344,7 +2362,7 @@
         fc.vassalOf = player.id;
         setFcOpinion(game, city, player.id, 0);
         Rules.invalidate(player.id);
-        Rules.notify(game, player.id, 'good', L(`${city.name}이(가) 봉신이 되었습니다.`, `${city.name} has become your vassal.`), 'crown', { cityId: city.id });
+        Rules.notify(game, player.id, 'good', L(`${J(city.name, '이/가')} 봉신이 되었습니다.`, `${city.name} has become your vassal.`), 'crown', { cityId: city.id });
         return { ok: true, vassal: true };
       }
       case 'integrate': {
@@ -2513,7 +2531,7 @@
       reward.knowledge = r.knowledge || 0;
       reward.imperium = (r.imperium || 0) + tier * 5;
       reward.items = Rules.rollLoot(game, r.itemTier || tier, r.items || 1);
-      if (player) Rules.notify(game, pid, 'good', L(`${w ? AOW.L(w.name) : '고대 불가사의'}을(를) 정복했습니다!`, `${w ? AOW.L(w.name) : 'Ancient wonder'} cleared!`), 'star', { structureId: st.id });
+      if (player) Rules.notify(game, pid, 'good', L(`${J(w ? KO(w.name) : '고대 불가사의', '을/를')} 정복했습니다!`, `${w ? EN(w.name) : 'Ancient wonder'} cleared!`), 'star', { structureId: st.id });
     } else if (st.kind === 'infestation') {
       const tier = st.refId === 'dragon_lair' ? 3 : 2;
       reward.gold = 40 * tier;
@@ -2625,7 +2643,7 @@
       if (Rules.playerAlive(game, p.id)) continue;
       p.alive = false;
       out.push(p.id);
-      Rules.notify(game, -1, 'warn', L(`${p.name} 세력이 멸망했습니다.`, `${p.name} has been eliminated.`), 'skull', { pid: p.id });
+      Rules.notifyWorld(game, 'warn', L(`${p.name} 세력이 멸망했습니다.`, `${p.name} has been eliminated.`), 'skull', { pid: p.id });
       log(game, `[eliminated] p${p.id}`);
     }
     return out;
@@ -2649,7 +2667,7 @@
     player.resources.mana -= cost;
     const beacons = cities.slice(0, C.BEACONS).map(c => { Rules.ensureCity(game, c); c.beacon = true; return c.id; });
     player.magicVictory = { startTurn: game.turn, turns: C.MAGIC_HOLD, beacons };
-    Rules.notify(game, -1, 'warn', L(`${player.name}이(가) 마법 승리 의식을 시작했습니다!`, `${player.name} has begun the ritual of magic victory!`), 'mana', { pid: player.id });
+    Rules.notifyWorld(game, 'warn', L(`${J(player.name, '이/가')} 마법 승리 의식을 시작했습니다!`, `${player.name} has begun the ritual of magic victory!`), 'mana', { pid: player.id });
     log(game, `[magic victory] p${player.id} started`);
     return { ok: true, beacons, cost: { mana: cost } };
   };

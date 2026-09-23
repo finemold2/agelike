@@ -29,6 +29,7 @@
   const Hex = () => AOW.Hex;
   const Events = () => AOW.Events;
   const L = (ko, en) => ({ ko, en });
+  const J = (w, pair) => AOW.I18n.josa(w, pair);
   const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
   const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
   const fn = (ns, name) => (AOW[ns] && typeof AOW[ns][name] === 'function' ? AOW[ns][name] : null);
@@ -167,7 +168,7 @@
           out.grown.push(city.id);
           const tier = Math.min(Rules.cityTierForPop(city.pop), C_(Rules).MAX_TIER);
           if (tier > city.tier) city.tier = tier;
-          Rules.notify(game, pid, 'good', L(`${city.name}의 인구가 ${city.pop}(으)로 늘었습니다.`, `${city.name} has grown to ${city.pop} population.`), 'pop', { cityId: city.id });
+          Rules.notify(game, pid, 'good', L(`${city.name}의 인구가 ${J(city.pop, '으로/로')} 늘었습니다.`, `${city.name} has grown to ${city.pop} population.`), 'pop', { cityId: city.id }, { low: true });
           if (Events()) Events().emit('city:changed', { cityId: city.id });
         }
       }
@@ -245,7 +246,7 @@
       unit.heroId = hero.id; unit.name = hero.name; unit.formId = player.formId;
       hero.unitId = unit.id; hero.dead = false; hero.respawnTurns = 0; hero.respawnAt = undefined;
       Rules.syncUnit(game, unit, true);
-      Rules.notify(game, pid, 'good', L(`${hero.name}이(가) 돌아왔습니다.`, `${hero.name} has returned.`), 'crown', { heroId: hero.id, cityId: cap.id });
+      Rules.notify(game, pid, 'good', L(`${J(hero.name, '이/가')} 돌아왔습니다.`, `${hero.name} has returned.`), 'crown', { heroId: hero.id, cityId: cap.id });
     }
 
     // --- free-city allegiance from this player's whispering stones is handled in the world tick
@@ -262,7 +263,8 @@
       game.victory = v;
       if (Events()) Events().emit('victory', v);
       const w = S().player(game, v.winner);
-      Rules.notify(game, -1, 'good', L(`${w ? w.name : ''} 승리! (${v.type})`, `${w ? w.name : ''} wins! (${v.type})`), 'crown', v);
+      const VT = { military: ['군사 승리', 'military victory'], magic: ['마법 승리', 'magic victory'], expansion: ['확장 승리', 'expansion victory'], score: ['점수 승리', 'score victory'] }[v.type] || [v.type, v.type];
+      Rules.notifyWorld(game, 'good', L(`${w ? w.name : ''} — ${VT[0]}!`, `${w ? w.name : ''} wins — ${VT[1]}!`), 'crown', v);
     }
     return out;
   };
@@ -353,7 +355,7 @@
             const loot = Math.min(p.resources.gold, C.PILLAGE_GOLD);
             p.resources.gold -= loot;
             Rules.addStabilityMod(game, city, 'pillaged', C.PILLAGE_STABILITY, 5, L('약탈당함', 'Pillaged'));
-            Rules.notify(game, city.owner, 'bad', L(`${city.name}이(가) 약탈당했습니다 (−${loot} 금)`, `${city.name} was pillaged (−${loot} gold)`), 'skull', { cityId: city.id });
+            Rules.notify(game, city.owner, 'bad', L(`${J(city.name, '이/가')} 약탈당했습니다 (−${loot} 금)`, `${city.name} was pillaged (−${loot} gold)`), 'skull', { cityId: city.id });
           }
         }
       } else if (res.encounter && res.encounter.armyIds && res.encounter.armyIds.length) {

@@ -80,7 +80,7 @@
       'dip.title': '외교', 'dip.state.peace': '평화', 'dip.state.war': '전쟁', 'dip.state.alliance': '동맹', 'dip.state.defensive_pact': '방어 동맹', 'dip.state.non_aggression': '불가침',
       'dip.opinion': '호감도', 'dip.treaties': '조약', 'dip.warScore': '전쟁 점수', 'dip.propose.peace': '평화 제안', 'dip.propose.non_aggression': '불가침', 'dip.propose.defensive_pact': '방어 동맹',
       'dip.propose.alliance': '동맹', 'dip.declareWar': '선전포고', 'dip.gift': '선물', 'dip.trade': '교역', 'dip.confirmWar': '{name}에게 선전포고하시겠습니까?',
-      'dip.accepted': '{name}이(가) 제안을 받아들였습니다.', 'dip.rejected': '{name}이(가) 제안을 거절했습니다.', 'dip.sent': '제안을 보냈습니다.', 'dip.noOthers': '다른 세력이 없습니다.',
+      'dip.accepted': '{name:이/가} 제안을 받아들였습니다.', 'dip.rejected': '{name:이/가} 제안을 거절했습니다.', 'dip.sent': '제안을 보냈습니다.', 'dip.noOthers': '다른 세력이 없습니다.',
       'dip.giftAmount': '선물할 금', 'dip.give': '주는 것', 'dip.receive': '받는 것', 'dip.terms': '조건', 'dip.incoming': '{name}의 제안', 'dip.accept': '수락', 'dip.decline': '거절',
       'dip.grievances': '불만', 'dip.truce': '휴전 {n}턴', 'dip.dead': '멸망', 'dip.ruler': '군주', 'dip.personality.expansionist': '확장주의', 'dip.personality.militarist': '군국주의',
       'dip.personality.scholar': '학자', 'dip.personality.diplomat': '외교관', 'dip.turns': '{n}턴', 'dip.kind.gift': '선물', 'dip.kind.trade': '교역', 'dip.kind.peace': '평화',
@@ -88,7 +88,7 @@
       // victory
       'vic.victory': '승리', 'vic.defeat': '패배', 'vic.type.expansion': '확장 승리', 'vic.type.magic': '마법 승리', 'vic.type.military': '군사 승리', 'vic.type.score': '점수 승리',
       'vic.type.elimination': '정복 승리', 'vic.winner': '승자', 'vic.continue': '계속하기', 'vic.menu': '메인 메뉴', 'vic.stats': '통계', 'vic.turns': '턴', 'vic.cities': '도시', 'vic.units': '유닛',
-      'vic.territory': '영토', 'vic.score': '점수', 'vic.player': '세력', 'vic.subtitle.win': '{name}의 시대가 열렸습니다.', 'vic.subtitle.lose': '{name}이(가) 이 세계의 주인이 되었습니다.',
+      'vic.territory': '영토', 'vic.score': '점수', 'vic.player': '세력', 'vic.subtitle.win': '{name}의 시대가 열렸습니다.', 'vic.subtitle.lose': '{name:이/가} 이 세계의 주인이 되었습니다.',
       // encyclopedia
       'enc.title': '백과사전', 'enc.cat.cultures': '문화', 'enc.cat.forms': '종족', 'enc.cat.units': '유닛', 'enc.cat.tomes': '마법서', 'enc.cat.spells': '주문', 'enc.cat.buildings': '건물',
       'enc.cat.heroClasses': '영웅 직업', 'enc.cat.improvements': '개선물', 'enc.cat.wonders': '고대 유적', 'enc.cat.items': '아이템', 'enc.cat.abilities': '능력', 'enc.cat.statuses': '상태 효과',

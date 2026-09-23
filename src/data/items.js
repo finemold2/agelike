@@ -11,6 +11,7 @@
 (function (AOW) {
   'use strict';
   const Data = AOW.Data;
+  const J = (w, pair) => AOW.I18n.josa(w, pair);
 
   const RARITIES = ['common', 'uncommon', 'rare', 'epic', 'legendary'];
   const RADJ = {
@@ -41,7 +42,7 @@
     for (const r of RARITIES) {
       const b = RBAND[r], adj = RADJ[r];
       const statusPart = statusId ? { id: statusId, chance: b.chance } : null;
-      const dko = `${adj.ko} ${baseKo}. 공격 시 ${CH_KO[channel]} 피해 +${b.dmg}` + (statusPart ? `, ${b.chance}% 확률로 ${ST_KO[statusId]}을(를) 입힙니다.` : '를 더합니다.');
+      const dko = `${adj.ko} ${baseKo}. 공격 시 ${CH_KO[channel]} 피해 +${b.dmg}` + (statusPart ? `, ${b.chance}% 확률로 ${J(ST_KO[statusId], '을/를')} 입힙니다.` : AOW.I18n.particle(b.dmg, '을/를') + ' 더합니다.');
       const den = `${adj.en} ${baseEn}. Attacks deal +${b.dmg} ${CH_EN[channel]} damage` + (statusPart ? `, with a ${b.chance}% chance to inflict ${ST_EN[statusId]}.` : '.');
       IT({
         id: `${baseId}_${r}`, name: { ko: `${adj.ko} ${baseKo}`, en: `${adj.en} ${baseEn}` }, desc: { ko: dko, en: den },
@@ -85,7 +86,7 @@
       const b = RBAND[r], adj = RADJ[r];
       const eff = {}; eff[statKey] = b.stat;
       const grant = abilityByRarity && abilityByRarity[r];
-      const dko = `${adj.ko} ${baseKo}. 착용 시 ${statLabelKo(statKey)} +${b.stat}${grant ? `, ${grant.ko}을(를) 얻습니다.` : '.'}`;
+      const dko = `${adj.ko} ${baseKo}. 착용 시 ${statLabelKo(statKey)} +${b.stat}${grant ? `, ${J(grant.ko, '을/를')} 얻습니다.` : '.'}`;
       const den = `${adj.en} ${baseEn}. Grants +${b.stat} ${statLabelEn(statKey)}${grant ? ` and the ${grant.en} ability.` : '.'}`;
       IT({
         id: `${baseId}_${r}`, name: { ko: `${adj.ko} ${baseKo}`, en: `${adj.en} ${baseEn}` }, desc: { ko: dko, en: den },
@@ -99,7 +100,7 @@
     for (const r of RARITIES) {
       const b = RBAND[r], adj = RADJ[r];
       const eff = { mp: 1 + Math.floor(b.stat / 3), hp: hpBase + b.stat * 2 };
-      const dko = `${adj.ko} ${baseKo}. 이동력 +${eff.mp}, 체력 +${eff.hp}${ability ? `, ${ability.ko}을(를) 얻습니다.` : '.'}`;
+      const dko = `${adj.ko} ${baseKo}. 이동력 +${eff.mp}, 체력 +${eff.hp}${ability ? `, ${J(ability.ko, '을/를')} 얻습니다.` : '.'}`;
       const den = `${adj.en} ${baseEn}. +${eff.mp} Movement and +${eff.hp} HP${ability ? `, granting ${ability.en}.` : '.'}`;
       IT({
         id: `${baseId}_${r}`, name: { ko: `${adj.ko} ${baseKo}`, en: `${adj.en} ${baseEn}` }, desc: { ko: dko, en: den },

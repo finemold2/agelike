@@ -13,6 +13,7 @@
 //   UI.roman(n), UI.ROMAN                                'I'..'V'
 //   UI.iconName(candidates…)                             first candidate AOW.Icons knows (or '')
 //   UI.layers {screen, hud, toast, tooltip}              the four layer elements
+//   UI.TOAST_MAX / UI.TOAST_TIMEOUT                      centre-toast cap (3) and auto-dismiss (5000 ms); 'notify' {low:true} → HUD list only
 //   Screen definitions may also carry: full:true (opaque full-screen), dim:false (no backdrop), tick(dt), relang() (called on language change instead of re-open)
 //   UI.button(...) marks the element with el._aowSetDisabled(bool) and el._aowSetLabel(str) helpers; UI.panel returns el with el.body / el.setTitle(str).
 //   Modal api: {el, body, close(), setButtons([...])}; button onClick(ev, api) returning false keeps the modal open.
@@ -268,7 +269,12 @@
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('mousemove', e => { tipPos.x = e.clientX; tipPos.y = e.clientY; }, { passive: true });
     window.addEventListener('blur', () => UI.hideTooltip());
-    AOW.Events.on('notify', p => { if (!p) return; UI.toast(p.kind || 'info', typeof p.text === 'object' ? L(p.text) : (p.text || ''), { icon: p.icon, onClick: p.onClick, timeout: p.timeout, title: p.title }); });
+    // routine news (rank-ups, production finished, own-action confirmations: notify {low:true}) only goes to the
+    // HUD notification list; everything else also gets a centre toast
+    AOW.Events.on('notify', p => {
+      if (!p || p.low || (p.notification && p.notification.low)) return;
+      UI.toast(p.kind || 'info', typeof p.text === 'object' ? L(p.text) : (p.text || ''), { icon: p.icon, onClick: p.onClick, timeout: p.timeout, title: p.title });
+    });
     AOW.Events.on('i18n:changed', () => relangAll());
     AOW.Events.on('game:new', () => { UI.closeModals(); UI.hideTooltip(); UI.selected = { armyId: null, cityId: null, unitId: null }; });
     UI.css(SETTINGS_CSS);
@@ -468,6 +474,8 @@
   UI.closeModals = function () { while (modals.length) modals[modals.length - 1].close(); };
 
   // ------------------------------------------------------------------ toasts
+  UI.TOAST_MAX = 3;           // centre toasts visible at once (older ones are dismissed)
+  UI.TOAST_TIMEOUT = 5000;    // every toast auto-dismisses after at most 5 s (o.sticky keeps one up)
   UI.toast = function (kind, text, o) {
     if (kind && typeof kind === 'object') { o = kind; kind = o.kind; text = o.text; }
     o = o || {};
@@ -480,9 +488,15 @@
       el('button', { class: 'aow-toast__close', type: 'button', onclick: e => { e.stopPropagation(); remove(); } }, '×'));
     const remove = () => { if (removed) return; removed = true; item.classList.add('aow-toast--out'); setTimeout(() => item.remove(), 240); };
     if (o.onClick) item.addEventListener('click', () => { safe(() => o.onClick()); remove(); });
+    // the same message already on screen (e.g. several "battle won" in one AI phase): refresh it instead of stacking
+    const live = () => Array.from(layer.children).filter(c => c.classList && c.classList.contains('aow-toast') && !c.classList.contains('aow-toast--out'));
+    for (const c of live()) if (c._aowText === kind + '|' + text && typeof c.close === 'function') c.close();
+    item._aowText = kind + '|' + text;
     layer.appendChild(item);
-    while (layer.children.length > 6) layer.firstChild.remove();
-    const timeout = o.timeout === undefined ? 5000 : o.timeout;
+    // at most UI.TOAST_MAX toasts on screen: the oldest make room (the HUD notification list keeps the history)
+    const shown = live();
+    for (let i = 0; i < shown.length - UI.TOAST_MAX; i++) shown[i].close ? shown[i].close() : shown[i].remove();
+    const timeout = o.sticky ? 0 : Math.min(UI.TOAST_TIMEOUT, o.timeout > 0 ? o.timeout : UI.TOAST_TIMEOUT);
     if (timeout > 0) setTimeout(remove, timeout);
     if (o.sound !== false) { if (kind === 'warn' || kind === 'bad') sfx('alert', { volume: 0.6 }); else if (kind === 'good') sfx('notification', { volume: 0.5 }); }
     item.close = remove;
