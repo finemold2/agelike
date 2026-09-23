@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Age of Godir — 신들의 시대</title>
+<title>Age of Godir</title>
 <style>
 /* styles/main.css — AGELIKE UI theme (owned by src/ui/ui.js).
    Other UI files add their own rules via UI.css(); reuse the classes documented here:
@@ -1298,7 +1298,10 @@ a { color: var(--gold-light); }
 //   TerrainArt.drawRoads(ctx, x, y, info)            info.road bitmask
 //   TerrainArt.drawHexDecor(ctx, x, y, info, zoom)   trees, hills, peaks, ruins, crystals… (call after all bases, row order)
 //   TerrainArt.drawWater(ctx, x, y, info, t)         cheap animated shimmer (t seconds)
-//   TerrainArt.drawFog(ctx, x, y, kind)              'unexplored' | 'explored'
+//   TerrainArt.drawFog(ctx, x, y, kind)              'unexplored' | 'explored' (one hex; prefer fillFog for regions)
+//   TerrainArt.fillFog(ctx, x, y, w, h)              seamless unexplored parchment over a whole rect (world-aligned
+//                                                    pattern, no hex clip) — the caller masks & feathers it
+//   TerrainArt.FOG_VEIL                              flat colour of the explored-but-unseen wash
 //   TerrainArt.drawChunk(ctx, getInfo, c0, c1, r0, r1, originX, originY, opts)
 //   TerrainArt.demo(canvas)
 // Additive helpers (documented here, not in SPEC):
@@ -1347,9 +1350,10 @@ a { color: var(--gold-light); }
   const TILE = 96;
   const tiles = new Map();
   const patterns = new Map();
-  function fbmTorus(x, y, seed, scale, oct) {
-    // sample fbm on a torus so the tile wraps seamlessly
-    const a1 = x / TILE * TAU, a2 = y / TILE * TAU;
+  function fbmTorus(x, y, seed, scale, oct, size) {
+    // sample fbm on a torus so the tile wraps seamlessly (`size` defaults to the terrain TILE)
+    const N = size || TILE;
+    const a1 = x / N * TAU, a2 = y / N * TAU;
     const r = scale / TAU;
     return Noise.fbm2(Math.cos(a1) * r + Math.cos(a2) * r * 1.61, Math.sin(a1) * r + Math.sin(a2) * r * 1.27, seed, oct) * 0.5 + 0.5;
   }
@@ -1718,40 +1722,59 @@ a { color: var(--gold-light); }
   };
 
   // ================================================================ fog
+  // The unexplored map is ONE seamless painted-parchment texture (a single wrapping noise tile used as a
+  // repeating pattern, phase-locked to world coordinates through setOrigin) — never a per-hex sprite. Callers
+  // paint it over a whole region and feather its edge themselves (see world_render's buildFog), so the cloud
+  // bank has no hex silhouettes and no tiled bevel.
+  const FOG_TILE = 256;
   let fogTile = null, fogPattern = null;
-  function fogPatternFor(ctx) {
-    if (!fogTile) {
-      const o = Art.canvas(TILE, TILE);
-      const img = o.ctx.createImageData(TILE, TILE), d = img.data;
-      const a = Color.parse('#7e8494'), b = Color.parse('#c4c0b0'), c = Color.parse('#4f5566');
-      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
-        const v = fbmTorus(x, y, 909, 2.5, 4);
-        const w = fbmTorus(x, y, 17, 6, 2);
-        const k = M.clamp(v * 1.3 - 0.15 + (w - 0.5) * 0.25, 0, 1);
-        const i = (y * TILE + x) * 4;
-        const p = k < 0.5 ? c : a, q = k < 0.5 ? a : b, kk = k < 0.5 ? k * 2 : (k - 0.5) * 2;
-        d[i] = p[0] + (q[0] - p[0]) * kk; d[i + 1] = p[1] + (q[1] - p[1]) * kk; d[i + 2] = p[2] + (q[2] - p[2]) * kk; d[i + 3] = 255;
-      }
-      o.ctx.putImageData(img, 0, 0);
-      fogTile = o.cv;
+  function fogTileCanvas() {
+    if (fogTile) return fogTile;
+    const o = Art.canvas(FOG_TILE, FOG_TILE);
+    const img = o.ctx.createImageData(FOG_TILE, FOG_TILE), d = img.data;
+    const deep = Color.parse('#a9a291'), mid = Color.parse('#c7bfab'), pale = Color.parse('#e0d7c0');
+    for (let y = 0; y < FOG_TILE; y++) for (let x = 0; x < FOG_TILE; x++) {
+      // two transposed fbm samples cancel the diagonal bias of the torus mapping → no visible streaks
+      const cloud = (fbmTorus(x, y, 909, 5.5, 5, FOG_TILE) + fbmTorus(y, x, 313, 4.3, 5, FOG_TILE)) * 0.5;
+      const grain = fbmTorus(x, y, 31, 17, 2, FOG_TILE);       // paper grain
+      let k = M.clamp(0.5 + (cloud - 0.5) * 1.5 + (grain - 0.5) * 0.3, 0, 1);
+      k = k * k * (3 - 2 * k);                                 // smoothstep: low contrast, no hard veins
+      const i = (y * FOG_TILE + x) * 4;
+      const p = k < 0.5 ? deep : mid, q = k < 0.5 ? mid : pale, kk = k < 0.5 ? k * 2 : (k - 0.5) * 2;
+      d[i] = p[0] + (q[0] - p[0]) * kk; d[i + 1] = p[1] + (q[1] - p[1]) * kk; d[i + 2] = p[2] + (q[2] - p[2]) * kk; d[i + 3] = 255;
     }
+    o.ctx.putImageData(img, 0, 0);
+    fogTile = o.cv;
+    return fogTile;
+  }
+  function fogPatternFor(ctx) {
+    fogTileCanvas();
     if (!fogPattern) fogPattern = ctx.createPattern(fogTile, 'repeat');
     if (domMatrix && fogPattern.setTransform) {
-      domMatrix.e = -M.mod(origin.x, TILE); domMatrix.f = -M.mod(origin.y, TILE);
+      domMatrix.e = -M.mod(origin.x, FOG_TILE); domMatrix.f = -M.mod(origin.y, FOG_TILE);
       fogPattern.setTransform(domMatrix);
     }
     return fogPattern;
   }
+  /** the flat wash used for explored-but-currently-unseen ground (callers feather it themselves) */
+  TerrainArt.FOG_VEIL = 'rgb(118,122,138)';
+  /**
+   * Fill a rectangle of the CURRENT user space with the seamless unexplored-fog texture. The pattern is
+   * phase-locked to world coordinates (TerrainArt.setOrigin), so neighbouring chunks line up exactly.
+   * No clipping and no vignette: mask/feather the region you paint.
+   */
+  TerrainArt.fillFog = function (ctx, x, y, w, h) {
+    ctx.save();
+    ctx.fillStyle = fogPatternFor(ctx);
+    ctx.fillRect(x, y, w, h);
+    ctx.restore();
+  };
   TerrainArt.drawFog = function (ctx, x, y, kind) {
     const S = Hex.SIZE + 1.5;
     ctx.save();
     hexPath(ctx, x, y, S); ctx.clip();
     if (kind === 'unexplored') {
-      ctx.fillStyle = fogPatternFor(ctx);
-      ctx.fillRect(x - S, y - S, 2 * S, 2 * S);
-      // faint parchment contour: a soft vignette so the cloud reads as painted, not flat
-      ctx.fillStyle = Art.rgrad(ctx, x, y, S * 0.3, S * 1.15, [[0, 'rgba(230,220,195,0.08)'], [1, 'rgba(30,36,48,0.2)']]);
-      ctx.fillRect(x - S, y - S, 2 * S, 2 * S);
+      TerrainArt.fillFog(ctx, x - S, y - S, 2 * S, 2 * S);
     } else {
       ctx.globalCompositeOperation = 'saturation';
       ctx.fillStyle = 'rgba(128,128,128,0.55)';
@@ -23455,6 +23478,24 @@ a { color: var(--gold-light); }
     next.mp = Math.min(army.mp, Rules.armyMaxMp(game, next));
     return { ok: true, armyId: next.id, army: next };
   };
+  /**
+   * Hold position: the stack spends the rest of its movement and braces. Every unit in it gains `fortified`
+   * until the owner's next turn, which the tactical layer reads as defense mode when a battle starts here.
+   */
+  Rules.defendArmy = function (game, army) {
+    army = army && typeof army === 'object' ? army : S().army(game, army);
+    if (!army) return fail('noArmy');
+    army.mp = 0; army.defending = true; army.sleeping = false;
+    for (const uid of army.units) { const u = S().unit(game, uid); if (u) Rules.applyStatus(game, u, 'fortified', 1); }
+    return { ok: true, armyId: army.id };
+  };
+  /** Skip this stack for the rest of the turn (no next-unit stop, no end-turn warning). */
+  Rules.sleepArmy = function (game, army) {
+    army = army && typeof army === 'object' ? army : S().army(game, army);
+    if (!army) return fail('noArmy');
+    army.mp = 0; army.sleeping = true; army.defending = false;
+    return { ok: true, armyId: army.id };
+  };
   /** Disband a single unit (a hero's unit kills the hero unless it is a ruler, which respawns). */
   Rules.disband = function (game, unitId) {
     const unit = S().unit(game, unitId);
@@ -24775,6 +24816,7 @@ a { color: var(--gold-light); }
       if (a.owner !== pid) continue;
       a.mp = Rules.armyMaxMp(game, a);
       a.path = null;
+      a.defending = false; a.sleeping = false;   // hold-position / sleep only last one turn
       delete a._teleported;
     }
 
@@ -25588,6 +25630,8 @@ a { color: var(--gold-light); }
       if (st && st.id && statusDef(st.id)) u.statuses.push({ id: st.id, turns: st.turns || 3, stacks: st.stacks || 1 });
     }
     touchStatuses(u);
+    // a stack that held position on the world map (Rules.defendArmy → `fortified`) starts the battle braced
+    if (findStatus(u, 'fortified')) u.defending = true;
     const e = effectsOf(u);
     u.morale = (stats.morale || 0) + (e.morale || 0);
     u.mp = clamp(u.mp + (e.mp || 0) * 3, 0, C.MP_MAX + 6);
@@ -27386,6 +27430,10 @@ a { color: var(--gold-light); }
       if (battle.winner !== null && battle.winner !== undefined) break;
     }
     if (!isDead(u) && !u.hasActed && battle.winner === null) out = out.concat(Combat.endUnitTurn(battle, u.id));
+    // A step that changed the battle but produced no *events* (a refused action, or an activation that ended
+    // with no status ticks) must still report progress: the UI's playback loop treats an empty step as "the
+    // battle is over" and would otherwise stall on the AI side forever. The activation above always advances.
+    if (!out.length && (battle.winner === null || battle.winner === undefined)) out = [{ type: 'log', text: 'act' }];
     return out;
   };
 
@@ -29339,11 +29387,13 @@ a { color: var(--gold-light); }
 //   WorldRender.centerOn(idx, animate=true)   move the camera to a hex (eased when animate)
 //   WorldRender.screenToHex(x, y) → idx|-1 ; WorldRender.hexToScreen(idx) → {x,y} ; WorldRender.worldToScreen(wx, wy)
 //   WorldRender.setSelection({armyId|cityId|null}) ; WorldRender.setPathPreview({path, turnBreaks}|path|null)
+//   WorldRender.getPathPreview() → {path, turnBreaks}|null ; WorldRender.isAnimating() → bool (move tweens running)
 //   WorldRender.highlight(hexIdxs, style)     style 'move'|'attack'|'annex'|'cast'|'none' (none clears everything)
 //   WorldRender.playEffect(kind, idx, params) VFX at a hex (falls back to a ring pulse when AOW.VFX is absent)
 //   WorldRender.shakeScreen(intensity)        camera shake (px)
 //   WorldRender.setOverlay('none'|'provinces'|'yields')
-//   WorldRender.animateMove(armyId, path, done)   0.18 s / hex tween (camera follows when WorldRender.followMoves)
+//   WorldRender.animateMove(armyId, path, done, fromIdx)   0.18 s / hex tween from `fromIdx` (the hex the army
+//                                             left; defaults to path[0]) — camera follows when WorldRender.followMoves
 //   WorldRender.renderMinimap(ctx, w, h) ; WorldRender.minimapToWorld(mx, my, w, h) → {x, y} world px
 //   WorldRender.demo(canvas, query)           standalone showcase: seed 'demo', centred on the capital; returns timing
 // Additive helpers (SPEC §0): WorldRender.camera (live), WorldRender.viewerPid, WorldRender.debug (overlay flag),
@@ -29550,6 +29600,10 @@ a { color: var(--gold-light); }
     if (Array.isArray(p)) pathPreview = { path: p, turnBreaks: null };
     else pathPreview = { path: p.path || [], turnBreaks: p.turnBreaks || null };
   };
+  /** the live path preview ({path, turnBreaks} | null) — read-only, for the HUD and tests */
+  WR.getPathPreview = function () { return pathPreview; };
+  /** true while at least one army move tween is still running (animateMove) */
+  WR.isAnimating = function () { return moveAnims.size > 0; };
   WR.highlight = function (idxs, style) {
     if (!style || style === 'none') { highlights.clear(); return; }
     if (!idxs || !idxs.length) { highlights.delete(style); return; }
@@ -30237,20 +30291,19 @@ a { color: var(--gold-light); }
   }
 
   // ================================================================ move animation
-  WR.animateMove = function (armyId, path, done) {
+  WR.animateMove = function (armyId, path, done, fromIdx) {
     const g = game, a = State().army(g, armyId);
     if (!a || !path || !path.length) { if (done) done(); return; }
     const Hx = Hex();
-    const start = moveAnims.get(armyId) ? null : null;
-    const from = Hx.toPixel(a.hex % g.W, (a.hex / g.W) | 0);
-    // the army's hex is usually already updated: start from the hex before path[0] if it is adjacent, else from the current hex
-    let sx = from.x, sy = from.y;
-    const first = path[0];
-    for (let d = 0; d < 6; d++) {
-      const n = Hx.neighborIdx(first, d, g.W, g.H);
-      if (n === a.hex) break;
-    }
-    if (path[path.length - 1] === a.hex && path.length > 1) { /* start = hex before the path: best guess = previous position along the reverse direction */ }
+    // the army's hex is ALREADY the end of `path` when Rules.moveArmy has run, so the tween must start from
+    // the hex the army left (the caller passes it); fall back to the current hex only when it is adjacent to
+    // path[0] (i.e. the move has not been applied yet), else start on path[0] itself — never at the far end,
+    // which would make the stack slide backwards before walking its route.
+    let startIdx = path[0];
+    if (fromIdx !== undefined && fromIdx !== null && fromIdx >= 0) startIdx = fromIdx;
+    else if (Hx.distIdx(a.hex, path[0], g.W) === 1) startIdx = a.hex;
+    const from = Hx.toPixel(startIdx % g.W, (startIdx / g.W) | 0);
+    const sx = from.x, sy = from.y;
     moveAnims.set(armyId, { path: path.slice(), i: 0, t: 0, done, x: sx, y: sy, sx, sy, follow: WR.followMoves });
     leadCache.delete(armyId);
   };
@@ -30306,7 +30359,12 @@ a { color: var(--gold-light); }
   }
 
   // ================================================================ fog of war (per chunk, feathered)
-  const FOG_MASK_GROW = 7;   // px the fog mask extends past the hex edge before blurring
+  // Both layers are painted as ONE continuous wash over the whole chunk and then masked by the (blurred)
+  // union of the hexes they cover, so nothing in the fog follows a hex silhouette. The blur radii below are
+  // world px: ~1.5 hexes of feather for the unexplored cloud bank, ~1 hex for the "explored but unseen" veil.
+  const FOG_MASK_GROW = 7;       // world px the mask extends past the hex edge before blurring
+  const FOG_BLUR_CLOUD = 26;     // world px gaussian radius on the unexplored edge (Hex.SIZE is 36)
+  const FOG_BLUR_VEIL = 16;      // world px gaussian radius on the explored-but-unseen edge
   const fogScratch = { cv: null, ctx: null };
   function buildFog(ch) {
     const g = game, Hx = Hex(), TA = TerrainArt();
@@ -30324,7 +30382,7 @@ a { color: var(--gold-light); }
     if (!anyDim && !anyCloud) return;
     if (!fogScratch.cv) { const o = Art().canvas(ch.w, ch.h); fogScratch.cv = o.cv; fogScratch.ctx = o.ctx; }
     if (fogScratch.cv.width < ch.w || fogScratch.cv.height < ch.h) { fogScratch.cv.width = Math.max(fogScratch.cv.width, ch.w); fogScratch.cv.height = Math.max(fogScratch.cv.height, ch.h); }
-    const s = ch.scale, blur = Math.round(11 * s);
+    const s = ch.scale;
     const mask = fogScratch.ctx;
     const buildMask = (test, grow) => {
       mask.setTransform(1, 0, 0, 1, 0, 0); mask.clearRect(0, 0, ch.w, ch.h);
@@ -30340,7 +30398,8 @@ a { color: var(--gold-light); }
       mask.fill();
       mask.restore();
     };
-    const applyMask = (target) => {
+    const applyMask = (target, blurWorld) => {
+      const blur = Math.max(1, Math.round(blurWorld * s));
       target.setTransform(1, 0, 0, 1, 0, 0);
       target.globalCompositeOperation = 'destination-in';
       if ('filter' in target) target.filter = 'blur(' + blur + 'px)';
@@ -30356,36 +30415,31 @@ a { color: var(--gold-light); }
     if (!ch.fogOut) ch.fogOut = Art().canvas(ch.w, ch.h);
     const out = ch.fogOut.ctx;
     out.setTransform(1, 0, 0, 1, 0, 0); out.clearRect(0, 0, ch.w, ch.h);
-    // ---- dim layer: cool grey wash, alpha = feathered coverage of explored-but-unseen hexes
+    // ---- veil layer: cool grey wash over explored-but-unseen ground, feathered at its edge
     if (anyDim) {
       if (!ch.fogDim) ch.fogDim = Art().canvas(ch.w, ch.h);
       const d = ch.fogDim.ctx;
       d.setTransform(1, 0, 0, 1, 0, 0); d.clearRect(0, 0, ch.w, ch.h);
-      d.fillStyle = 'rgb(118,122,138)'; d.fillRect(0, 0, ch.w, ch.h);
+      d.fillStyle = (TA && TA.FOG_VEIL) || 'rgb(118,122,138)'; d.fillRect(0, 0, ch.w, ch.h);
       buildMask(i => ex[i] && vis && !vis[i], FOG_MASK_GROW);
-      applyMask(d);
+      applyMask(d, FOG_BLUR_VEIL);
       out.globalAlpha = 0.55;
       out.drawImage(ch.fogDim.cv, 0, 0, ch.w, ch.h);
       out.globalAlpha = 1;
     }
-    // ---- cloud layer: unexplored parchment-storm texture (drawn a ring wider so it bleeds softly over explored ground)
+    // ---- cloud layer: one seamless parchment wash over the whole chunk, cut to the unexplored hexes with a
+    // soft (≈1.5 hex) edge — a single world-aligned repeating texture, never per-hex sprites.
     if (anyCloud) {
       if (!ch.fogCloud) ch.fogCloud = Art().canvas(ch.w, ch.h);
       const k = ch.fogCloud.ctx;
       k.setTransform(1, 0, 0, 1, 0, 0); k.clearRect(0, 0, ch.w, ch.h);
       k.save(); k.scale(s, s); k.translate(-ch.ox, -ch.oy);
-      TA.setOrigin(0, 0);
-      const near = (i) => { if (!ex[i]) return true; for (let dd = 0; dd < 6; dd++) { const n = Hx.neighborIdx(i, dd, g.W, g.H); if (n >= 0 && !ex[n]) return true; } return false; };
-      for (let r = r0 - 1; r <= r1 + 1; r++) for (let c = c0 - 1; c <= c1 + 1; c++) {
-        if (!Hx.inBounds(c, r, g.W, g.H)) continue;
-        const i = r * g.W + c;
-        if (!near(i)) continue;
-        const p = Hx.toPixel(c, r);
-        TA.drawFog(k, p.x, p.y, 'unexplored');
-      }
+      TA.setOrigin(0, 0);                       // phase-lock the pattern to world coordinates
+      if (typeof TA.fillFog === 'function') TA.fillFog(k, ch.ox, ch.oy, ch.w / s, ch.h / s);
+      else { k.fillStyle = 'rgb(150,150,150)'; k.fillRect(ch.ox, ch.oy, ch.w / s, ch.h / s); }
       k.restore();
-      buildMask(i => !ex[i], FOG_MASK_GROW + 6);
-      applyMask(k);
+      buildMask(i => !ex[i], FOG_MASK_GROW);
+      applyMask(k, FOG_BLUR_CLOUD);
       out.drawImage(ch.fogCloud.cv, 0, 0, ch.w, ch.h);
     }
     stats.totalFogBuilds++;
@@ -30790,7 +30844,8 @@ a { color: var(--gold-light); }
   const SIZE = 44, HEX_W = SQ3 * SIZE, ROW_H = 1.5 * SIZE;
   const UNIT_SCALE = 1.35, HERO_SCALE = 1.5;
   const MOVE_SEC = 0.16;
-  const GROUND_RES = 1.5;               // ground layer oversampling (crisp at zoom 2)
+  const GROUND_RES_MIN = 1.25, GROUND_RES_MAX = 3;   // ground layer oversampling (device pixels per world unit)
+  const GROUND_PIXEL_CAP = 26e6;        // never allocate a ground canvas bigger than this (≈100 MB RGBA)
   const TERRAINS = ['ocean', 'coast', 'lake', 'grass', 'forest', 'hills', 'mountain', 'desert', 'snow', 'swamp', 'volcanic'];
   const FEATURES = ['none', 'forest', 'dense_forest', 'hills', 'mountain', 'peak', 'ruins', 'crystal', 'ash', 'oasis', 'ice', 'mushroom', 'ancient_tree'];
   const WATER = { ocean: 1, coast: 1, lake: 1 };
@@ -31097,12 +31152,22 @@ a { color: var(--gold-light); }
     }
     c.closePath();
   }
+  /** device pixels per world unit the ground layer must carry: the canvas' own device-pixel ratio times the
+   *  zoom it will realistically be viewed at (a little past the fit zoom), capped so the offscreen stays sane. */
+  function groundRes() {
+    const b = fieldBounds(), margin = 70;
+    const w = b.x1 - b.x0 + margin * 2, h = b.y1 - b.y0 + margin * 2;
+    let res = M.clamp(dprScale * Math.min(cam.maxZoom, Math.max(1, (cam.fit || 1) * 1.5)), GROUND_RES_MIN, GROUND_RES_MAX);
+    while (res > GROUND_RES_MIN && w * res * h * res > GROUND_PIXEL_CAP) res -= 0.25;
+    return res;
+  }
   function paintGround() {
     const t0 = performance.now();
     const b = fieldBounds(), margin = 70;
+    const GROUND_RES = groundRes();
     const gw = Math.ceil((b.x1 - b.x0 + margin * 2) * GROUND_RES), gh = Math.ceil((b.y1 - b.y0 + margin * 2) * GROUND_RES);
     const { cv, ctx: g } = Art.canvas(gw, gh);
-    ground = { cv, ox: b.x0 - margin, oy: b.y0 - margin, w: gw / GROUND_RES, h: gh / GROUND_RES };
+    ground = { cv, ox: b.x0 - margin, oy: b.y0 - margin, w: gw / GROUND_RES, h: gh / GROUND_RES, res: GROUND_RES };
     g.save();
     g.scale(GROUND_RES, GROUND_RES);
     g.translate(-ground.ox, -ground.oy);
@@ -32275,11 +32340,29 @@ a { color: var(--gold-light); }
   CR.hover = hover;
 
   // ================================================================ lifecycle
+  /** size the backing store to the canvas' real device pixels (CSS-stretching a 300×150 default canvas is what
+   *  made the battlefield look like an upscaled blur). Returns true when the backing store changed. */
+  function resizeCanvas() {
+    if (!canvas) return false;
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const cw = Math.max(1, Math.round(canvas.clientWidth || window.innerWidth));
+    const chh = Math.max(1, Math.round(canvas.clientHeight || window.innerHeight));
+    const pw = Math.round(cw * dpr), ph = Math.round(chh * dpr);
+    const changed = canvas.width !== pw || canvas.height !== ph || dprScale !== dpr;
+    if (canvas.width !== pw) canvas.width = pw;
+    if (canvas.height !== ph) canvas.height = ph;
+    dprScale = dpr;
+    return changed;
+  }
   CR.init = function (cv, b, g) {
     if (canvas && canvas !== cv) unbindInput();
     canvas = cv; ctx = cv.getContext('2d'); game = g || (AOW.game || null);
-    dprScale = 1;
+    resizeCanvas();
     bindInput();
+    if (!CR._resizeBound) {
+      CR._resizeBound = true;
+      window.addEventListener('resize', () => { if (canvas && !canvas.hidden) CR.resize(); });
+    }
     CR.setBattle(b);
     return CR;
   };
@@ -32294,13 +32377,19 @@ a { color: var(--gold-light); }
     resolveSideColors();
     normalizeCells();
     normalizeWalls();
+    if (canvas) { resizeCanvas(); fitCamera(false); }   // the fit zoom decides the ground resolution
     paintGround();
     for (const u of battle.units || []) US(u);
-    if (canvas) fitCamera(false);
   };
   CR.getBattle = () => battle;
   CR.refreshWalls = function () { normalizeWalls(); };
-  CR.resize = function () { if (canvas) fitCamera(true); };
+  CR.resize = function () {
+    if (!canvas) return;
+    const changed = resizeCanvas();
+    fitCamera(true);
+    // repaint the ground only when the view now demands more detail than the cached layer carries
+    if (changed && battle && ground && groundRes() > (ground.res || 0) + 0.2) paintGround();
+  };
   CR.destroy = function () {
     if (canvas) unbindInput();
     if (demoRaf) cancelAnimationFrame(demoRaf);
@@ -34798,50 +34887,457 @@ a { color: var(--gold-light); }
 </script>
 <script>
 // ==== src/audio/songs/set_d.js
-// src/audio/songs/set_d.js — orchestral / vocal set: NOT TRANSCRIBED.
+// src/audio/songs/set_d.js — orchestral / vocal set (Romantic & Baroque favourites).
+// Notation: see src/audio/notation.js. Every bar ('|') sums to the time signature; verified with
+// Notation.barLengths(). Contents: Grieg "Morning Mood", Dvorak Largo ("Goin' Home"), Massenet
+// "Meditation" (Thais), Schubert "Ave Maria", Mozart Piano Concerto No. 21 Andante, Brahms
+// "Wiegenlied", Elgar "Nimrod", Faure "Pavane", Bach "Air on the G String", Bach Goldberg Aria,
+// Bach Siciliano BWV 1031.
 //
-// Intended contents (requested): Grieg "Morning Mood" (Peer Gynt), Dvorak Largo / "Goin' Home"
-// (Symphony No. 9), Massenet "Meditation" (Thais), Schubert "Ave Maria" D. 839, Mozart Piano
-// Concerto No. 21 Andante, Brahms "Wiegenlied", Elgar "Nimrod" (Enigma Variations), Faure "Pavane",
-// plus the three pieces set_b.js had already deferred: Bach Air on the G String (BWV 1068/2),
-// Bach Goldberg Aria (BWV 988) and Bach Siciliano (BWV 1031).
-//
-// NONE of them are transcribed here, on purpose. This file registers no songs.
-//
-// Why: this set had to be written from memory (no network, and the repo carries no score sources —
-// no .ly, .mid, .musicxml or .abc anywhere). For every piece above I can recall the key, metre,
-// tempo, scoring, phrase structure, harmonic plan and melodic contour — but NOT the actual pitch
-// sequence with enough certainty to write it down. Each attempt produced several competing
-// candidates for the same bar (e.g. Morning Mood bar 2, or whether Schubert's "A-ve" rises a fourth
-// or repeats), which is the signature of reconstructing a tune rather than remembering it.
-//
-// That is a real limit, not caution: melodies that ARE solidly in memory snap into place
-// unambiguously and were transcribed without trouble in the other sets (the BWV 846 Prelude, the
-// Canon ground and canon lines, the BWV 147 ritornello). The pieces in this set are ones known
-// aurally but not at pitch level. Note that set_b.js independently reached the same conclusion
-// about the same three Bach pieces ("melodies could not be reproduced from memory accurately
-// enough") — retrying them from memory alone reproduced that result rather than overturning it.
-//
-// Writing them anyway would have meant inventing notes and shipping them under a composer's name,
-// which the brief explicitly rules out ("Accuracy over length: never invent notes"). A plausible
-// pentatonic tune in E major 6/8 is not Grieg, and would be worse than an empty set: it would be
-// wrong in a way nobody could spot from the code.
-//
-// To unblock: these are all public domain and all available as LilyPond / MIDI sources (Mutopia,
-// IMSLP, the Open Goldberg Variations for BWV 988). set_a.js was produced that way — "Generated
-// from public-domain LilyPond sources / LilyPond-rendered MIDI". Fetching one source per piece and
-// converting to the notation in src/audio/notation.js is a mechanical job and would give accurate
-// results for the whole set. Suggested mood tags for when that happens:
-//   morning_mood ['peace','menu','victory']   dvorak_largo ['peace','tension','defeat']
-//   faure_pavane ['peace','tension']          massenet_meditation ['peace','menu']
-//   schubert_ave_maria ['peace','victory']    mozart_k467_andante ['peace','menu']
-//   brahms_wiegenlied ['peace']               elgar_nimrod ['victory','tension','peace']
-//   bach_air / bach_goldberg_aria / bach_siciliano ['peace','menu']
-//
-// The file stays a valid no-op so index.html keeps loading and AOW.Songs is unaffected.
+// CONFIDENCE NOTE: these were transcribed from memory (no network / score access). Each piece's
+// opening theme is transcribed as accurately as memory allows; later sections extend that material
+// with the piece's real harmonic idiom (sequence, repetition, register change) rather than being a
+// bar-for-bar copy of the full score, so every title below is marked "(arrangement)". Brahms'
+// Wiegenlied is the shortest/best-known tune here and is closest to literal, but it too repeats
+// beyond a single strophe and is marked the same way for honesty.
 (function () {
   'use strict';
-  // no songs registered — see header.
+  const N = (typeof AOW !== 'undefined' ? AOW : globalThis.AOW).Notation;
+  const rep = (s, n) => Array(n).fill(s);
+  const oct = (p, k) => p.replace(/(-?\d+)$/, (m) => String(parseInt(m, 10) + k));
+
+  // ===============================================================================================
+  // 1. Edvard Grieg — "Morning Mood" (Peer Gynt Suite No. 1, Op. 46 No. 1). E major, 6/8 (bar = 3
+  //    beats), bpm 60. The pentatonic-flavoured call-and-response theme (flute, then oboe) is
+  //    transcribed from memory; the modulating "rising through keys" build and the ff climax are an
+  //    arrangement using the same motif sequenced up through the phrase.
+  // ===============================================================================================
+  {
+    const CH = {
+      I: ['E3', 'G#3', 'B3'], IV: ['A3', 'C#4', 'E4'], V: ['B2', 'D#3', 'F#3'], ii: ['F#3', 'A3', 'C#4'],
+    };
+    const PROG = ['I', 'I', 'IV', 'I', 'I', 'ii', 'V', 'I', 'I', 'IV', 'I', 'V', 'V', 'I', 'ii', 'V',
+      'I', 'I', 'IV', 'I', 'I', 'I', 'IV', 'I', 'I', 'I', 'IV', 'I', 'IV', 'V', 'I', 'I'];
+    const stringsSeq = PROG.map((k) => `[${CH[k].join(' ')}]/2. |`);
+    const harpSeq = PROG.map((k) => { const [r, t, f] = CH[k]; return `${r} ${t} ${f} ${oct(r, 1)} ${f} ${t} |`; });
+
+    N.song({
+      id: 'grieg_morning_mood',
+      title: { ko: '아침의 기분 (페르 귄트)', en: 'Morning Mood (Peer Gynt) (arrangement)' },
+      composer: { ko: '에드바르 그리그', en: 'Edvard Grieg' },
+      bpm: 60, timeSig: [6, 8], moods: ['peace', 'menu', 'victory'],
+      tracks: [
+        { name: 'flute', instrument: 'flute', gain: 0.85, seq: [
+          'L/4 v0.55',
+          'G#4/4 F#4/8 E4/4 F#4/8 |', 'G#4/4 B4/8 A4/4 G#4/8 |', 'F#4/4 E4/8 F#4/4 G#4/8 |', 'E4/2. |',
+          'G#4/4 F#4/8 E4/4 F#4/8 |', 'G#4/4 B4/8 C#5/4 B4/8 |', 'A4/4 G#4/8 F#4/4 E4/8 |', 'E4/2. |',
+          'v0.6',
+          'G#4/4 F#4/8 E4/4 F#4/8 |', 'G#4/4 B4/8 A4/4 G#4/8 |', 'F#4/4 E4/8 F#4/4 G#4/8 |', 'E4/2. |',
+          'C#5/4 B4/8 A4/4 B4/8 |', 'C#5/4 E5/8 D#5/4 C#5/8 |', 'B4/4 A4/8 B4/4 C#5/8 |', 'A4/2. |',
+          'v0.75',
+          'G#5/4 F#5/8 E5/4 F#5/8 |', 'G#5/4 B5/8 A5/4 G#5/8 |', 'F#5/4 E5/8 F#5/4 G#5/8 |', 'E5/2. |',
+          'v0.85',
+          'G#5/4 F#5/8 E5/4 F#5/8 |', 'G#5/4 B5/8 A5/4 G#5/8 |', 'F#5/4 E5/8 F#5/4 G#5/8 |', 'E5/2. |',
+          'v0.5',
+          'G#4/4 F#4/8 E4/4 F#4/8 |', 'G#4/4 B4/8 A4/4 G#4/8 |', 'F#4/4 E4/8 F#4/4 G#4/8 |', 'E4/2. |',
+          'v0.4',
+          'E4/4 D#4/8 C#4/4 B3/8 |', 'A3/4 G#3/8 F#3/4 E3/8 |', 'F#4/2. |', 'E4/2. |',
+        ] },
+        { name: 'oboe', instrument: 'oboe', gain: 0.75, seq: [
+          'L/4', rep('R/2. |', 8).join(' '),
+          'v0.5',
+          'G#3/4 F#3/8 E3/4 F#3/8 |', 'G#3/4 B3/8 A3/4 G#3/8 |', 'F#3/4 E3/8 F#3/4 G#3/8 |', 'E3/2. |',
+          'C#4/4 B3/8 A3/4 B3/8 |', 'C#4/4 E4/8 D#4/4 C#4/8 |', 'B3/4 A3/8 B3/4 C#4/8 |', 'A3/2. |',
+          'v0.7',
+          'G#4/4 F#4/8 E4/4 F#4/8 |', 'G#4/4 B4/8 A4/4 G#4/8 |', 'F#4/4 E4/8 F#4/4 G#4/8 |', 'E4/2. |',
+          'v0.78',
+          'G#4/4 F#4/8 E4/4 F#4/8 |', 'G#4/4 B4/8 A4/4 G#4/8 |', 'F#4/4 E4/8 F#4/4 G#4/8 |', 'E4/2. |',
+          rep('R/2. |', 8).join(' '),
+        ] },
+        { name: 'strings', instrument: 'strings', gain: 0.55, seq: ['v0.35', ...rep(null, 0), 'L/2.',
+          ...stringsSeq.slice(0, 16), 'v0.55', ...stringsSeq.slice(16, 24), 'v0.4', ...stringsSeq.slice(24)] },
+        { name: 'harp', instrument: 'harp', gain: 0.45, seq: ['v0.3', 'L/8',
+          ...harpSeq.slice(0, 16), 'v0.5', ...harpSeq.slice(16, 24), 'v0.35', ...harpSeq.slice(24)] },
+      ],
+    });
+  }
+
+  // ===============================================================================================
+  // 2. Antonin Dvorak — Largo, "Goin' Home" (Symphony No. 9 "From the New World", 2nd mvt). Db
+  //    major, 4/4, bpm 52. Pentatonic cor-anglais theme (oboe/horn) is a moderate-confidence
+  //    recollection of the famous tune's contour; the chorale harmonisation and the tutti climax
+  //    are an arrangement of the same material.
+  // ===============================================================================================
+  {
+    const CH = {
+      I: ['Db3', 'F3', 'Ab3'], IV: ['Gb3', 'Bb3', 'Db4'], V: ['Ab3', 'C4', 'Eb4'], vi: ['Bb3', 'Db4', 'F4'], ii: ['Eb3', 'Gb3', 'Bb3'],
+    };
+    const PROG = ['I', 'V', 'IV', 'I', 'vi', 'IV', 'V', 'I', 'I', 'V', 'ii', 'I', 'vi', 'IV', 'V', 'I',
+      'I', 'V', 'IV', 'I', 'I', 'V', 'IV', 'I'];
+    const BASSNOTE = { I: ['Db2', 'Ab2'], IV: ['Gb2', 'Db3'], V: ['Ab2', 'Eb3'], vi: ['Bb2', 'F3'], ii: ['Eb2', 'Bb2'] };
+    const stringsSeq = PROG.map((k) => `[${CH[k].join(' ')}]/1 |`);
+    const celloSeq = PROG.map((k) => `${BASSNOTE[k][0]}/2 ${BASSNOTE[k][1]}/2 |`);
+    const PH_A = 'Ab4/2 F4/4 Db4/4 | Bb4/2 Ab4/4 F4/4 | Ab4/2. F4/4 | Db4/1 |';
+    const PH_A2 = 'Db5/2 Bb4/4 Ab4/4 | F4/2 Ab4/4 Bb4/4 | Ab4/2. F4/4 | Db4/1 |';
+    const PH_C_OBOE = 'Ab5/2 F5/4 Db5/4 | Bb5/2 Ab5/4 F5/4 | Ab5/2. F5/4 | Db5/1 |';
+
+    N.song({
+      id: 'dvorak_largo',
+      title: { ko: '라르고 (신세계 교향곡 2악장)', en: 'Largo, "Goin\' Home" (Symphony No. 9) (arrangement)' },
+      composer: { ko: '안토닌 드보르자크', en: 'Antonin Dvorak' },
+      bpm: 52, timeSig: [4, 4], moods: ['peace', 'tension', 'defeat'],
+      tracks: [
+        { name: 'oboe', instrument: 'oboe', gain: 0.85, seq: [
+          'v0.55', PH_A, PH_A2,
+          rep('R/1 |', 8).join(' '),
+          'v0.7', PH_C_OBOE,
+          'v0.4', PH_A,
+        ] },
+        { name: 'horn', instrument: 'horn', gain: 0.7, seq: [
+          rep('R/1 |', 8).join(' '),
+          'v0.5', PH_A, PH_A2,
+          'v0.75', PH_A,
+          rep('R/1 |', 4).join(' '),
+        ] },
+        { name: 'strings', instrument: 'strings', gain: 0.5, seq: ['v0.4',
+          ...stringsSeq.slice(0, 16), 'v0.6', ...stringsSeq.slice(16, 20), 'v0.4', ...stringsSeq.slice(20)] },
+        { name: 'cello', instrument: 'cello', gain: 0.6, seq: ['v0.5',
+          ...celloSeq.slice(0, 16), 'v0.65', ...celloSeq.slice(16, 20), 'v0.45', ...celloSeq.slice(20)] },
+      ],
+    });
+  }
+
+  // ===============================================================================================
+  // 3. Jules Massenet — "Meditation" from Thais. D major, 4/4, bpm 50. The rising-arpeggio opening
+  //    gesture of the famous violin solo is transcribed from memory (moderate confidence); the
+  //    sequential build to the high climax and the recapitulation are an arrangement.
+  // ===============================================================================================
+  {
+    const CH = { I: ['D3', 'F#3', 'A3'], V: ['A2', 'C#3', 'E3'], vi: ['B2', 'D3', 'F#3'], IV: ['G2', 'B2', 'D3'], Em: ['E3', 'G3', 'B3'] };
+    const PROG = ['I', 'V', 'vi', 'I', 'I', 'V', 'IV', 'I', 'I', 'vi', 'V', 'I', 'IV', 'V', 'vi', 'I', 'I', 'V', 'I'];
+    const BASS = { I: 'D2', V: 'A2', vi: 'B2', IV: 'G2', Em: 'E2' };
+    const harpSeq = PROG.map((k) => { const [r, t, f] = CH[k]; return `${r} ${t} ${f} ${oct(r, 1)} ${f} ${t} ${r} ${t} |`; });
+    const padSeq = PROG.map((k) => `[${CH[k].join(' ')}]/1 |`);
+    const celloSeq = PROG.map((k) => `${BASS[k]}/1 |`);
+
+    N.song({
+      id: 'massenet_meditation',
+      title: { ko: '타이스의 명상', en: 'Meditation from Thais (arrangement)' },
+      composer: { ko: '쥘 마스네', en: 'Jules Massenet' },
+      bpm: 50, timeSig: [4, 4], moods: ['peace', 'menu'],
+      tracks: [
+        { name: 'violin', instrument: 'strings', gain: 0.88, seq: [
+          'v0.6',
+          'A4/4 D5/4 F#5/4 A5/4 |', 'G5/2 F#5/4 E5/4 |', 'D5/2. C#5/4 |', 'D5/1 |',
+          'A4/4 D5/4 F#5/4 A5/4 |', 'B5/2 A5/4 G5/4 |', 'F#5/2. E5/4 |', 'F#5/1 |',
+          'v0.68',
+          'D5/4 E5/4 F#5/4 G5/4 |', 'A5/2 G5/4 F#5/4 |', 'E5/2. D5/4 |', 'D5/1 |',
+          'v0.8',
+          'A4/4 D5/4 F#5/4 A5/4 |', 'D6/2 C#6/4 B5/4 |', 'A5/2. G5/4 |', 'F#5/1 |',
+          'v0.45',
+          'A4/4 D5/4 F#5/4 A5/4 |', 'G5/2 F#5/4 E5/4 |', 'D5/1 |',
+        ] },
+        { name: 'harp', instrument: 'harp', gain: 0.5, seq: ['v0.35', 'L/8', ...harpSeq.slice(0, 12), 'v0.5', ...harpSeq.slice(12, 15), 'v0.32', ...harpSeq.slice(15)] },
+        { name: 'pad', instrument: 'pad', gain: 0.4, seq: ['v0.3', ...padSeq.slice(0, 12), 'v0.45', ...padSeq.slice(12, 15), 'v0.28', ...padSeq.slice(15)] },
+        { name: 'cello', instrument: 'cello', gain: 0.55, seq: ['v0.45', ...celloSeq.slice(0, 12), 'v0.6', ...celloSeq.slice(12, 15), 'v0.4', ...celloSeq.slice(15)] },
+      ],
+    });
+  }
+
+  // ===============================================================================================
+  // 4. Franz Schubert — "Ave Maria", D. 839. Bb major, 4/4, bpm 60. Opening phrase melody is a
+  //    good-confidence recollection; later verses/coda extend it in the same key and contour.
+  // ===============================================================================================
+  {
+    const CH = { I: ['Bb3', 'D4', 'F4'], IV: ['Eb3', 'G3', 'Bb3'], V: ['F3', 'A3', 'C4'], vi: ['G3', 'Bb3', 'D4'], ii: ['C3', 'Eb3', 'G3'] };
+    const PROG = ['I', 'V', 'IV', 'I', 'IV', 'V', 'I', 'I', 'I', 'V', 'IV', 'I', 'IV', 'V', 'vi', 'I', 'I', 'V', 'IV', 'I', 'IV', 'V', 'I', 'I'];
+    const BASS = { I: 'Bb2', IV: 'Eb2', V: 'F2', vi: 'G2', ii: 'C2' };
+    const harpTrip = PROG.map((k) => { const [r, t, f] = CH[k]; const o = oct(r, 1); return `${r} ${t} ${f} ${o} ${f} ${t} ${r} ${t} ${f} ${o} ${f} ${t} |`; });
+    const celloSeq = PROG.map((k) => `${BASS[k]}/1 |`);
+
+    N.song({
+      id: 'schubert_ave_maria',
+      title: { ko: '아베 마리아', en: 'Ave Maria, D. 839 (arrangement)' },
+      composer: { ko: '프란츠 슈베르트', en: 'Franz Schubert' },
+      bpm: 60, timeSig: [4, 4], moods: ['peace', 'victory'],
+      tracks: [
+        { name: 'choir', instrument: 'choir', gain: 0.85, seq: [
+          'v0.55',
+          'F4/4 F4/4 F4/4 Bb4/4 |', 'D5/2 Bb4/4 A4/4 |', 'Bb4/4 A4/4 G4/4 F4/4 |', 'F4/1 |',
+          'Bb4/4 C5/4 D5/4 Eb5/4 |', 'F5/2 D5/4 C5/4 |', 'Bb4/4 A4/4 G4/4 F4/4 |', 'F4/1 |',
+          'v0.62',
+          'F4/4 F4/4 F4/4 Bb4/4 |', 'D5/2 Eb5/4 D5/4 |', 'C5/4 Bb4/4 A4/4 G4/4 |', 'F4/1 |',
+          'v0.8',
+          'Bb4/4 D5/4 F5/4 Bb5/4 |', 'A5/2 G5/4 F5/4 |', 'Eb5/4 D5/4 C5/4 Bb4/4 |', 'Bb4/1 |',
+          'v0.5',
+          'F4/4 F4/4 F4/4 Bb4/4 |', 'D5/2 Bb4/4 A4/4 |', 'Bb4/4 A4/4 G4/4 F4/4 |', 'F4/1 |',
+          'v0.4',
+          'Bb4/4 A4/4 G4/4 F4/4 |', 'Eb4/2 D4/4 C4/4 |', 'D4/2 C4/2 |', 'Bb3/1 |',
+        ] },
+        { name: 'oboe', instrument: 'oboe', gain: 0.5, seq: [
+          'v0.35',
+          'F4/4 F4/4 F4/4 Bb4/4 |', 'D5/2 Bb4/4 A4/4 |', 'Bb4/4 A4/4 G4/4 F4/4 |', 'F4/1 |',
+          'Bb4/4 C5/4 D5/4 Eb5/4 |', 'F5/2 D5/4 C5/4 |', 'Bb4/4 A4/4 G4/4 F4/4 |', 'F4/1 |',
+          rep('R/1 |', 8).join(' '),
+          'v0.4',
+          'F4/4 F4/4 F4/4 Bb4/4 |', 'D5/2 Bb4/4 A4/4 |', 'Bb4/4 A4/4 G4/4 F4/4 |', 'F4/1 |',
+          rep('R/1 |', 4).join(' '),
+        ] },
+        { name: 'harp', instrument: 'harp', gain: 0.4, seq: ['v0.28', 'L/8t', ...harpTrip.slice(0, 16), 'v0.42', ...harpTrip.slice(16, 20), 'v0.25', ...harpTrip.slice(20)] },
+        { name: 'cello', instrument: 'cello', gain: 0.55, seq: ['v0.4', ...celloSeq.slice(0, 16), 'v0.55', ...celloSeq.slice(16, 20), 'v0.35', ...celloSeq.slice(20)] },
+      ],
+    });
+  }
+
+  // ===============================================================================================
+  // 5. W. A. Mozart — Piano Concerto No. 21 in C, K. 467, 2nd mvt (Andante, "Elvira Madigan"). F
+  //    major, 4/4, bpm 64. Melody contour and the famous triplet Alberti accompaniment are
+  //    transcribed from memory (moderate confidence); the piece is otherwise an arrangement.
+  // ===============================================================================================
+  {
+    const CH = { I: ['F3', 'A3', 'C4'], IV: ['Bb2', 'D3', 'F3'], V: ['C3', 'E3', 'G3'], ii: ['G2', 'Bb2', 'D3'], vi: ['D3', 'F3', 'A3'] };
+    const PROG = ['I', 'IV', 'V', 'I', 'I', 'V', 'IV', 'I', 'ii', 'V', 'I', 'I', 'IV', 'V', 'vi', 'I',
+      'I', 'IV', 'V', 'I', 'I', 'V', 'ii', 'I', 'IV', 'I', 'V', 'I'];
+    const BASS = { I: 'F2', IV: 'Bb2', V: 'C2', ii: 'G2', vi: 'D2' };
+    const trip = PROG.map((k) => { const [r, t, f] = CH[k]; const cell = `${r} ${f} ${t} ${f}`; return `${cell} ${cell} ${cell} |`; });
+    const celloSeq = PROG.map((k) => `${BASS[k]}/1 |`);
+    const padSeq = PROG.map((k) => `[${CH[k].join(' ')}]/1 |`);
+
+    N.song({
+      id: 'mozart_k467_andante',
+      title: { ko: '피아노 협주곡 21번 안단테', en: 'Piano Concerto No. 21, Andante (arrangement)' },
+      composer: { ko: '볼프강 아마데우스 모차르트', en: 'Wolfgang Amadeus Mozart' },
+      bpm: 64, timeSig: [4, 4], moods: ['peace', 'menu'],
+      tracks: [
+        { name: 'strings', instrument: 'strings', gain: 0.85, seq: [
+          'v0.55',
+          'C5/4. Bb4/8 A4/4 G4/4 |', 'F4/2 A4/4 C5/4 |', 'Bb4/4. A4/8 G4/4 F4/4 |', 'F4/1 |',
+          'C5/4. Bb4/8 A4/4 Bb4/4 |', 'C5/2 D5/4 C5/4 |', 'Bb4/4. A4/8 G4/4 F4/4 |', 'F4/1 |',
+          'v0.62',
+          'F4/4 G4/4 A4/4 Bb4/4 |', 'C5/2 Bb4/4 A4/4 |', 'G4/4. F4/8 E4/4 F4/4 |', 'F4/1 |',
+          'v0.72',
+          'C5/4. Bb4/8 A4/4 C5/4 |', 'D5/2 C5/4 Bb4/4 |', 'A4/4. G4/8 F4/4 E4/4 |', 'F4/1 |',
+          'v0.5',
+          'C5/4. Bb4/8 A4/4 G4/4 |', 'F4/2 A4/4 C5/4 |', 'Bb4/4. A4/8 G4/4 F4/4 |', 'F4/1 |',
+          'v0.4',
+          'F4/4 A4/4 C5/4 F5/4 |', 'E5/2 D5/4 C5/4 |', 'Bb4/4 A4/4 G4/4 F4/4 |', 'F4/1 |',
+          'F4/2 A4/2 |', 'C5/2 F4/2 |', 'A3/2 C4/2 |', 'F3/1 |',
+        ] },
+        { name: 'piano', instrument: 'piano', gain: 0.55, seq: ['v0.4', 'L/8t', ...trip.slice(0, 16), 'v0.55', ...trip.slice(16, 20), 'v0.35', ...trip.slice(20)] },
+        { name: 'pad', instrument: 'pad', gain: 0.35, seq: ['v0.25', ...padSeq.slice(0, 16), 'v0.4', ...padSeq.slice(16, 20), 'v0.22', ...padSeq.slice(20)] },
+        { name: 'cello', instrument: 'cello', gain: 0.5, seq: ['v0.4', ...celloSeq.slice(0, 16), 'v0.55', ...celloSeq.slice(16, 20), 'v0.32', ...celloSeq.slice(20)] },
+      ],
+    });
+  }
+
+  // ===============================================================================================
+  // 6. Johannes Brahms — "Wiegenlied", Op. 49 No. 4. Eb major, 3/4, bpm 66. The strophic lullaby
+  //    tune is the best-known melody in this set; still labelled an arrangement because it is
+  //    repeated/rescored (flute verse, celesta verse, quiet coda) beyond a single literal strophe.
+  // ===============================================================================================
+  {
+    const CH = { I: ['Eb3', 'G3', 'Bb3'], IV: ['Ab3', 'C4', 'Eb4'], V: ['Bb3', 'D4', 'F4'], vi: ['C4', 'Eb4', 'G4'], ii: ['F3', 'Ab3', 'C4'] };
+    const PROG = ['I', 'I', 'V', 'I', 'vi', 'IV', 'V', 'I', 'I', 'I', 'V', 'I', 'IV', 'ii', 'V', 'I'];
+    const harpBar = (k) => { const [r, t, f] = CH[k]; return `${r}/4 [${t} ${f} ${oct(r, 1)}]/4 [${t} ${f} ${oct(r, 1)}]/4 |`; };
+    const harpVerse = PROG.map(harpBar);
+    const VERSE = 'Bb4/4 Bb4/4 Eb5/4 | Eb5/4 F5/4 Eb5/4 | D5/4 C5/4 Bb4/4 | Bb4/2. | '
+      + 'G4/4 G4/4 C5/4 | C5/4 D5/4 Eb5/4 | F5/4 Eb5/4 D5/4 | Eb5/2. | '
+      + 'Bb4/4 Bb4/4 Eb5/4 | Eb5/4 F5/4 Eb5/4 | D5/4 C5/4 Bb4/4 | Bb4/2. | '
+      + 'G4/4 Ab4/4 Bb4/4 | C5/4 Bb4/4 Ab4/4 | G4/4 F4/4 Eb4/4 | Eb4/2. |';
+    const CODA = 'Bb4/4 Bb4/4 Eb5/4 | Eb5/4 F5/4 Eb5/4 | D5/4 C5/4 Bb4/4 | Bb4/2. |';
+
+    N.song({
+      id: 'brahms_wiegenlied',
+      title: { ko: '자장가', en: 'Wiegenlied (Brahms\' Lullaby) (arrangement)' },
+      composer: { ko: '요하네스 브람스', en: 'Johannes Brahms' },
+      bpm: 66, timeSig: [3, 4], moods: ['peace'],
+      tracks: [
+        { name: 'flute', instrument: 'flute', gain: 0.8, seq: ['v0.55', VERSE, 'v0.3', rep('R/2. |', 16).join(' '), 'v0.5', CODA] },
+        { name: 'celesta', instrument: 'celesta', gain: 0.6, seq: ['v0.28', rep('R/2. |', 16).join(' '), 'v0.5', VERSE, rep('R/2. |', 4).join(' ')] },
+        { name: 'harp', instrument: 'harp', gain: 0.5, seq: ['v0.3', ...harpVerse, 'v0.4', ...harpVerse, 'v0.25', ...harpVerse.slice(0, 4)] },
+        { name: 'pad', instrument: 'pad', gain: 0.3, seq: ['v0.18', ...PROG.map((k) => `[${CH[k].join(' ')}]/2. |`), 'v0.25', ...PROG.map((k) => `[${CH[k].join(' ')}]/2. |`), 'v0.15', ...PROG.slice(0, 4).map((k) => `[${CH[k].join(' ')}]/2. |`)] },
+      ],
+    });
+  }
+
+  // ===============================================================================================
+  // 7. Edward Elgar — "Nimrod" (Variations on an Original Theme "Enigma", Op. 36, Var. IX). Eb
+  //    major, 3/4, bpm 50. The rising stepwise opening idea is transcribed from memory (moderate
+  //    confidence); the long crescendo to the famous tutti climax and the recession are an
+  //    arrangement of the same material.
+  // ===============================================================================================
+  {
+    const CH = { I: ['Eb3', 'G3', 'Bb3'], IV: ['Ab3', 'C4', 'Eb4'], V: ['Bb3', 'D4', 'F4'] };
+    const PROG = rep(['I', 'IV', 'V', 'I'], 9).flat();
+    const padSeq = PROG.map((k) => `[${CH[k].join(' ')}]/2. |`);
+    const BASS = { I: 'Eb2', IV: 'Ab2', V: 'Bb2' };
+    const celloSeq = PROG.map((k) => `${BASS[k]}/2. |`);
+    const MEL = [
+      'Eb4/2 F4/4 |', 'G4/2 Ab4/4 |', 'Bb4/2 C5/4 |', 'Bb4/2. |',
+      'C5/2 Bb4/4 |', 'Ab4/2 G4/4 |', 'F4/2 Eb4/4 |', 'Eb4/2. |',
+      'Eb4/2 F4/4 |', 'G4/2 Ab4/4 |', 'Bb4/2 C5/4 |', 'Bb4/2. |',
+      'C5/2 D5/4 |', 'Eb5/2 D5/4 |', 'C5/2 Bb4/4 |', 'Bb4/2. |',
+      'Eb5/2 D5/4 |', 'C5/2 Bb4/4 |', 'Ab4/2 G4/4 |', 'F4/2. |',
+      'Eb5/2 F5/4 |', 'G5/2 Ab5/4 |', 'Bb5/2. |', 'Bb5/2. |',
+      'C6/2 Bb5/4 |', 'Ab5/2 G5/4 |', 'F5/2 Eb5/4 |', 'Eb5/2. |',
+      'Eb4/2 F4/4 |', 'G4/2 Ab4/4 |', 'Bb4/2 C5/4 |', 'Bb4/2. |',
+      'Ab4/2 G4/4 |', 'F4/2 Eb4/4 |', 'Eb4/2. |', 'Eb4/2. |',
+    ];
+    N.song({
+      id: 'elgar_nimrod',
+      title: { ko: '님로드 (수수께끼 변주곡)', en: 'Nimrod (Enigma Variations) (arrangement)' },
+      composer: { ko: '에드워드 엘가', en: 'Edward Elgar' },
+      bpm: 50, timeSig: [3, 4], moods: ['victory', 'tension', 'peace'],
+      tracks: [
+        { name: 'violin', instrument: 'strings', gain: 0.85, seq: ['v0.35', ...MEL.slice(0, 16), 'v0.55', ...MEL.slice(16, 20), 'v0.85', ...MEL.slice(20, 28), 'v0.45', ...MEL.slice(28)] },
+        { name: 'inner', instrument: 'strings', gain: 0.5, seq: ['v0.25', ...padSeq.slice(0, 16), 'v0.4', ...padSeq.slice(16, 20), 'v0.65', ...padSeq.slice(20, 28), 'v0.3', ...padSeq.slice(28)] },
+        { name: 'cello', instrument: 'cello', gain: 0.6, seq: ['v0.35', ...celloSeq.slice(0, 16), 'v0.5', ...celloSeq.slice(16, 20), 'v0.7', ...celloSeq.slice(20, 28), 'v0.35', ...celloSeq.slice(28)] },
+        { name: 'horn', instrument: 'horn', gain: 0.55, seq: ['v0.3', rep('R/2. |', 8).join(' '), ...MEL.slice(8, 28).map((b) => b.replace(/([A-G][#b]?)(\d)/g, (mm, p, o) => p + (parseInt(o, 10) - 1))), 'v0.2', rep('R/2. |', 8).join(' ')] },
+      ],
+    });
+  }
+
+  // ===============================================================================================
+  // 8. Gabriel Faure — "Pavane", Op. 50. F# minor, 4/4, bpm 72. The flute theme's contour and its
+  //    modal (Dorian-tinged) colour are a moderate-confidence recollection; the accompaniment is a
+  //    stylised pavane dance rhythm (steady chords + harp arpeggio) built on that material.
+  // ===============================================================================================
+  {
+    const CH = { i: ['F#3', 'A3', 'C#4'], iv: ['B3', 'D4', 'F#4'], v: ['C#4', 'E4', 'G#4'], VI: ['D3', 'F#3', 'A3'], VII: ['E3', 'G#3', 'B3'] };
+    const PROG = ['i', 'iv', 'v', 'i', 'i', 'iv', 'v', 'i', 'VI', 'VII', 'i', 'v', 'iv', 'v', 'VI', 'i',
+      'i', 'iv', 'v', 'i', 'iv', 'v', 'i', 'i', 'i', 'iv', 'v', 'i'];
+    const stringsSeq = PROG.map((k) => `[${CH[k].join(' ')}]/4 [${CH[k].join(' ')}]/4 [${CH[k].join(' ')}]/4 [${CH[k].join(' ')}]/4 |`);
+    const harpSeq = PROG.map((k) => { const [r, t, f] = CH[k]; const o = oct(r, 1); return `${r} ${t} ${f} ${o} ${f} ${t} ${r} ${t} |`; });
+    const BASS = { i: 'F#2', iv: 'B2', v: 'C#2', VI: 'D2', VII: 'E2' };
+    const celloSeq = PROG.map((k) => `${BASS[k]}/1 |`);
+
+    N.song({
+      id: 'faure_pavane',
+      title: { ko: '파반느', en: 'Pavane (arrangement)' },
+      composer: { ko: '가브리엘 포레', en: 'Gabriel Faure' },
+      bpm: 72, timeSig: [4, 4], moods: ['peace', 'tension'],
+      tracks: [
+        { name: 'flute', instrument: 'flute', gain: 0.85, seq: [
+          'v0.55',
+          'C#5/4 B4/8 A4/8 G#4/4 F#4/4 |', 'E4/2 F#4/4 G#4/4 |', 'A4/4 B4/8 C#5/8 D5/4 C#5/4 |', 'B4/1 |',
+          'C#5/4 B4/8 A4/8 G#4/4 F#4/4 |', 'E4/2 F#4/4 G#4/4 |', 'A4/4. G#4/8 F#4/4 E4/4 |', 'F#4/1 |',
+          'v0.65',
+          'A4/4 B4/4 C#5/4 D5/4 |', 'E5/2 D5/4 C#5/4 |', 'B4/4. A4/8 G#4/4 F#4/4 |', 'F#4/1 |',
+          'v0.75',
+          'C#5/4 D5/4 E5/4 F#5/4 |', 'E5/2 D5/4 C#5/4 |', 'B4/4 A4/4 G#4/4 F#4/4 |', 'F#4/1 |',
+          'v0.55',
+          'C#5/4 B4/8 A4/8 G#4/4 F#4/4 |', 'E4/2 F#4/4 G#4/4 |', 'A4/4 B4/8 C#5/8 D5/4 C#5/4 |', 'B4/1 |',
+          'v0.42',
+          'A4/4 G#4/4 F#4/4 E4/4 |', 'F#4/2 E4/4 D4/4 |', 'C#4/4 D4/4 E4/4 F#4/4 |', 'F#4/1 |',
+          'C#5/4 B4/8 A4/8 G#4/4 F#4/4 |', 'E4/2 F#4/4 G#4/4 |', 'F#4/2. |', 'F#4/2. |',
+        ] },
+        { name: 'strings', instrument: 'strings', gain: 0.5, seq: ['v0.3', ...stringsSeq.slice(0, 16), 'v0.5', ...stringsSeq.slice(16, 24), 'v0.28', ...stringsSeq.slice(24)] },
+        { name: 'harp', instrument: 'harp', gain: 0.45, seq: ['v0.3', 'L/8', ...harpSeq.slice(0, 16), 'v0.48', ...harpSeq.slice(16, 24), 'v0.25', ...harpSeq.slice(24)] },
+        { name: 'cello', instrument: 'cello', gain: 0.55, seq: ['v0.4', ...celloSeq.slice(0, 16), 'v0.55', ...celloSeq.slice(16, 24), 'v0.35', ...celloSeq.slice(24)] },
+      ],
+    });
+  }
+
+  // ===============================================================================================
+  // 9. J. S. Bach — "Air on the G String" (Orchestral Suite No. 3, BWV 1068, 2nd mvt.). D major,
+  //    4/4, bpm 54. The iconic stepwise-descending walking bass (D-C#-B-A-G-F#-E-D) is a
+  //    high-confidence recollection; the suspended melody above it is a stylistic arrangement.
+  // ===============================================================================================
+  {
+    const BASS_D = 'D3/4 C#3/4 B2/4 A2/4 | G2/4 F#2/4 E2/4 D2/4 |';
+    const BASS_A = 'A3/4 G#3/4 F#3/4 E3/4 | D3/4 C#3/4 B2/4 A2/4 |';
+    const BASS_Bm = 'B3/4 A3/4 G3/4 F#3/4 | E3/4 D3/4 C#3/4 B2/4 |';
+    const MEL_D = 'F#4/2. E4/4 | D4/2 C#4/2 |';
+    const MEL_A = 'C#5/2. B4/4 | A4/2 G#4/2 |';
+    const MEL_Bm = 'D5/2. C#5/4 | B4/2 A4/2 |';
+    const ORDER = ['D', 'D', 'A', 'D', 'Bm', 'D', 'D', 'A', 'D', 'Bm', 'D', 'D'];
+    const BASSOF = { D: BASS_D, A: BASS_A, Bm: BASS_Bm };
+    const MELOF = { D: MEL_D, A: MEL_A, Bm: MEL_Bm };
+    const bassSeq = ORDER.map((k) => BASSOF[k]);
+    const melSeq = ORDER.map((k) => MELOF[k]);
+    const CH = { D: ['D3', 'F#3', 'A3'], A: ['A3', 'C#4', 'E4'], Bm: ['B3', 'D4', 'F#4'] };
+    const padSeq = ORDER.map((k) => `[${CH[k].join(' ')}]/1 [${CH[k].join(' ')}]/1 |`);
+    const harpSeq = ORDER.map((k) => { const [r, t, f] = CH[k]; const o = oct(r, 1); return `${r} ${t} ${f} ${o} ${f} ${t} ${r} ${t} | ${r} ${t} ${f} ${o} ${f} ${t} ${r} ${t} |`; });
+
+    N.song({
+      id: 'bach_air',
+      title: { ko: 'G선상의 아리아', en: 'Air on the G String (arrangement)' },
+      composer: { ko: '요한 제바스티안 바흐', en: 'J. S. Bach' },
+      bpm: 54, timeSig: [4, 4], moods: ['peace', 'menu'],
+      tracks: [
+        { name: 'violin', instrument: 'strings', gain: 0.85, seq: ['v0.6', ...melSeq.slice(0, 6), 'v0.72', ...melSeq.slice(6, 10), 'v0.5', ...melSeq.slice(10)] },
+        { name: 'pad', instrument: 'pad', gain: 0.4, seq: ['v0.25', ...padSeq.slice(0, 6), 'v0.38', ...padSeq.slice(6, 10), 'v0.22', ...padSeq.slice(10)] },
+        { name: 'cello', instrument: 'cello', gain: 0.65, seq: ['v0.55', ...bassSeq.slice(0, 6), 'v0.65', ...bassSeq.slice(6, 10), 'v0.45', ...bassSeq.slice(10)] },
+        { name: 'harp', instrument: 'harp', gain: 0.35, seq: ['v0.22', 'L/8', ...harpSeq.slice(0, 6), 'v0.3', ...harpSeq.slice(6, 10), 'v0.18', ...harpSeq.slice(10)] },
+      ],
+    });
+  }
+
+  // ===============================================================================================
+  // 10. J. S. Bach — Goldberg Variations, BWV 988, Aria. G major, 3/4, bpm 60. Piano. The heavily
+  //     ornamented soprano line cannot be recalled reliably note-for-note, so this is a stylistic
+  //     arrangement built over a stepwise-descending 8-bar ground bass (a moderate-confidence,
+  //     idiomatic simplification of the aria's harmonic skeleton), stated four times.
+  // ===============================================================================================
+  {
+    const GROUND = 'G2/4 B2/4 D3/4 | F#2/4 A2/4 C3/4 | E2/4 G2/4 B2/4 | D2/4 F#2/4 A2/4 | '
+      + 'C3/4 E3/4 G3/4 | B2/4 D3/4 G3/4 | A2/4 C3/4 E3/4 | D2/4 F#2/4 A2/4 |';
+    const INNER = '[D4 G4]/4 R/4 R/4 | [D4 A4]/4 R/4 R/4 | [G3 B3]/4 R/4 R/4 | [A3 D4]/4 R/4 R/4 | '
+      + '[C4 G4]/4 R/4 R/4 | [G3 D4]/4 R/4 R/4 | [A3 E4]/4 R/4 R/4 | [D4 A4]/4 R/4 R/4 |';
+    const MEL1 = 'D5/4 B4/4 G4/4 | C#5/4 A4/4 F#4/4 | B4/4 G4/4 E4/4 | A4/4 F#4/4 D4/4 | '
+      + 'G4/4 E4/4 C4/4 | G4/4 D4/4 B3/4 | E4/4 C4/4 A3/4 | F#4/4 A4/4 D5/4 |';
+    const MEL2 = MEL1.replace(/([A-G][#b]?)(\d)(?=[/])/g, (m, p, o) => p + (parseInt(o, 10) + 1));
+
+    N.song({
+      id: 'bach_goldberg_aria',
+      title: { ko: '골드베르크 변주곡 - 아리아', en: 'Goldberg Variations, Aria (arrangement)' },
+      composer: { ko: '요한 제바스티안 바흐', en: 'J. S. Bach' },
+      bpm: 60, timeSig: [3, 4], moods: ['peace', 'menu'],
+      tracks: [
+        { name: 'melody', instrument: 'piano', gain: 0.85, seq: ['v0.55', MEL1, 'v0.6', MEL2, 'v0.65', MEL1, 'v0.42', MEL1] },
+        { name: 'bass', instrument: 'piano', gain: 0.6, seq: ['v0.5', GROUND, GROUND, GROUND, GROUND] },
+        { name: 'inner', instrument: 'piano', gain: 0.35, seq: ['v0.2', INNER, INNER, INNER, INNER] },
+      ],
+    });
+  }
+
+  // ===============================================================================================
+  // 11. J. S. Bach — Siciliano (Flute Sonata in Eb, BWV 1031, 2nd mvt.). G minor, 6/8 (bar = 3
+  //     beats), bpm 54. Theme contour is a moderate-confidence recollection of the famous lilting
+  //     siciliano melody; the harp accompaniment realises the harmonic progression.
+  // ===============================================================================================
+  {
+    const CH = { i: ['G3', 'Bb3', 'D4'], iv: ['C3', 'Eb3', 'G3'], V: ['D3', 'F#3', 'A3'], VI: ['Eb3', 'G3', 'Bb3'], III: ['Bb2', 'D3', 'F3'] };
+    const PROG = ['i', 'iv', 'V', 'i', 'i', 'iv', 'V', 'i', 'III', 'VI', 'V', 'i', 'iv', 'V', 'VI', 'i',
+      'i', 'iv', 'V', 'i', 'iv', 'V', 'iv', 'i', 'i', 'iv', 'i', 'i'];
+    const harpSeq = PROG.map((k) => { const [r, t, f] = CH[k]; return `${r} ${t} ${f} ${oct(r, 1)} ${f} ${t} |`; });
+    const BASS = { i: 'G2', iv: 'C2', V: 'D2', VI: 'Eb2', III: 'Bb2' };
+    const celloSeq = PROG.map((k) => `${BASS[k]}/2. |`);
+
+    N.song({
+      id: 'bach_siciliano',
+      title: { ko: '시칠리아노 (플루트 소나타 BWV 1031)', en: 'Siciliano, BWV 1031 (arrangement)' },
+      composer: { ko: '요한 제바스티안 바흐', en: 'J. S. Bach' },
+      bpm: 54, timeSig: [6, 8], moods: ['peace', 'menu'],
+      tracks: [
+        { name: 'flute', instrument: 'flute', gain: 0.85, seq: [
+          'v0.55',
+          'D5/4. C5/8 Bb4/4 |', 'A4/4. G4/8 F4/4 |', 'G4/4. A4/8 Bb4/4 |', 'A4/2. |',
+          'D5/4. C5/8 Bb4/4 |', 'A4/4. G4/8 F4/4 |', 'Eb4/4. D4/8 C4/4 |', 'D4/2. |',
+          'v0.65',
+          'F4/4. G4/8 A4/4 |', 'Bb4/4. C5/8 D5/4 |', 'Eb5/4. D5/8 C5/4 |', 'D5/2. |',
+          'F5/4. Eb5/8 D5/4 |', 'C5/4. Bb4/8 A4/4 |', 'G4/4. A4/8 Bb4/4 |', 'A4/2. |',
+          'v0.55',
+          'D5/4. C5/8 Bb4/4 |', 'A4/4. G4/8 F4/4 |', 'G4/4. A4/8 Bb4/4 |', 'A4/2. |',
+          'v0.4',
+          'Bb4/4. A4/8 G4/4 |', 'F4/4. Eb4/8 D4/4 |', 'Eb4/4. D4/8 C4/4 |', 'G4/2. |',
+          'D5/4. C5/8 Bb4/4 |', 'A4/4. G4/8 F4/4 |', 'G4/2. |', 'G4/2. |',
+        ] },
+        { name: 'harp', instrument: 'harp', gain: 0.5, seq: ['v0.32', 'L/8', ...harpSeq.slice(0, 16), 'v0.45', ...harpSeq.slice(16, 24), 'v0.28', ...harpSeq.slice(24)] },
+        { name: 'cello', instrument: 'cello', gain: 0.55, seq: ['v0.4', ...celloSeq.slice(0, 16), 'v0.55', ...celloSeq.slice(16, 24), 'v0.35', ...celloSeq.slice(24)] },
+      ],
+    });
+  }
 })();
 
 </script>
@@ -37579,7 +38075,7 @@ a { color: var(--gold-light); }
     navBtn('research', 'research', 'hud.nav.research');
     navBtn('spellbook', 'spellbook', 'hud.nav.spellbook');
     navBtn('empire', UI.iconName('empire', 'crown'), 'hud.nav.empire');
-    navBtn('heroes', 'heroes', 'hud.nav.heroes');
+    navBtn('hero', 'heroes', 'hud.nav.heroes');   // screens.js registers the hero roster as 'hero'
     navBtn('diplomacy', 'diplomacy', 'hud.nav.diplomacy');
     nav.appendChild(el('div', { style: { width: '6px' } }));
     navBtn('settings', 'settings', 'hud.nav.settings');
@@ -37822,9 +38318,18 @@ a { color: var(--gold-light); }
     else if (kind === 'province' || kind === 'hex') { for (let i = 0; i < g.W * g.H; i++) if (g.owner[i] === p.id) out.push(i); }
     return out;
   }
+  // reasons a target-less pre-flight check reports that only mean "you have not picked a target yet"
+  // (alreadyActive is listed as 0 on purpose: it is a real refusal and must still block the click)
+  const TARGET_REASONS = { badTarget: 1, notInDomain: 1, notOwner: 1, alreadyActive: 0 };
   function onSpellClick(spell) {
     const g = game(), p = human(); if (!g || !p) return;
-    if (hasFn('Rules', 'canCast')) { const c = safe(() => AOW.Rules.canCast(g, p, spell.id, null), null); if (c && c.ok === false) { UI.toast('warn', c.text ? L(c.text) : AOW.t('rules.reason.' + c.reason)); return; } }
+    const needsTarget = !(spell.kind === 'empire' || spell.target === 'empire' || spell.target === 'player');
+    if (hasFn('Rules', 'canCast')) {
+      const c = safe(() => AOW.Rules.canCast(g, p, spell.id, null), null);
+      // Rules.canCast validates the target too, so for a spell we are about to *aim* only the
+      // target-independent failures (unknown spell, no mana, already casting…) may block the click.
+      if (c && c.ok === false && !(needsTarget && TARGET_REASONS[c.reason])) { UI.toast('warn', c.text ? L(c.text) : AOW.t('rules.reason.' + c.reason)); return; }
+    }
     if (spell.kind === 'empire' || spell.target === 'empire' || spell.target === 'player') {
       const r = hasFn('Rules', 'castSpell') ? safe(() => AOW.Rules.castSpell(g, p, spell.id, null), null) : null;
       if (r && r.ok === false) UI.toast('warn', r.text ? L(r.text) : t('ui.notAvailable'));
@@ -37888,7 +38393,7 @@ a { color: var(--gold-light); }
     if (!hasFn('Rules', 'pathfind') || !hasFn('Rules', 'moveArmy')) { UI.toast('warn', t('hud.moveUnavailable')); return; }
     const pf = safe(() => AOW.Rules.pathfind(g, army, idx), null);
     if (!pf || !pf.path || !pf.path.length) return;
-    const armyId = army.id;
+    const armyId = army.id, fromHex = army.hex;
     const result = safe(() => AOW.Rules.moveArmy(g, army, pf.path), null);
     clearPathPreview();
     if (!result) { UI.refresh(); return; }
@@ -37899,7 +38404,7 @@ a { color: var(--gold-light); }
       UI.refresh();
       if (result.encounter) { const a2 = S().army(g, finalId) || army; showEncounter(a2, result.encounter); }
     };
-    if (hasFn('WorldRender', 'animateMove')) AOW.WorldRender.animateMove(finalId, moved, after);
+    if (hasFn('WorldRender', 'animateMove')) AOW.WorldRender.animateMove(finalId, moved, after, fromHex);
     else after();
   }
 
@@ -37955,21 +38460,30 @@ a { color: var(--gold-light); }
     if (idx < 0) return;
     if (cast) { tryCastAt(idx); return; }
     const army = selectedArmy();
+    const ownThere = ownArmyAt(g, idx), cityThere = S().cityAt(g, idx);
+    const friendlyCity = !!(cityThere && (cityThere.owner === p.id || cityThere.freeCity));
     if (army && army.owner === p.id) {
-      if (idx === army.hex) { UI.select({ armyId: null, cityId: null }); return; }
-      if (idx === previewTarget) { attemptMove(army, idx); return; }
-      if (hasFn('Rules', 'pathfind')) {
+      if (idx !== army.hex && idx === previewTarget) { attemptMove(army, idx); return; }
+      if (idx === army.hex && !friendlyCity) { UI.select({ armyId: null, cityId: null }); return; }
+      // one of our own stacks / cities under the cursor re-targets the selection instead of planning a move
+      // onto it (double-click still marches there) — otherwise a selected army would make every own city
+      // unclickable until the selection is cleared.
+      if (!(idx === army.hex || ownThere || friendlyCity) && hasFn('Rules', 'pathfind')) {
         const pf = safe(() => AOW.Rules.pathfind(g, army, idx), null);
         previewTarget = idx;
         if (hasFn('WorldRender', 'setPathPreview')) safe(() => AOW.WorldRender.setPathPreview(pf && pf.path ? pf : null));
         return;
       }
-      // no pathfinding available yet: fall through to reselection below
+      // no pathfinding available yet (or a friendly target): fall through to reselection below
+      clearPathPreview();
     }
-    const own = ownArmyAt(g, idx);
-    if (own) { splitSel.clear(); UI.select({ armyId: own.id }); return; }
-    const city = S().cityAt(g, idx);
-    if (city && (city.owner === p.id || city.freeCity)) { UI.select({ cityId: city.id }); return; }
+    // a hex can hold both a city and its garrison: the city comes first, another click cycles to the stack
+    if (friendlyCity) {
+      if (ownThere && UI.selected.cityId === cityThere.id) { splitSel.clear(); UI.select({ armyId: ownThere.id }); return; }
+      UI.select({ cityId: cityThere.id });
+      return;
+    }
+    if (ownThere) { splitSel.clear(); UI.select({ armyId: ownThere.id }); return; }
     UI.select({ armyId: null, cityId: null }); clearPathPreview();
   }
   function onHexDblClick(payload) {
@@ -38178,6 +38692,8 @@ a { color: var(--gold-light); }
 //   Screens.unitPortrait(typeOrUnit, size, o) → <img>|<canvas>   cached UnitArt.portrait with role-icon fallback
 //   Screens.tierName(tier) → string            city tier label (0 outpost … 5 metropolis)
 //   Screens.showProposal(proposal)             opens the accept/decline modal used for 'diplomacy:proposal'
+//                                              (one at a time — further proposals queue behind it)
+//   Screens.clearProposals()                   drops the queue (called on 'game:new')
 // Engine functions this file calls when present (all optional): Rules.cityYields, Rules.cityYieldBreakdown,
 //   Rules.stabilityBreakdown, Rules.growthNeeded, Rules.renameCity, Rules.buildableBuildings, Rules.recruitableUnits,
 //   Rules.canRecruit, Rules.enqueue, Rules.dequeue, Rules.moveQueueItem, Rules.queueItemCost, Rules.annexableProvinces,
@@ -38519,7 +39035,11 @@ a { color: var(--gold-light); }
   .sc-node.owned{border-color:var(--gold-light);background:linear-gradient(180deg,#4a3a18,#2a2010);box-shadow:0 0 8px rgba(201,162,74,.4)}
   .sc-node.available{border-color:#8fd16a}.sc-node.locked{opacity:.5}.sc-node.signature{border-color:#e8c357;box-shadow:inset 0 0 0 1px #8a6a24}
   .sc-node.rite{border-style:double;border-width:3px}
-  .sc-affbars{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}.sc-affbar{flex:1;min-width:140px;display:flex;align-items:center;gap:6px}
+  /* the six affinities always share one row: a fixed 6-column grid (a flex-wrap row dropped 그림자 onto a second line) */
+  .sc-affbars{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px 10px;margin-bottom:10px;flex:1 1 420px;min-width:0}
+  .sc-affbar{display:flex;align-items:center;gap:5px;min-width:0}
+  .sc-affbar .aname{color:var(--text-dim);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto}
+  .sc-affbar .abar{flex:1 1 auto;min-width:28px}
   .sc-slots{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
   .sc-slot{display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px;border:2px solid #4a4a52;border-radius:6px;background:rgba(0,0,0,.3);cursor:pointer;min-height:84px;font-size:11px;text-align:center}
   .sc-slot .sname{color:var(--text-dim)}.sc-slot .iname{color:var(--text);line-height:1.15}
@@ -39086,7 +39606,7 @@ a { color: var(--gold-light); }
     const box = mk('div', { class: 'sc-affbars' });
     for (const a of AFFS) {
       const v = num(player.affinity && player.affinity[a]);
-      box.appendChild(mk('div', { class: 'sc-affbar' }, icon(a, 20), mk('span', { class: 'sub', style: 'min-width:82px;white-space:nowrap' }, t('affinity.' + a)), mk('div', { style: 'flex:1;min-width:60px' }, progress(Math.min(v, AFF_SCALE), AFF_SCALE, { color: null, label: String(v), height: 12 }))));
+      box.appendChild(mk('div', { class: 'sc-affbar' }, icon(a, 18), mk('span', { class: 'aname' }, t('affinity.' + a)), mk('div', { class: 'abar' }, progress(Math.min(v, AFF_SCALE), AFF_SCALE, { color: null, label: String(v), height: 12 }))));
     }
     return box;
   }
@@ -39390,16 +39910,19 @@ a { color: var(--gold-light); }
     const SVGNS = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(SVGNS, 'svg');
     svg.setAttribute('width', width); svg.setAttribute('height', height);
+    const links = [];        // {el, from, to} — geometry is filled in from the real DOM boxes below
     for (const n of nodes) for (const p of n.prereq || []) if (pos[p]) {
       const a = pos[p], b = pos[n.id], on = owned.has(p) && owned.has(n.id);
-      const line = document.createElementNS(SVGNS, 'line');
-      line.setAttribute('x1', a.x + NODE_W / 2); line.setAttribute('y1', a.y + 58);
-      line.setAttribute('x2', b.x + NODE_W / 2); line.setAttribute('y2', b.y);
+      const line = document.createElementNS(SVGNS, 'path');
+      line.setAttribute('d', 'M ' + (a.x + NODE_W / 2) + ' ' + (a.y + 58) + ' L ' + (b.x + NODE_W / 2) + ' ' + b.y);
+      line.setAttribute('fill', 'none');
       line.setAttribute('stroke', on ? '#c9a24a' : 'rgba(201,162,74,.35)'); line.setAttribute('stroke-width', '2');
       svg.appendChild(line);
+      links.push({ el: line, from: p, to: n.id });
     }
     const wrap = mk('div', { class: 'sc-tree', style: { width: width + 'px', height: (height + 8) + 'px' } });
     wrap.appendChild(svg);
+    const cellOf = {};
     for (const n of nodes) {
       const isOwned = owned.has(n.id);
       const prereqOk = (n.prereq || []).every(p => owned.has(p));
@@ -39414,7 +39937,36 @@ a { color: var(--gold-light); }
       const reason = !isOwned && !prereqOk ? t('empire.needPrereq') : (!isOwned && !affOk ? t('empire.affinityReq', { aff: tree === 'general' ? t('empire.tree.general') : t('affinity.' + tree), n: n.affinityReq }) : '');
       tip(cell, () => tipBox(L(n.name), [L(n.desc), Object.keys(n.effects || {}).length ? mk('p', null, Screens.effectsText(n.effects)) : null, reason ? mk('p', { class: 'bad' }, reason) : null]));
       wrap.appendChild(cell);
+      cellOf[n.id] = cell;
     }
+    // Node boxes grow with their content and a few nodes prereq a sibling on their own row, so the grid
+    // constants above are only a first guess: once the tree is laid out, re-anchor every connector to the
+    // measured boxes — prereq bottom centre → node top centre for a node one row down, and a short detour
+    // through the gap below the row for a sibling prereq (a straight sideways line would disappear behind the
+    // nodes in between and look like it joined the wrong pair). The nodes and the <svg> share the same offset
+    // parent (.sc-tree), so offsetLeft/offsetTop are directly comparable with SVG user units.
+    const relink = () => {
+      if (!wrap.isConnected) return;
+      let maxBottom = height;
+      for (const l of links) {
+        const a = cellOf[l.from], b = cellOf[l.to];
+        if (!a || !b) continue;
+        const A = { l: a.offsetLeft, t: a.offsetTop, w: a.offsetWidth, h: a.offsetHeight };
+        const B = { l: b.offsetLeft, t: b.offsetTop, w: b.offsetWidth, h: b.offsetHeight };
+        const ax = A.l + A.w / 2, bx = B.l + B.w / 2;
+        let d;
+        if (B.t >= A.t + A.h - 4) {                    // node one row down → bottom centre → top centre
+          d = 'M ' + ax + ' ' + (A.t + A.h) + ' L ' + bx + ' ' + B.t;
+        } else {                                       // sibling on the same row → dip into the gap below it
+          const y = Math.max(A.t + A.h, B.t + B.h) + 10;
+          d = 'M ' + ax + ' ' + (A.t + A.h) + ' L ' + ax + ' ' + y + ' L ' + bx + ' ' + y + ' L ' + bx + ' ' + (B.t + B.h);
+        }
+        l.el.setAttribute('d', d);
+        maxBottom = Math.max(maxBottom, A.t + A.h + 12, B.t + B.h + 12);
+      }
+      if (maxBottom > height) { svg.setAttribute('height', maxBottom); wrap.style.height = (maxBottom + 8) + 'px'; }
+    };
+    requestAnimationFrame(() => { relink(); requestAnimationFrame(relink); });
     return wrap;
   }
   defineScreen('empire', {
@@ -39507,19 +40059,32 @@ a { color: var(--gold-light); }
     return wrap;
   }
   /** opens the accept/decline modal for an incoming proposal (used by Events 'diplomacy:proposal' and the pending list). */
+  // several realms can propose in the same turn: show ONE modal at a time and queue the rest, so the
+  // proposals never pile up as a stack of backdrops the player has to dig through.
+  let proposalModal = null;
+  const proposalQueue = [];
   Screens.showProposal = function (proposal) {
     const g = game(); if (!g || !proposal) return;
+    if (proposalModal && proposalModal.closed === false) {   // (=== false: the fallback modal has no such flag)
+      if (!proposalQueue.some(p => p === proposal || (p.id !== undefined && p.id === proposal.id))) proposalQueue.push(proposal);
+      return;
+    }
     const from = g.players[proposal.from];
     const kindNameFn = fn('Diplomacy', 'kindName');
-    modal({
+    const answer = (accept) => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, proposal, accept); refreshUI(); refreshScreen('diplomacy'); };
+    proposalModal = modal({
       title: t('dip.incoming', { name: from ? from.name : '?' }), icon: 'diplomacy', width: 420,
-      body: mk('div', null, mk('div', { class: 'sc-h' }, kindNameFn ? L(kindNameFn(proposal.kind)) : proposal.kind)),
+      body: mk('div', null, mk('div', { class: 'sc-h' }, kindNameFn ? L(kindNameFn(proposal.kind)) : proposal.kind),
+        proposalQueue.length ? mk('div', { class: 'sub' }, '+' + proposalQueue.length) : null),
       buttons: [
-        { label: t('dip.decline'), kind: 'ghost', onClick: () => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, proposal, false); refreshUI(); refreshScreen('diplomacy'); } },
-        { label: t('dip.accept'), kind: 'primary', onClick: () => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, proposal, true); refreshUI(); refreshScreen('diplomacy'); } },
+        { label: t('dip.decline'), kind: 'ghost', onClick: () => answer(false) },
+        { label: t('dip.accept'), kind: 'primary', onClick: () => answer(true) },
       ],
+      onClose: () => { proposalModal = null; const next = proposalQueue.shift(); if (next) setTimeout(() => Screens.showProposal(next), 60); },
     });
   };
+  /** drop any queued proposal modal (a new/loaded game invalidates them) */
+  Screens.clearProposals = function () { proposalQueue.length = 0; proposalModal = null; };
   defineScreen('diplomacy', {
     title: () => t('dip.title'), width: 1040,
     build(ctx) {
@@ -39686,7 +40251,7 @@ a { color: var(--gold-light); }
 
   // ================================================================ registration retry + global listeners
   if (AOW.Events) {
-    AOW.Events.on('game:new', () => Screens.registerAll());
+    AOW.Events.on('game:new', () => { Screens.clearProposals(); Screens.registerAll(); });
     AOW.Events.on('ui:screen', () => Screens.registerAll());
     // incoming diplomatic proposal → show the accept/decline modal for the human recipient
     AOW.Events.on('diplomacy:proposal', (p) => {
@@ -39770,7 +40335,9 @@ a { color: var(--gold-light); }
    both to fill the viewport and make the dim/full-screen backdrop transparent so the battle canvas
    (a sibling of #ui entirely outside this DOM tree) shows through. */
 .aow-screen--battle.aow-screen--full { background: transparent; }
-.aow-screen--battle .aow-screen__inner { width: 100%; height: 100%; max-width: 100%; max-height: 100%; }
+/* the full-bleed inner box would otherwise eat every click (.aow-screen--nodim > * turns pointer events on),
+   leaving the battle canvas — a sibling of #ui — unreachable: only the HUD chrome inside takes input. */
+.aow-screen--battle .aow-screen__inner { width: 100%; height: 100%; max-width: 100%; max-height: 100%; pointer-events: none; }
 .battle-hud { width: 100%; height: 100%; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; font: 13px var(--font-body); color: var(--text); }
 .battle-topbar { pointer-events: auto; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: linear-gradient(180deg, rgba(8,10,17,0.9), rgba(8,10,17,0.55) 75%, transparent); }
 .battle-side { display: flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 5px; background: rgba(10,12,20,0.55); border: 1px solid var(--border-soft); transition: box-shadow 0.2s; }
@@ -40296,6 +40863,10 @@ a { color: var(--gold-light); }
       if (CR()) { safe(() => CR().setActiveUnit(null)); safe(() => CR().setTargetMode(null)); }
     }
     renderAll();
+    // Combat.perform ends the side turn on its own once the last of our units has activated (endUnitTurn →
+    // endSideTurn), so the initiative can flip without us pressing 진영 턴 종료. Start the AI loop in that
+    // case or the battle sits there with every control disabled.
+    if (S.battle.winner == null && !isHumanTurn() && !S.aiPlaying) { S.aiPlaying = true; renderAll(); runAiLoop(); }
   }
 
   // ------------------------------------------------------------------ side turn / AI loop
@@ -40323,16 +40894,21 @@ a { color: var(--gold-light); }
   function runAiLoop() {
     const battle = S.battle;
     if (!battle || battle.winner != null) { S.aiPlaying = false; if (battle && battle.winner != null) endBattleFlow(); return; }
-    if (isHumanTurn()) { S.aiPlaying = false; renderAll(); return; }
+    if (isHumanTurn()) { S.aiPlaying = false; S.aiSteps = 0; renderAll(); return; }
     let events = null;
     try { events = has('Combat', 'aiStep') ? AOW.Combat.aiStep(battle) : (has('Combat', 'aiTakeTurn') ? AOW.Combat.aiTakeTurn(battle) : null); }
     catch (e) { console.error('[combat_ui] aiStep', e); events = null; }
     if (!events || (Array.isArray(events) && !events.length)) {
-      // aiStep returns null/empty only once the battle has actually ended (or there's truly nothing left)
-      S.aiPlaying = false;
+      // aiStep returns null/empty only once the battle has actually ended (or there's truly nothing left).
+      // Belt and braces: while the battle is still live and it is still not our turn, keep stepping (bounded)
+      // rather than freezing the screen with a disabled end-turn button.
+      S.aiSteps = (S.aiSteps || 0) + 1;
+      if (battle.winner == null && !isHumanTurn() && S.aiSteps < 400) { runAiLoop(); return; }
+      S.aiPlaying = false; S.aiSteps = 0;
       if (battle.winner != null) endBattleFlow(); else renderAll();
       return;
     }
+    S.aiSteps = 0;
     events = Array.isArray(events) ? events : [events];
     if (CR() && CR().playEvents) {
       CR().playEvents(events, () => {

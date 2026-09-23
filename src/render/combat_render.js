@@ -28,7 +28,8 @@
   const SIZE = 44, HEX_W = SQ3 * SIZE, ROW_H = 1.5 * SIZE;
   const UNIT_SCALE = 1.35, HERO_SCALE = 1.5;
   const MOVE_SEC = 0.16;
-  const GROUND_RES = 1.5;               // ground layer oversampling (crisp at zoom 2)
+  const GROUND_RES_MIN = 1.25, GROUND_RES_MAX = 3;   // ground layer oversampling (device pixels per world unit)
+  const GROUND_PIXEL_CAP = 26e6;        // never allocate a ground canvas bigger than this (≈100 MB RGBA)
   const TERRAINS = ['ocean', 'coast', 'lake', 'grass', 'forest', 'hills', 'mountain', 'desert', 'snow', 'swamp', 'volcanic'];
   const FEATURES = ['none', 'forest', 'dense_forest', 'hills', 'mountain', 'peak', 'ruins', 'crystal', 'ash', 'oasis', 'ice', 'mushroom', 'ancient_tree'];
   const WATER = { ocean: 1, coast: 1, lake: 1 };
@@ -335,12 +336,22 @@
     }
     c.closePath();
   }
+  /** device pixels per world unit the ground layer must carry: the canvas' own device-pixel ratio times the
+   *  zoom it will realistically be viewed at (a little past the fit zoom), capped so the offscreen stays sane. */
+  function groundRes() {
+    const b = fieldBounds(), margin = 70;
+    const w = b.x1 - b.x0 + margin * 2, h = b.y1 - b.y0 + margin * 2;
+    let res = M.clamp(dprScale * Math.min(cam.maxZoom, Math.max(1, (cam.fit || 1) * 1.5)), GROUND_RES_MIN, GROUND_RES_MAX);
+    while (res > GROUND_RES_MIN && w * res * h * res > GROUND_PIXEL_CAP) res -= 0.25;
+    return res;
+  }
   function paintGround() {
     const t0 = performance.now();
     const b = fieldBounds(), margin = 70;
+    const GROUND_RES = groundRes();
     const gw = Math.ceil((b.x1 - b.x0 + margin * 2) * GROUND_RES), gh = Math.ceil((b.y1 - b.y0 + margin * 2) * GROUND_RES);
     const { cv, ctx: g } = Art.canvas(gw, gh);
-    ground = { cv, ox: b.x0 - margin, oy: b.y0 - margin, w: gw / GROUND_RES, h: gh / GROUND_RES };
+    ground = { cv, ox: b.x0 - margin, oy: b.y0 - margin, w: gw / GROUND_RES, h: gh / GROUND_RES, res: GROUND_RES };
     g.save();
     g.scale(GROUND_RES, GROUND_RES);
     g.translate(-ground.ox, -ground.oy);
@@ -1513,11 +1524,29 @@
   CR.hover = hover;
 
   // ================================================================ lifecycle
+  /** size the backing store to the canvas' real device pixels (CSS-stretching a 300×150 default canvas is what
+   *  made the battlefield look like an upscaled blur). Returns true when the backing store changed. */
+  function resizeCanvas() {
+    if (!canvas) return false;
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const cw = Math.max(1, Math.round(canvas.clientWidth || window.innerWidth));
+    const chh = Math.max(1, Math.round(canvas.clientHeight || window.innerHeight));
+    const pw = Math.round(cw * dpr), ph = Math.round(chh * dpr);
+    const changed = canvas.width !== pw || canvas.height !== ph || dprScale !== dpr;
+    if (canvas.width !== pw) canvas.width = pw;
+    if (canvas.height !== ph) canvas.height = ph;
+    dprScale = dpr;
+    return changed;
+  }
   CR.init = function (cv, b, g) {
     if (canvas && canvas !== cv) unbindInput();
     canvas = cv; ctx = cv.getContext('2d'); game = g || (AOW.game || null);
-    dprScale = 1;
+    resizeCanvas();
     bindInput();
+    if (!CR._resizeBound) {
+      CR._resizeBound = true;
+      window.addEventListener('resize', () => { if (canvas && !canvas.hidden) CR.resize(); });
+    }
     CR.setBattle(b);
     return CR;
   };
@@ -1532,13 +1561,19 @@
     resolveSideColors();
     normalizeCells();
     normalizeWalls();
+    if (canvas) { resizeCanvas(); fitCamera(false); }   // the fit zoom decides the ground resolution
     paintGround();
     for (const u of battle.units || []) US(u);
-    if (canvas) fitCamera(false);
   };
   CR.getBattle = () => battle;
   CR.refreshWalls = function () { normalizeWalls(); };
-  CR.resize = function () { if (canvas) fitCamera(true); };
+  CR.resize = function () {
+    if (!canvas) return;
+    const changed = resizeCanvas();
+    fitCamera(true);
+    // repaint the ground only when the view now demands more detail than the cached layer carries
+    if (changed && battle && ground && groundRes() > (ground.res || 0) + 0.2) paintGround();
+  };
   CR.destroy = function () {
     if (canvas) unbindInput();
     if (demoRaf) cancelAnimationFrame(demoRaf);

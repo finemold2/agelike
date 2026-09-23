@@ -1584,6 +1584,24 @@
     next.mp = Math.min(army.mp, Rules.armyMaxMp(game, next));
     return { ok: true, armyId: next.id, army: next };
   };
+  /**
+   * Hold position: the stack spends the rest of its movement and braces. Every unit in it gains `fortified`
+   * until the owner's next turn, which the tactical layer reads as defense mode when a battle starts here.
+   */
+  Rules.defendArmy = function (game, army) {
+    army = army && typeof army === 'object' ? army : S().army(game, army);
+    if (!army) return fail('noArmy');
+    army.mp = 0; army.defending = true; army.sleeping = false;
+    for (const uid of army.units) { const u = S().unit(game, uid); if (u) Rules.applyStatus(game, u, 'fortified', 1); }
+    return { ok: true, armyId: army.id };
+  };
+  /** Skip this stack for the rest of the turn (no next-unit stop, no end-turn warning). */
+  Rules.sleepArmy = function (game, army) {
+    army = army && typeof army === 'object' ? army : S().army(game, army);
+    if (!army) return fail('noArmy');
+    army.mp = 0; army.sleeping = true; army.defending = false;
+    return { ok: true, armyId: army.id };
+  };
   /** Disband a single unit (a hero's unit kills the hero unless it is a ruler, which respawns). */
   Rules.disband = function (game, unitId) {
     const unit = S().unit(game, unitId);

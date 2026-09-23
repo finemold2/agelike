@@ -526,6 +526,8 @@
       if (st && st.id && statusDef(st.id)) u.statuses.push({ id: st.id, turns: st.turns || 3, stacks: st.stacks || 1 });
     }
     touchStatuses(u);
+    // a stack that held position on the world map (Rules.defendArmy → `fortified`) starts the battle braced
+    if (findStatus(u, 'fortified')) u.defending = true;
     const e = effectsOf(u);
     u.morale = (stats.morale || 0) + (e.morale || 0);
     u.mp = clamp(u.mp + (e.mp || 0) * 3, 0, C.MP_MAX + 6);
@@ -2324,6 +2326,10 @@
       if (battle.winner !== null && battle.winner !== undefined) break;
     }
     if (!isDead(u) && !u.hasActed && battle.winner === null) out = out.concat(Combat.endUnitTurn(battle, u.id));
+    // A step that changed the battle but produced no *events* (a refused action, or an activation that ended
+    // with no status ticks) must still report progress: the UI's playback loop treats an empty step as "the
+    // battle is over" and would otherwise stall on the AI side forever. The activation above always advances.
+    if (!out.length && (battle.winner === null || battle.winner === undefined)) out = [{ type: 'log', text: 'act' }];
     return out;
   };
 

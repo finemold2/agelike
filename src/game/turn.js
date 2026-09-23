@@ -225,6 +225,7 @@
       if (a.owner !== pid) continue;
       a.mp = Rules.armyMaxMp(game, a);
       a.path = null;
+      a.defending = false; a.sleeping = false;   // hold-position / sleep only last one turn
       delete a._teleported;
     }
 

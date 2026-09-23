@@ -9,11 +9,13 @@
 //   WorldRender.centerOn(idx, animate=true)   move the camera to a hex (eased when animate)
 //   WorldRender.screenToHex(x, y) → idx|-1 ; WorldRender.hexToScreen(idx) → {x,y} ; WorldRender.worldToScreen(wx, wy)
 //   WorldRender.setSelection({armyId|cityId|null}) ; WorldRender.setPathPreview({path, turnBreaks}|path|null)
+//   WorldRender.getPathPreview() → {path, turnBreaks}|null ; WorldRender.isAnimating() → bool (move tweens running)
 //   WorldRender.highlight(hexIdxs, style)     style 'move'|'attack'|'annex'|'cast'|'none' (none clears everything)
 //   WorldRender.playEffect(kind, idx, params) VFX at a hex (falls back to a ring pulse when AOW.VFX is absent)
 //   WorldRender.shakeScreen(intensity)        camera shake (px)
 //   WorldRender.setOverlay('none'|'provinces'|'yields')
-//   WorldRender.animateMove(armyId, path, done)   0.18 s / hex tween (camera follows when WorldRender.followMoves)
+//   WorldRender.animateMove(armyId, path, done, fromIdx)   0.18 s / hex tween from `fromIdx` (the hex the army
+//                                             left; defaults to path[0]) — camera follows when WorldRender.followMoves
 //   WorldRender.renderMinimap(ctx, w, h) ; WorldRender.minimapToWorld(mx, my, w, h) → {x, y} world px
 //   WorldRender.demo(canvas, query)           standalone showcase: seed 'demo', centred on the capital; returns timing
 // Additive helpers (SPEC §0): WorldRender.camera (live), WorldRender.viewerPid, WorldRender.debug (overlay flag),
@@ -220,6 +222,10 @@
     if (Array.isArray(p)) pathPreview = { path: p, turnBreaks: null };
     else pathPreview = { path: p.path || [], turnBreaks: p.turnBreaks || null };
   };
+  /** the live path preview ({path, turnBreaks} | null) — read-only, for the HUD and tests */
+  WR.getPathPreview = function () { return pathPreview; };
+  /** true while at least one army move tween is still running (animateMove) */
+  WR.isAnimating = function () { return moveAnims.size > 0; };
   WR.highlight = function (idxs, style) {
     if (!style || style === 'none') { highlights.clear(); return; }
     if (!idxs || !idxs.length) { highlights.delete(style); return; }
@@ -907,20 +913,19 @@
   }
 
   // ================================================================ move animation
-  WR.animateMove = function (armyId, path, done) {
+  WR.animateMove = function (armyId, path, done, fromIdx) {
     const g = game, a = State().army(g, armyId);
     if (!a || !path || !path.length) { if (done) done(); return; }
     const Hx = Hex();
-    const start = moveAnims.get(armyId) ? null : null;
-    const from = Hx.toPixel(a.hex % g.W, (a.hex / g.W) | 0);
-    // the army's hex is usually already updated: start from the hex before path[0] if it is adjacent, else from the current hex
-    let sx = from.x, sy = from.y;
-    const first = path[0];
-    for (let d = 0; d < 6; d++) {
-      const n = Hx.neighborIdx(first, d, g.W, g.H);
-      if (n === a.hex) break;
-    }
-    if (path[path.length - 1] === a.hex && path.length > 1) { /* start = hex before the path: best guess = previous position along the reverse direction */ }
+    // the army's hex is ALREADY the end of `path` when Rules.moveArmy has run, so the tween must start from
+    // the hex the army left (the caller passes it); fall back to the current hex only when it is adjacent to
+    // path[0] (i.e. the move has not been applied yet), else start on path[0] itself — never at the far end,
+    // which would make the stack slide backwards before walking its route.
+    let startIdx = path[0];
+    if (fromIdx !== undefined && fromIdx !== null && fromIdx >= 0) startIdx = fromIdx;
+    else if (Hx.distIdx(a.hex, path[0], g.W) === 1) startIdx = a.hex;
+    const from = Hx.toPixel(startIdx % g.W, (startIdx / g.W) | 0);
+    const sx = from.x, sy = from.y;
     moveAnims.set(armyId, { path: path.slice(), i: 0, t: 0, done, x: sx, y: sy, sx, sy, follow: WR.followMoves });
     leadCache.delete(armyId);
   };
@@ -976,7 +981,12 @@
   }
 
   // ================================================================ fog of war (per chunk, feathered)
-  const FOG_MASK_GROW = 7;   // px the fog mask extends past the hex edge before blurring
+  // Both layers are painted as ONE continuous wash over the whole chunk and then masked by the (blurred)
+  // union of the hexes they cover, so nothing in the fog follows a hex silhouette. The blur radii below are
+  // world px: ~1.5 hexes of feather for the unexplored cloud bank, ~1 hex for the "explored but unseen" veil.
+  const FOG_MASK_GROW = 7;       // world px the mask extends past the hex edge before blurring
+  const FOG_BLUR_CLOUD = 26;     // world px gaussian radius on the unexplored edge (Hex.SIZE is 36)
+  const FOG_BLUR_VEIL = 16;      // world px gaussian radius on the explored-but-unseen edge
   const fogScratch = { cv: null, ctx: null };
   function buildFog(ch) {
     const g = game, Hx = Hex(), TA = TerrainArt();
@@ -994,7 +1004,7 @@
     if (!anyDim && !anyCloud) return;
     if (!fogScratch.cv) { const o = Art().canvas(ch.w, ch.h); fogScratch.cv = o.cv; fogScratch.ctx = o.ctx; }
     if (fogScratch.cv.width < ch.w || fogScratch.cv.height < ch.h) { fogScratch.cv.width = Math.max(fogScratch.cv.width, ch.w); fogScratch.cv.height = Math.max(fogScratch.cv.height, ch.h); }
-    const s = ch.scale, blur = Math.round(11 * s);
+    const s = ch.scale;
     const mask = fogScratch.ctx;
     const buildMask = (test, grow) => {
       mask.setTransform(1, 0, 0, 1, 0, 0); mask.clearRect(0, 0, ch.w, ch.h);
@@ -1010,7 +1020,8 @@
       mask.fill();
       mask.restore();
     };
-    const applyMask = (target) => {
+    const applyMask = (target, blurWorld) => {
+      const blur = Math.max(1, Math.round(blurWorld * s));
       target.setTransform(1, 0, 0, 1, 0, 0);
       target.globalCompositeOperation = 'destination-in';
       if ('filter' in target) target.filter = 'blur(' + blur + 'px)';
@@ -1026,36 +1037,31 @@
     if (!ch.fogOut) ch.fogOut = Art().canvas(ch.w, ch.h);
     const out = ch.fogOut.ctx;
     out.setTransform(1, 0, 0, 1, 0, 0); out.clearRect(0, 0, ch.w, ch.h);
-    // ---- dim layer: cool grey wash, alpha = feathered coverage of explored-but-unseen hexes
+    // ---- veil layer: cool grey wash over explored-but-unseen ground, feathered at its edge
     if (anyDim) {
       if (!ch.fogDim) ch.fogDim = Art().canvas(ch.w, ch.h);
       const d = ch.fogDim.ctx;
       d.setTransform(1, 0, 0, 1, 0, 0); d.clearRect(0, 0, ch.w, ch.h);
-      d.fillStyle = 'rgb(118,122,138)'; d.fillRect(0, 0, ch.w, ch.h);
+      d.fillStyle = (TA && TA.FOG_VEIL) || 'rgb(118,122,138)'; d.fillRect(0, 0, ch.w, ch.h);
       buildMask(i => ex[i] && vis && !vis[i], FOG_MASK_GROW);
-      applyMask(d);
+      applyMask(d, FOG_BLUR_VEIL);
       out.globalAlpha = 0.55;
       out.drawImage(ch.fogDim.cv, 0, 0, ch.w, ch.h);
       out.globalAlpha = 1;
     }
-    // ---- cloud layer: unexplored parchment-storm texture (drawn a ring wider so it bleeds softly over explored ground)
+    // ---- cloud layer: one seamless parchment wash over the whole chunk, cut to the unexplored hexes with a
+    // soft (≈1.5 hex) edge — a single world-aligned repeating texture, never per-hex sprites.
     if (anyCloud) {
       if (!ch.fogCloud) ch.fogCloud = Art().canvas(ch.w, ch.h);
       const k = ch.fogCloud.ctx;
       k.setTransform(1, 0, 0, 1, 0, 0); k.clearRect(0, 0, ch.w, ch.h);
       k.save(); k.scale(s, s); k.translate(-ch.ox, -ch.oy);
-      TA.setOrigin(0, 0);
-      const near = (i) => { if (!ex[i]) return true; for (let dd = 0; dd < 6; dd++) { const n = Hx.neighborIdx(i, dd, g.W, g.H); if (n >= 0 && !ex[n]) return true; } return false; };
-      for (let r = r0 - 1; r <= r1 + 1; r++) for (let c = c0 - 1; c <= c1 + 1; c++) {
-        if (!Hx.inBounds(c, r, g.W, g.H)) continue;
-        const i = r * g.W + c;
-        if (!near(i)) continue;
-        const p = Hx.toPixel(c, r);
-        TA.drawFog(k, p.x, p.y, 'unexplored');
-      }
+      TA.setOrigin(0, 0);                       // phase-lock the pattern to world coordinates
+      if (typeof TA.fillFog === 'function') TA.fillFog(k, ch.ox, ch.oy, ch.w / s, ch.h / s);
+      else { k.fillStyle = 'rgb(150,150,150)'; k.fillRect(ch.ox, ch.oy, ch.w / s, ch.h / s); }
       k.restore();
-      buildMask(i => !ex[i], FOG_MASK_GROW + 6);
-      applyMask(k);
+      buildMask(i => !ex[i], FOG_MASK_GROW);
+      applyMask(k, FOG_BLUR_CLOUD);
       out.drawImage(ch.fogCloud.cv, 0, 0, ch.w, ch.h);
     }
     stats.totalFogBuilds++;

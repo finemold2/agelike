@@ -12,6 +12,8 @@
 //   Screens.unitPortrait(typeOrUnit, size, o) → <img>|<canvas>   cached UnitArt.portrait with role-icon fallback
 //   Screens.tierName(tier) → string            city tier label (0 outpost … 5 metropolis)
 //   Screens.showProposal(proposal)             opens the accept/decline modal used for 'diplomacy:proposal'
+//                                              (one at a time — further proposals queue behind it)
+//   Screens.clearProposals()                   drops the queue (called on 'game:new')
 // Engine functions this file calls when present (all optional): Rules.cityYields, Rules.cityYieldBreakdown,
 //   Rules.stabilityBreakdown, Rules.growthNeeded, Rules.renameCity, Rules.buildableBuildings, Rules.recruitableUnits,
 //   Rules.canRecruit, Rules.enqueue, Rules.dequeue, Rules.moveQueueItem, Rules.queueItemCost, Rules.annexableProvinces,
@@ -353,7 +355,11 @@
   .sc-node.owned{border-color:var(--gold-light);background:linear-gradient(180deg,#4a3a18,#2a2010);box-shadow:0 0 8px rgba(201,162,74,.4)}
   .sc-node.available{border-color:#8fd16a}.sc-node.locked{opacity:.5}.sc-node.signature{border-color:#e8c357;box-shadow:inset 0 0 0 1px #8a6a24}
   .sc-node.rite{border-style:double;border-width:3px}
-  .sc-affbars{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}.sc-affbar{flex:1;min-width:140px;display:flex;align-items:center;gap:6px}
+  /* the six affinities always share one row: a fixed 6-column grid (a flex-wrap row dropped 그림자 onto a second line) */
+  .sc-affbars{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px 10px;margin-bottom:10px;flex:1 1 420px;min-width:0}
+  .sc-affbar{display:flex;align-items:center;gap:5px;min-width:0}
+  .sc-affbar .aname{color:var(--text-dim);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto}
+  .sc-affbar .abar{flex:1 1 auto;min-width:28px}
   .sc-slots{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
   .sc-slot{display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px;border:2px solid #4a4a52;border-radius:6px;background:rgba(0,0,0,.3);cursor:pointer;min-height:84px;font-size:11px;text-align:center}
   .sc-slot .sname{color:var(--text-dim)}.sc-slot .iname{color:var(--text);line-height:1.15}
@@ -920,7 +926,7 @@
     const box = mk('div', { class: 'sc-affbars' });
     for (const a of AFFS) {
       const v = num(player.affinity && player.affinity[a]);
-      box.appendChild(mk('div', { class: 'sc-affbar' }, icon(a, 20), mk('span', { class: 'sub', style: 'min-width:82px;white-space:nowrap' }, t('affinity.' + a)), mk('div', { style: 'flex:1;min-width:60px' }, progress(Math.min(v, AFF_SCALE), AFF_SCALE, { color: null, label: String(v), height: 12 }))));
+      box.appendChild(mk('div', { class: 'sc-affbar' }, icon(a, 18), mk('span', { class: 'aname' }, t('affinity.' + a)), mk('div', { class: 'abar' }, progress(Math.min(v, AFF_SCALE), AFF_SCALE, { color: null, label: String(v), height: 12 }))));
     }
     return box;
   }
@@ -1224,16 +1230,19 @@
     const SVGNS = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(SVGNS, 'svg');
     svg.setAttribute('width', width); svg.setAttribute('height', height);
+    const links = [];        // {el, from, to} — geometry is filled in from the real DOM boxes below
     for (const n of nodes) for (const p of n.prereq || []) if (pos[p]) {
       const a = pos[p], b = pos[n.id], on = owned.has(p) && owned.has(n.id);
-      const line = document.createElementNS(SVGNS, 'line');
-      line.setAttribute('x1', a.x + NODE_W / 2); line.setAttribute('y1', a.y + 58);
-      line.setAttribute('x2', b.x + NODE_W / 2); line.setAttribute('y2', b.y);
+      const line = document.createElementNS(SVGNS, 'path');
+      line.setAttribute('d', 'M ' + (a.x + NODE_W / 2) + ' ' + (a.y + 58) + ' L ' + (b.x + NODE_W / 2) + ' ' + b.y);
+      line.setAttribute('fill', 'none');
       line.setAttribute('stroke', on ? '#c9a24a' : 'rgba(201,162,74,.35)'); line.setAttribute('stroke-width', '2');
       svg.appendChild(line);
+      links.push({ el: line, from: p, to: n.id });
     }
     const wrap = mk('div', { class: 'sc-tree', style: { width: width + 'px', height: (height + 8) + 'px' } });
     wrap.appendChild(svg);
+    const cellOf = {};
     for (const n of nodes) {
       const isOwned = owned.has(n.id);
       const prereqOk = (n.prereq || []).every(p => owned.has(p));
@@ -1248,7 +1257,36 @@
       const reason = !isOwned && !prereqOk ? t('empire.needPrereq') : (!isOwned && !affOk ? t('empire.affinityReq', { aff: tree === 'general' ? t('empire.tree.general') : t('affinity.' + tree), n: n.affinityReq }) : '');
       tip(cell, () => tipBox(L(n.name), [L(n.desc), Object.keys(n.effects || {}).length ? mk('p', null, Screens.effectsText(n.effects)) : null, reason ? mk('p', { class: 'bad' }, reason) : null]));
       wrap.appendChild(cell);
+      cellOf[n.id] = cell;
     }
+    // Node boxes grow with their content and a few nodes prereq a sibling on their own row, so the grid
+    // constants above are only a first guess: once the tree is laid out, re-anchor every connector to the
+    // measured boxes — prereq bottom centre → node top centre for a node one row down, and a short detour
+    // through the gap below the row for a sibling prereq (a straight sideways line would disappear behind the
+    // nodes in between and look like it joined the wrong pair). The nodes and the <svg> share the same offset
+    // parent (.sc-tree), so offsetLeft/offsetTop are directly comparable with SVG user units.
+    const relink = () => {
+      if (!wrap.isConnected) return;
+      let maxBottom = height;
+      for (const l of links) {
+        const a = cellOf[l.from], b = cellOf[l.to];
+        if (!a || !b) continue;
+        const A = { l: a.offsetLeft, t: a.offsetTop, w: a.offsetWidth, h: a.offsetHeight };
+        const B = { l: b.offsetLeft, t: b.offsetTop, w: b.offsetWidth, h: b.offsetHeight };
+        const ax = A.l + A.w / 2, bx = B.l + B.w / 2;
+        let d;
+        if (B.t >= A.t + A.h - 4) {                    // node one row down → bottom centre → top centre
+          d = 'M ' + ax + ' ' + (A.t + A.h) + ' L ' + bx + ' ' + B.t;
+        } else {                                       // sibling on the same row → dip into the gap below it
+          const y = Math.max(A.t + A.h, B.t + B.h) + 10;
+          d = 'M ' + ax + ' ' + (A.t + A.h) + ' L ' + ax + ' ' + y + ' L ' + bx + ' ' + y + ' L ' + bx + ' ' + (B.t + B.h);
+        }
+        l.el.setAttribute('d', d);
+        maxBottom = Math.max(maxBottom, A.t + A.h + 12, B.t + B.h + 12);
+      }
+      if (maxBottom > height) { svg.setAttribute('height', maxBottom); wrap.style.height = (maxBottom + 8) + 'px'; }
+    };
+    requestAnimationFrame(() => { relink(); requestAnimationFrame(relink); });
     return wrap;
   }
   defineScreen('empire', {
@@ -1341,19 +1379,32 @@
     return wrap;
   }
   /** opens the accept/decline modal for an incoming proposal (used by Events 'diplomacy:proposal' and the pending list). */
+  // several realms can propose in the same turn: show ONE modal at a time and queue the rest, so the
+  // proposals never pile up as a stack of backdrops the player has to dig through.
+  let proposalModal = null;
+  const proposalQueue = [];
   Screens.showProposal = function (proposal) {
     const g = game(); if (!g || !proposal) return;
+    if (proposalModal && proposalModal.closed === false) {   // (=== false: the fallback modal has no such flag)
+      if (!proposalQueue.some(p => p === proposal || (p.id !== undefined && p.id === proposal.id))) proposalQueue.push(proposal);
+      return;
+    }
     const from = g.players[proposal.from];
     const kindNameFn = fn('Diplomacy', 'kindName');
-    modal({
+    const answer = (accept) => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, proposal, accept); refreshUI(); refreshScreen('diplomacy'); };
+    proposalModal = modal({
       title: t('dip.incoming', { name: from ? from.name : '?' }), icon: 'diplomacy', width: 420,
-      body: mk('div', null, mk('div', { class: 'sc-h' }, kindNameFn ? L(kindNameFn(proposal.kind)) : proposal.kind)),
+      body: mk('div', null, mk('div', { class: 'sc-h' }, kindNameFn ? L(kindNameFn(proposal.kind)) : proposal.kind),
+        proposalQueue.length ? mk('div', { class: 'sub' }, '+' + proposalQueue.length) : null),
       buttons: [
-        { label: t('dip.decline'), kind: 'ghost', onClick: () => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, proposal, false); refreshUI(); refreshScreen('diplomacy'); } },
-        { label: t('dip.accept'), kind: 'primary', onClick: () => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, proposal, true); refreshUI(); refreshScreen('diplomacy'); } },
+        { label: t('dip.decline'), kind: 'ghost', onClick: () => answer(false) },
+        { label: t('dip.accept'), kind: 'primary', onClick: () => answer(true) },
       ],
+      onClose: () => { proposalModal = null; const next = proposalQueue.shift(); if (next) setTimeout(() => Screens.showProposal(next), 60); },
     });
   };
+  /** drop any queued proposal modal (a new/loaded game invalidates them) */
+  Screens.clearProposals = function () { proposalQueue.length = 0; proposalModal = null; };
   defineScreen('diplomacy', {
     title: () => t('dip.title'), width: 1040,
     build(ctx) {
@@ -1520,7 +1571,7 @@
 
   // ================================================================ registration retry + global listeners
   if (AOW.Events) {
-    AOW.Events.on('game:new', () => Screens.registerAll());
+    AOW.Events.on('game:new', () => { Screens.clearProposals(); Screens.registerAll(); });
     AOW.Events.on('ui:screen', () => Screens.registerAll());
     // incoming diplomatic proposal → show the accept/decline modal for the human recipient
     AOW.Events.on('diplomacy:proposal', (p) => {

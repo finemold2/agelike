@@ -204,7 +204,7 @@
     navBtn('research', 'research', 'hud.nav.research');
     navBtn('spellbook', 'spellbook', 'hud.nav.spellbook');
     navBtn('empire', UI.iconName('empire', 'crown'), 'hud.nav.empire');
-    navBtn('heroes', 'heroes', 'hud.nav.heroes');
+    navBtn('hero', 'heroes', 'hud.nav.heroes');   // screens.js registers the hero roster as 'hero'
     navBtn('diplomacy', 'diplomacy', 'hud.nav.diplomacy');
     nav.appendChild(el('div', { style: { width: '6px' } }));
     navBtn('settings', 'settings', 'hud.nav.settings');
@@ -447,9 +447,18 @@
     else if (kind === 'province' || kind === 'hex') { for (let i = 0; i < g.W * g.H; i++) if (g.owner[i] === p.id) out.push(i); }
     return out;
   }
+  // reasons a target-less pre-flight check reports that only mean "you have not picked a target yet"
+  // (alreadyActive is listed as 0 on purpose: it is a real refusal and must still block the click)
+  const TARGET_REASONS = { badTarget: 1, notInDomain: 1, notOwner: 1, alreadyActive: 0 };
   function onSpellClick(spell) {
     const g = game(), p = human(); if (!g || !p) return;
-    if (hasFn('Rules', 'canCast')) { const c = safe(() => AOW.Rules.canCast(g, p, spell.id, null), null); if (c && c.ok === false) { UI.toast('warn', c.text ? L(c.text) : AOW.t('rules.reason.' + c.reason)); return; } }
+    const needsTarget = !(spell.kind === 'empire' || spell.target === 'empire' || spell.target === 'player');
+    if (hasFn('Rules', 'canCast')) {
+      const c = safe(() => AOW.Rules.canCast(g, p, spell.id, null), null);
+      // Rules.canCast validates the target too, so for a spell we are about to *aim* only the
+      // target-independent failures (unknown spell, no mana, already casting…) may block the click.
+      if (c && c.ok === false && !(needsTarget && TARGET_REASONS[c.reason])) { UI.toast('warn', c.text ? L(c.text) : AOW.t('rules.reason.' + c.reason)); return; }
+    }
     if (spell.kind === 'empire' || spell.target === 'empire' || spell.target === 'player') {
       const r = hasFn('Rules', 'castSpell') ? safe(() => AOW.Rules.castSpell(g, p, spell.id, null), null) : null;
       if (r && r.ok === false) UI.toast('warn', r.text ? L(r.text) : t('ui.notAvailable'));
@@ -513,7 +522,7 @@
     if (!hasFn('Rules', 'pathfind') || !hasFn('Rules', 'moveArmy')) { UI.toast('warn', t('hud.moveUnavailable')); return; }
     const pf = safe(() => AOW.Rules.pathfind(g, army, idx), null);
     if (!pf || !pf.path || !pf.path.length) return;
-    const armyId = army.id;
+    const armyId = army.id, fromHex = army.hex;
     const result = safe(() => AOW.Rules.moveArmy(g, army, pf.path), null);
     clearPathPreview();
     if (!result) { UI.refresh(); return; }
@@ -524,7 +533,7 @@
       UI.refresh();
       if (result.encounter) { const a2 = S().army(g, finalId) || army; showEncounter(a2, result.encounter); }
     };
-    if (hasFn('WorldRender', 'animateMove')) AOW.WorldRender.animateMove(finalId, moved, after);
+    if (hasFn('WorldRender', 'animateMove')) AOW.WorldRender.animateMove(finalId, moved, after, fromHex);
     else after();
   }
 
@@ -580,21 +589,30 @@
     if (idx < 0) return;
     if (cast) { tryCastAt(idx); return; }
     const army = selectedArmy();
+    const ownThere = ownArmyAt(g, idx), cityThere = S().cityAt(g, idx);
+    const friendlyCity = !!(cityThere && (cityThere.owner === p.id || cityThere.freeCity));
     if (army && army.owner === p.id) {
-      if (idx === army.hex) { UI.select({ armyId: null, cityId: null }); return; }
-      if (idx === previewTarget) { attemptMove(army, idx); return; }
-      if (hasFn('Rules', 'pathfind')) {
+      if (idx !== army.hex && idx === previewTarget) { attemptMove(army, idx); return; }
+      if (idx === army.hex && !friendlyCity) { UI.select({ armyId: null, cityId: null }); return; }
+      // one of our own stacks / cities under the cursor re-targets the selection instead of planning a move
+      // onto it (double-click still marches there) — otherwise a selected army would make every own city
+      // unclickable until the selection is cleared.
+      if (!(idx === army.hex || ownThere || friendlyCity) && hasFn('Rules', 'pathfind')) {
         const pf = safe(() => AOW.Rules.pathfind(g, army, idx), null);
         previewTarget = idx;
         if (hasFn('WorldRender', 'setPathPreview')) safe(() => AOW.WorldRender.setPathPreview(pf && pf.path ? pf : null));
         return;
       }
-      // no pathfinding available yet: fall through to reselection below
+      // no pathfinding available yet (or a friendly target): fall through to reselection below
+      clearPathPreview();
     }
-    const own = ownArmyAt(g, idx);
-    if (own) { splitSel.clear(); UI.select({ armyId: own.id }); return; }
-    const city = S().cityAt(g, idx);
-    if (city && (city.owner === p.id || city.freeCity)) { UI.select({ cityId: city.id }); return; }
+    // a hex can hold both a city and its garrison: the city comes first, another click cycles to the stack
+    if (friendlyCity) {
+      if (ownThere && UI.selected.cityId === cityThere.id) { splitSel.clear(); UI.select({ armyId: ownThere.id }); return; }
+      UI.select({ cityId: cityThere.id });
+      return;
+    }
+    if (ownThere) { splitSel.clear(); UI.select({ armyId: ownThere.id }); return; }
     UI.select({ armyId: null, cityId: null }); clearPathPreview();
   }
   function onHexDblClick(payload) {

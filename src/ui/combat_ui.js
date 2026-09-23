@@ -67,7 +67,9 @@
    both to fill the viewport and make the dim/full-screen backdrop transparent so the battle canvas
    (a sibling of #ui entirely outside this DOM tree) shows through. */
 .aow-screen--battle.aow-screen--full { background: transparent; }
-.aow-screen--battle .aow-screen__inner { width: 100%; height: 100%; max-width: 100%; max-height: 100%; }
+/* the full-bleed inner box would otherwise eat every click (.aow-screen--nodim > * turns pointer events on),
+   leaving the battle canvas — a sibling of #ui — unreachable: only the HUD chrome inside takes input. */
+.aow-screen--battle .aow-screen__inner { width: 100%; height: 100%; max-width: 100%; max-height: 100%; pointer-events: none; }
 .battle-hud { width: 100%; height: 100%; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; font: 13px var(--font-body); color: var(--text); }
 .battle-topbar { pointer-events: auto; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: linear-gradient(180deg, rgba(8,10,17,0.9), rgba(8,10,17,0.55) 75%, transparent); }
 .battle-side { display: flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 5px; background: rgba(10,12,20,0.55); border: 1px solid var(--border-soft); transition: box-shadow 0.2s; }
@@ -593,6 +595,10 @@
       if (CR()) { safe(() => CR().setActiveUnit(null)); safe(() => CR().setTargetMode(null)); }
     }
     renderAll();
+    // Combat.perform ends the side turn on its own once the last of our units has activated (endUnitTurn →
+    // endSideTurn), so the initiative can flip without us pressing 진영 턴 종료. Start the AI loop in that
+    // case or the battle sits there with every control disabled.
+    if (S.battle.winner == null && !isHumanTurn() && !S.aiPlaying) { S.aiPlaying = true; renderAll(); runAiLoop(); }
   }
 
   // ------------------------------------------------------------------ side turn / AI loop
@@ -620,16 +626,21 @@
   function runAiLoop() {
     const battle = S.battle;
     if (!battle || battle.winner != null) { S.aiPlaying = false; if (battle && battle.winner != null) endBattleFlow(); return; }
-    if (isHumanTurn()) { S.aiPlaying = false; renderAll(); return; }
+    if (isHumanTurn()) { S.aiPlaying = false; S.aiSteps = 0; renderAll(); return; }
     let events = null;
     try { events = has('Combat', 'aiStep') ? AOW.Combat.aiStep(battle) : (has('Combat', 'aiTakeTurn') ? AOW.Combat.aiTakeTurn(battle) : null); }
     catch (e) { console.error('[combat_ui] aiStep', e); events = null; }
     if (!events || (Array.isArray(events) && !events.length)) {
-      // aiStep returns null/empty only once the battle has actually ended (or there's truly nothing left)
-      S.aiPlaying = false;
+      // aiStep returns null/empty only once the battle has actually ended (or there's truly nothing left).
+      // Belt and braces: while the battle is still live and it is still not our turn, keep stepping (bounded)
+      // rather than freezing the screen with a disabled end-turn button.
+      S.aiSteps = (S.aiSteps || 0) + 1;
+      if (battle.winner == null && !isHumanTurn() && S.aiSteps < 400) { runAiLoop(); return; }
+      S.aiPlaying = false; S.aiSteps = 0;
       if (battle.winner != null) endBattleFlow(); else renderAll();
       return;
     }
+    S.aiSteps = 0;
     events = Array.isArray(events) ? events : [events];
     if (CR() && CR().playEvents) {
       CR().playEvents(events, () => {

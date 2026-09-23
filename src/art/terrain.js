@@ -7,7 +7,10 @@
 //   TerrainArt.drawRoads(ctx, x, y, info)            info.road bitmask
 //   TerrainArt.drawHexDecor(ctx, x, y, info, zoom)   trees, hills, peaks, ruins, crystals… (call after all bases, row order)
 //   TerrainArt.drawWater(ctx, x, y, info, t)         cheap animated shimmer (t seconds)
-//   TerrainArt.drawFog(ctx, x, y, kind)              'unexplored' | 'explored'
+//   TerrainArt.drawFog(ctx, x, y, kind)              'unexplored' | 'explored' (one hex; prefer fillFog for regions)
+//   TerrainArt.fillFog(ctx, x, y, w, h)              seamless unexplored parchment over a whole rect (world-aligned
+//                                                    pattern, no hex clip) — the caller masks & feathers it
+//   TerrainArt.FOG_VEIL                              flat colour of the explored-but-unseen wash
 //   TerrainArt.drawChunk(ctx, getInfo, c0, c1, r0, r1, originX, originY, opts)
 //   TerrainArt.demo(canvas)
 // Additive helpers (documented here, not in SPEC):
@@ -56,9 +59,10 @@
   const TILE = 96;
   const tiles = new Map();
   const patterns = new Map();
-  function fbmTorus(x, y, seed, scale, oct) {
-    // sample fbm on a torus so the tile wraps seamlessly
-    const a1 = x / TILE * TAU, a2 = y / TILE * TAU;
+  function fbmTorus(x, y, seed, scale, oct, size) {
+    // sample fbm on a torus so the tile wraps seamlessly (`size` defaults to the terrain TILE)
+    const N = size || TILE;
+    const a1 = x / N * TAU, a2 = y / N * TAU;
     const r = scale / TAU;
     return Noise.fbm2(Math.cos(a1) * r + Math.cos(a2) * r * 1.61, Math.sin(a1) * r + Math.sin(a2) * r * 1.27, seed, oct) * 0.5 + 0.5;
   }
@@ -427,40 +431,59 @@
   };
 
   // ================================================================ fog
+  // The unexplored map is ONE seamless painted-parchment texture (a single wrapping noise tile used as a
+  // repeating pattern, phase-locked to world coordinates through setOrigin) — never a per-hex sprite. Callers
+  // paint it over a whole region and feather its edge themselves (see world_render's buildFog), so the cloud
+  // bank has no hex silhouettes and no tiled bevel.
+  const FOG_TILE = 256;
   let fogTile = null, fogPattern = null;
-  function fogPatternFor(ctx) {
-    if (!fogTile) {
-      const o = Art.canvas(TILE, TILE);
-      const img = o.ctx.createImageData(TILE, TILE), d = img.data;
-      const a = Color.parse('#7e8494'), b = Color.parse('#c4c0b0'), c = Color.parse('#4f5566');
-      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
-        const v = fbmTorus(x, y, 909, 2.5, 4);
-        const w = fbmTorus(x, y, 17, 6, 2);
-        const k = M.clamp(v * 1.3 - 0.15 + (w - 0.5) * 0.25, 0, 1);
-        const i = (y * TILE + x) * 4;
-        const p = k < 0.5 ? c : a, q = k < 0.5 ? a : b, kk = k < 0.5 ? k * 2 : (k - 0.5) * 2;
-        d[i] = p[0] + (q[0] - p[0]) * kk; d[i + 1] = p[1] + (q[1] - p[1]) * kk; d[i + 2] = p[2] + (q[2] - p[2]) * kk; d[i + 3] = 255;
-      }
-      o.ctx.putImageData(img, 0, 0);
-      fogTile = o.cv;
+  function fogTileCanvas() {
+    if (fogTile) return fogTile;
+    const o = Art.canvas(FOG_TILE, FOG_TILE);
+    const img = o.ctx.createImageData(FOG_TILE, FOG_TILE), d = img.data;
+    const deep = Color.parse('#a9a291'), mid = Color.parse('#c7bfab'), pale = Color.parse('#e0d7c0');
+    for (let y = 0; y < FOG_TILE; y++) for (let x = 0; x < FOG_TILE; x++) {
+      // two transposed fbm samples cancel the diagonal bias of the torus mapping → no visible streaks
+      const cloud = (fbmTorus(x, y, 909, 5.5, 5, FOG_TILE) + fbmTorus(y, x, 313, 4.3, 5, FOG_TILE)) * 0.5;
+      const grain = fbmTorus(x, y, 31, 17, 2, FOG_TILE);       // paper grain
+      let k = M.clamp(0.5 + (cloud - 0.5) * 1.5 + (grain - 0.5) * 0.3, 0, 1);
+      k = k * k * (3 - 2 * k);                                 // smoothstep: low contrast, no hard veins
+      const i = (y * FOG_TILE + x) * 4;
+      const p = k < 0.5 ? deep : mid, q = k < 0.5 ? mid : pale, kk = k < 0.5 ? k * 2 : (k - 0.5) * 2;
+      d[i] = p[0] + (q[0] - p[0]) * kk; d[i + 1] = p[1] + (q[1] - p[1]) * kk; d[i + 2] = p[2] + (q[2] - p[2]) * kk; d[i + 3] = 255;
     }
+    o.ctx.putImageData(img, 0, 0);
+    fogTile = o.cv;
+    return fogTile;
+  }
+  function fogPatternFor(ctx) {
+    fogTileCanvas();
     if (!fogPattern) fogPattern = ctx.createPattern(fogTile, 'repeat');
     if (domMatrix && fogPattern.setTransform) {
-      domMatrix.e = -M.mod(origin.x, TILE); domMatrix.f = -M.mod(origin.y, TILE);
+      domMatrix.e = -M.mod(origin.x, FOG_TILE); domMatrix.f = -M.mod(origin.y, FOG_TILE);
       fogPattern.setTransform(domMatrix);
     }
     return fogPattern;
   }
+  /** the flat wash used for explored-but-currently-unseen ground (callers feather it themselves) */
+  TerrainArt.FOG_VEIL = 'rgb(118,122,138)';
+  /**
+   * Fill a rectangle of the CURRENT user space with the seamless unexplored-fog texture. The pattern is
+   * phase-locked to world coordinates (TerrainArt.setOrigin), so neighbouring chunks line up exactly.
+   * No clipping and no vignette: mask/feather the region you paint.
+   */
+  TerrainArt.fillFog = function (ctx, x, y, w, h) {
+    ctx.save();
+    ctx.fillStyle = fogPatternFor(ctx);
+    ctx.fillRect(x, y, w, h);
+    ctx.restore();
+  };
   TerrainArt.drawFog = function (ctx, x, y, kind) {
     const S = Hex.SIZE + 1.5;
     ctx.save();
     hexPath(ctx, x, y, S); ctx.clip();
     if (kind === 'unexplored') {
-      ctx.fillStyle = fogPatternFor(ctx);
-      ctx.fillRect(x - S, y - S, 2 * S, 2 * S);
-      // faint parchment contour: a soft vignette so the cloud reads as painted, not flat
-      ctx.fillStyle = Art.rgrad(ctx, x, y, S * 0.3, S * 1.15, [[0, 'rgba(230,220,195,0.08)'], [1, 'rgba(30,36,48,0.2)']]);
-      ctx.fillRect(x - S, y - S, 2 * S, 2 * S);
+      TerrainArt.fillFog(ctx, x - S, y - S, 2 * S, 2 * S);
     } else {
       ctx.globalCompositeOperation = 'saturation';
       ctx.fillStyle = 'rgba(128,128,128,0.55)';
