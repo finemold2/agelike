@@ -1225,6 +1225,15 @@
     }
     return { level: hero.level, xp: hero.xp, levels };
   };
+  /** skill id → tome id for hero skills that are tome contents (they must be researched before a hero can learn them) */
+  let tomeSkillMap = null;
+  Rules.tomeOfSkill = function (skillId) {
+    if (!tomeSkillMap) {
+      tomeSkillMap = {};
+      for (const t of Data().list('tomes')) for (const c of t.contents || []) if (c.type === 'skill') tomeSkillMap[c.id] = t.id;
+    }
+    return tomeSkillMap[skillId] || null;
+  };
   /** Hero skills the hero may learn right now (class/level/prereq/tome gated). */
   Rules.heroAvailableSkills = function (game, hero) {
     const player = S().player(game, hero.owner);
@@ -1237,6 +1246,8 @@
       if (sk.rulerType && sk.rulerType !== hero.rulerType) continue;
       if ((sk.minLevel || 1) > hero.level) continue;
       if (sk.tome && player && !(player.tomes || []).includes(sk.tome) && !player.unlocked.skills.includes(sk.id)) continue;
+      // skills taught by a tome (listed as tome contents) are unlocked by researching them
+      if (!sk.tome && Rules.tomeOfSkill(sk.id) && player && !player.unlocked.skills.includes(sk.id)) continue;
       let ok = true;
       for (const p of sk.prereq || []) if (!known.has(p)) { ok = false; break; }
       if (!ok) continue;
@@ -2531,7 +2542,7 @@
       reward.knowledge = r.knowledge || 0;
       reward.imperium = (r.imperium || 0) + tier * 5;
       reward.items = Rules.rollLoot(game, r.itemTier || tier, r.items || 1);
-      if (player) Rules.notify(game, pid, 'good', L(`${J(w ? KO(w.name) : '고대 불가사의', '을/를')} 정복했습니다!`, `${w ? EN(w.name) : 'Ancient wonder'} cleared!`), 'star', { structureId: st.id });
+      reward.title = L(`${J(w ? KO(w.name) : '고대 불가사의', '을/를')} 정복했습니다!`, `${w ? EN(w.name) : 'Ancient wonder'} cleared!`);
     } else if (st.kind === 'infestation') {
       const tier = st.refId === 'dragon_lair' ? 3 : 2;
       reward.gold = 40 * tier;
@@ -2539,7 +2550,7 @@
       reward.imperium = 5 * tier;
       reward.items = Rules.rollLoot(game, tier, 1);
       st.infestationCleared = true;
-      if (player) Rules.notify(game, pid, 'good', L('소굴을 소탕했습니다!', 'Infestation destroyed!'), 'skull', { structureId: st.id });
+      reward.title = L('소굴을 소탕했습니다!', 'Infestation destroyed!');
       // the spawner is gone for good
       for (const a of game.armies.slice()) if (a.owner < 0 && a.raid && a.raid.home === st.id) a.raid.home = -1;
       S().removeStructure(game, st.id);
@@ -2551,6 +2562,15 @@
       player.resources.imperium += reward.imperium;
       for (const it of reward.items) player.items.push(it);
       Rules.invalidate(pid);
+      if (reward.title) {
+        // "X을 정복했습니다! 금 +75 · 제국력 +15 · 강철 검" — the spoils are part of the news
+        const RK = { gold: ['금', 'gold'], mana: ['마나', 'mana'], knowledge: ['지식', 'knowledge'], imperium: ['제국력', 'imperium'] };
+        const parts = [[], []];
+        for (const k of Object.keys(RK)) if (reward[k]) { parts[0].push(`${RK[k][0]} +${reward[k]}`); parts[1].push(`+${reward[k]} ${RK[k][1]}`); }
+        for (const id of reward.items) { const it = get('items', id); parts[0].push(it ? KO(it.name) : id); parts[1].push(it ? EN(it.name) : id); }
+        const text = parts[0].length ? L(reward.title.ko + ' ' + parts[0].join(' · '), reward.title.en + ' ' + parts[1].join(' · ')) : reward.title;
+        Rules.notify(game, pid, 'good', text, st.kind === 'wonder' ? 'star' : 'skull', { structureId: st.id, hexIdx: st.hex });
+      }
     }
     log(game, `[clear] structure ${structureId} by p${pid}`);
     return { ok: true, reward, kind: st.kind };

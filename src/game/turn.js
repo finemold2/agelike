@@ -81,7 +81,8 @@
     const Rules = R();
     const t0 = now();
     const hp = Turn.humanPid(game);
-    if (game.victory) return game.victory;
+    // the game stops at a result until the player chooses to play on (victory screen → Continue sets .continued)
+    if (game.victory && !game.victory.continued) return game.victory;
     // everything notified from here on (AI phase, upkeep, the human's next turn) belongs to the human's next
     // turn in the HUD feed — the AI phase still runs under the old game.turn number
     game.notifSince = game.nextId && game.nextId.notification ? game.nextId.notification - 1 : 0;
@@ -92,14 +93,14 @@
       const play = fn('AI', 'playTurn');
       if (play) { try { play(game, p.id); } catch (e) { AOW.warn('AI.playTurn p' + p.id, e); } }
       try { Turn.processPlayer(game, p.id); } catch (e) { AOW.warn('processPlayer p' + p.id, e); }
-      if (game.victory) break;
+      if (game.victory && !game.victory.continued) break;
     }
     game.turn++;
     if (hp >= 0) { try { Turn.processPlayer(game, hp); } catch (e) { AOW.warn('processPlayer human', e); } }
     else { try { Turn.worldTick(game); } catch (e) { AOW.warn('worldTick', e); } }
     Turn.beginTurn(game);
     game.turnStats = { ms: Math.round((now() - t0) * 10) / 10 };
-    return game.victory || null;
+    return game.victory && !game.victory.continued ? game.victory : null;
   };
 
   /** Announce the start of the human player's turn. */

@@ -138,6 +138,39 @@
     AOW.Events.emit('battle:start', { battle });
     return battle.id;
   };
+  /** move an army straight to hexIdx (no pathing/MP) and refresh vision + renderer — test setup helper */
+  Debug.teleportArmy = function (armyId, hexIdx) {
+    const g = AOW.game; if (!g) return false;
+    const a = AOW.State.army(g, armyId); if (!a) return false;
+    a.hex = hexIdx; a.path = null;
+    if (a.owner >= 0 && hasFn('Rules', 'recomputeVisibility')) AOW.Rules.recomputeVisibility(g, a.owner);
+    if (hasFn('WorldRender', 'invalidate')) AOW.WorldRender.invalidate(null);
+    if (hasFn('UI', 'refresh')) AOW.UI.refresh();
+    return true;
+  };
+  /** drop every unit of an army to `hp` (default 1) — makes a guard stack beatable in a test */
+  Debug.weakenArmy = function (armyId, hp = 1) {
+    const g = AOW.game; if (!g) return 0;
+    const a = AOW.State.army(g, armyId); if (!a) return 0;
+    for (const uid of a.units) { const u = AOW.State.unit(g, uid); if (u) u.hp = Math.min(u.hp, hp); }
+    return a.units.length;
+  };
+  /** knock a realm out of the game: its cities become free cities, its armies vanish; the next turn's
+   *  elimination check marks it dead (so Turn/Events report it the normal way) */
+  Debug.eliminate = function (pid) {
+    const g = AOW.game; if (!g) return false;
+    const p = g.players[pid]; if (!p) return false;
+    for (const a of g.armies.slice()) if (a.owner === pid) AOW.State.removeArmy(g, a.id);
+    for (const c of g.cities) if (c.owner === pid) {
+      c.owner = -1; c.isCapital = false; c.queue = [];
+      c.freeCity = { culture: p.cultureId, form: p.formId, opinion: {}, vassalOf: -1, integrated: false, stones: [], warWith: [] };
+      const st = AOW.State.structureAt(g, c.hex); if (st) { st.kind = 'free_city'; st.owner = -1; }
+      for (const pr of c.provinces || []) { const prov = g.provinces[pr]; if (prov) { prov.owner = -1; for (const h of prov.hexes) g.owner[h] = -1; } }
+    }
+    for (const u of g.units.slice()) if (u.owner === pid && hasFn('State', 'removeUnit')) AOW.State.removeUnit(g, u.id);
+    if (hasFn('WorldRender', 'invalidate')) AOW.WorldRender.invalidate(null);
+    return true;
+  };
   Debug.endTurn = function (n = 1) { for (let i = 0; i < n; i++) AOW.Turn.endTurn(AOW.game); return AOW.game.turn; };
   Debug.stats = function () {
     const g = AOW.game; if (!g) return null;

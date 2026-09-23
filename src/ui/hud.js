@@ -44,6 +44,8 @@
       'hud.castHint': '{name} — 지도에서 대상을 선택하세요. (우클릭으로 취소)', 'hud.castCancelled': '주문 시전을 취소했습니다.', 'hud.castDone': '{name} 시전 완료.',
       'hud.encounter.title': '교전', 'hud.encounter.ours': '아군 전력', 'hud.encounter.theirs': '적 전력', 'hud.attack': '공격', 'hud.autoResolve': '자동 전투',
       'hud.autoWin': '승리했습니다!', 'hud.autoLose': '패배했습니다…', 'hud.freeCity.title': '자유 도시', 'hud.freeCity.gift': '선물', 'hud.freeCity.vassalize': '봉신화 요청', 'hud.freeCity.declareWar': '전쟁 선포',
+      'hud.freeCity.whisper': '속삭임의 돌', 'hud.freeCity.whisperTip': '매 턴 이 도시의 호감도가 오릅니다.', 'hud.freeCity.integrate': '제국에 편입', 'hud.freeCity.isVassal': '우리의 봉신 도시입니다.',
+      'hud.freeCity.giftTip': '금 {gold:을/를} 보내 호감도를 높입니다.', 'hud.freeCity.needOpinion': '호감도 {n} 이상 필요',
       'hud.unclaimed': '미개척 지방', 'hud.queueEmpty': '생산 대기열이 비어 있습니다', 'hud.provinceYields': '지방 산출', 'hud.improvement': '개선물', 'hud.resource': '자원', 'hud.units': '유닛',
       'hud.endTurnUnavailable': '아직 턴 종료 규칙이 준비되지 않았습니다.', 'hud.moveUnavailable': '아직 이동 규칙이 준비되지 않았습니다.', 'hud.base': '기본', 'hud.vassalTribute': '봉신 조공', 'hud.opinion': '호감도',
     },
@@ -59,6 +61,8 @@
       'hud.castHint': '{name} — choose a target on the map. (right-click to cancel)', 'hud.castCancelled': 'Cast cancelled.', 'hud.castDone': '{name} cast.',
       'hud.encounter.title': 'Encounter', 'hud.encounter.ours': 'Our strength', 'hud.encounter.theirs': 'Their strength', 'hud.attack': 'Attack', 'hud.autoResolve': 'Auto-resolve',
       'hud.autoWin': 'Victory!', 'hud.autoLose': 'Defeat…', 'hud.freeCity.title': 'Free city', 'hud.freeCity.gift': 'Gift', 'hud.freeCity.vassalize': 'Demand vassalage', 'hud.freeCity.declareWar': 'Declare war',
+      'hud.freeCity.whisper': 'Whispering stone', 'hud.freeCity.whisperTip': 'Raises this city\'s opinion of you every turn.', 'hud.freeCity.integrate': 'Integrate', 'hud.freeCity.isVassal': 'This city is our vassal.',
+      'hud.freeCity.giftTip': 'Send {gold} gold to raise its opinion.', 'hud.freeCity.needOpinion': 'Needs opinion {n}+',
       'hud.unclaimed': 'Unclaimed province', 'hud.queueEmpty': 'Production queue is empty', 'hud.provinceYields': 'Province yields', 'hud.improvement': 'Improvement', 'hud.resource': 'Resource', 'hud.units': 'units',
       'hud.endTurnUnavailable': 'Turn rules are not ready yet.', 'hud.moveUnavailable': 'Movement rules are not ready yet.', 'hud.base': 'Base', 'hud.vassalTribute': 'Vassal tribute', 'hud.opinion': 'Opinion',
     },
@@ -269,9 +273,19 @@
   function onNotifClick(n) {
     const g = game(); if (!g) return;
     const ref = n.ref || {};
-    if (ref.cityId !== undefined && ref.cityId !== null) { const c = S().city(g, ref.cityId); if (c) { if (hasFn('WorldRender', 'centerOn')) safe(() => AOW.WorldRender.centerOn(c.hex, true)); UI.select({ cityId: c.id }); } }
-    else if (ref.armyId !== undefined && ref.armyId !== null) { const a = S().army(g, ref.armyId); if (a) { if (hasFn('WorldRender', 'centerOn')) safe(() => AOW.WorldRender.centerOn(a.hex, true)); UI.select({ armyId: a.id }); } }
-    else if (ref.hex !== undefined && ref.hex !== null && hasFn('WorldRender', 'centerOn')) safe(() => AOW.WorldRender.centerOn(ref.hex, true));
+    const given = v => v !== undefined && v !== null && v >= 0;
+    const centre = idx => { if (hasFn('WorldRender', 'centerOn')) safe(() => AOW.WorldRender.centerOn(idx, true)); };
+    const unit = given(ref.unitId) ? S().unit(g, ref.unitId) : null;
+    const armyId = given(ref.armyId) ? ref.armyId : (unit && given(unit.armyId) ? unit.armyId : null);
+    const hex = given(ref.hex) ? ref.hex : given(ref.hexIdx) ? ref.hexIdx : null;
+    if (given(ref.heroId) && !given(ref.cityId)) { UI.showScreen('hero', { heroId: ref.heroId }); return; }
+    if (ref.tomeId || ref.contentId) { UI.showScreen('research'); return; }
+    if (ref.empireSkill) { UI.showScreen('empire'); return; }
+    if (given(ref.cityId)) { const c = S().city(g, ref.cityId); if (c) { centre(c.hex); UI.select({ cityId: c.id }); } }
+    else if (armyId !== null) { const a = S().army(g, armyId); if (a) { centre(a.hex); if (a.owner === (human() || {}).id) UI.select({ armyId: a.id }); } }
+    else if (hex !== null) centre(hex);
+    else if (given(ref.structureId)) { const st = S().structure(g, ref.structureId); if (st && st.hex >= 0) centre(st.hex); }
+    else if (ref.spellId) UI.showScreen('spellbook');
   }
   function renderNotifications() {
     const wrap = el('div', { class: 'hud-notifications' });
@@ -362,7 +376,10 @@
       const q = (city.queue || [])[0];
       box.push(el('div', { class: 'aow-small' }, q ? (t('ui.production') + ': ' + (q.type === 'unit' && AOW.Data.has('units', q.id) ? L(AOW.Data.get('units', q.id).name) : q.id)) : el('span', { class: 'aow-warn' }, t('hud.queueEmpty'))));
     } else {
-      box.push(el('div', { class: 'aow-small aow-dim' }, city.freeCity.culture || ''));
+      const fc = city.freeCity, D = AOW.Data;
+      const culture = fc.culture && D.has('cultures', fc.culture) ? L(D.get('cultures', fc.culture).name) : '';
+      const form = fc.form && D.has('forms', fc.form) ? L(D.get('forms', fc.form).name) : '';
+      box.push(el('div', { class: 'aow-small aow-dim' }, [form, culture].filter(Boolean).join(' · ')));
       box.push(renderFreeCityOptions(g, p, city));
     }
     if (isOwn) box.push(el('div', { class: 'hud-actions' }, UI.button(t('hud.openCity'), () => UI.showScreen('city', { cityId: city.id }), { icon: 'cities', kind: 'gold' })));
@@ -373,9 +390,16 @@
     const has = hasFn('Rules', 'freeCityAction');
     const opinion = hasFn('Rules', 'freeCityOpinion') ? safe(() => AOW.Rules.freeCityOpinion(g, city, p.id), null) : null;
     if (opinion !== null) wrap.appendChild(el('div', { class: 'aow-small aow-dim', style: { width: '100%' } }, t('hud.opinion') + ': ', el('b', null, UI.fmtSigned(opinion))));
-    wrap.appendChild(UI.button(t('hud.freeCity.gift'), () => afterAction(call('Rules', 'freeCityAction', g, p, city, 'gift')), { icon: 'gold', small: true, disabled: !has }));
-    wrap.appendChild(UI.button(t('hud.freeCity.vassalize'), () => afterAction(call('Rules', 'freeCityAction', g, p, city, 'vassalize')), { icon: UI.iconName('alliance', 'flag'), small: true, disabled: !has }));
-    wrap.appendChild(UI.button(t('hud.freeCity.declareWar'), () => afterAction(call('Rules', 'freeCityAction', g, p, city, 'declare')), { icon: 'sword', small: true, kind: 'danger', disabled: !has }));
+    const fc = city.freeCity || {};
+    const C = (AOW.Rules && AOW.Rules.C && AOW.Rules.C.FC) || {};
+    const mine = fc.vassalOf === p.id, atWar = (fc.warWith || []).includes(p.id), stone = (fc.stones || []).includes(p.id);
+    if (mine) wrap.appendChild(el('div', { class: 'aow-small aow-good', style: { width: '100%' } }, t('hud.freeCity.isVassal')));
+    const act = (label, action, o) => wrap.appendChild(UI.button(label, () => afterAction(call('Rules', 'freeCityAction', g, p, city, action)), Object.assign({ small: true, disabled: !has }, o)));
+    act(t('hud.freeCity.gift'), 'gift', { icon: 'gold', tooltip: C.GIFT_GOLD ? t('hud.freeCity.giftTip', { gold: C.GIFT_GOLD }) : null, disabled: !has || atWar });
+    act(t('hud.freeCity.whisper'), 'whisper', { icon: 'mana', disabled: !has || stone || atWar, tooltip: t('hud.freeCity.whisperTip') });
+    if (mine) act(t('hud.freeCity.integrate'), 'integrate', { icon: 'cities', kind: 'gold' });
+    else act(t('hud.freeCity.vassalize'), 'vassalize', { icon: UI.iconName('alliance', 'flag'), disabled: !has || atWar || fc.vassalOf >= 0, tooltip: C.VASSAL_OPINION ? t('hud.freeCity.needOpinion', { n: C.VASSAL_OPINION }) : null });
+    act(t('hud.freeCity.declareWar'), 'declare', { icon: 'sword', kind: 'danger', disabled: !has || atWar });
     return wrap;
   }
 

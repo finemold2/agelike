@@ -71,7 +71,7 @@
       'hero.inventory': '보관함', 'hero.inventoryEmpty': '보관 중인 아이템이 없습니다.', 'hero.equip': '장착', 'hero.unequip': '해제', 'hero.ruler': '군주', 'hero.dead': '전사',
       'hero.slot.weapon': '무기', 'hero.slot.offhand': '보조', 'hero.slot.armor': '갑옷', 'hero.slot.helm': '투구', 'hero.slot.trinket': '장신구', 'hero.slot.mount': '탈것',
       'hero.signature': '전용 기술', 'hero.tier': '{n}단계', 'hero.minLevel': '레벨 {n} 필요', 'hero.needPrereq': '선행 기술 필요', 'hero.noPoints': '기술 점수가 없습니다',
-      'hero.stats': '능력치', 'hero.general': '일반 기술', 'hero.class': '직업', 'hero.grants': '능력 부여',
+      'hero.stats': '능력치', 'hero.general': '일반 기술', 'hero.class': '직업', 'hero.grants': '능력 부여', 'hero.needTome': '{name:을/를} 먼저 선택해야 합니다',
       'rarity.common': '일반', 'rarity.uncommon': '고급', 'rarity.rare': '희귀', 'rarity.epic': '영웅', 'rarity.legendary': '전설',
       // empire
       'empire.title': '제국 개발', 'empire.affinity': '친화도', 'empire.tree.general': '일반', 'empire.buy': '구매', 'empire.rite': '의식', 'empire.affinityReq': '{aff} 친화 {n} 필요',
@@ -137,7 +137,7 @@
       'hero.inventory': 'Inventory', 'hero.inventoryEmpty': 'No items in the vault.', 'hero.equip': 'Equip', 'hero.unequip': 'Unequip', 'hero.ruler': 'Ruler', 'hero.dead': 'Fallen',
       'hero.slot.weapon': 'Weapon', 'hero.slot.offhand': 'Off-hand', 'hero.slot.armor': 'Armor', 'hero.slot.helm': 'Helm', 'hero.slot.trinket': 'Trinket', 'hero.slot.mount': 'Mount',
       'hero.signature': 'Signature skill', 'hero.tier': 'Tier {n}', 'hero.minLevel': 'Needs level {n}', 'hero.needPrereq': 'Needs prerequisite skill', 'hero.noPoints': 'No skill points',
-      'hero.stats': 'Stats', 'hero.general': 'General skills', 'hero.class': 'Class', 'hero.grants': 'Grants ability',
+      'hero.stats': 'Stats', 'hero.general': 'General skills', 'hero.class': 'Class', 'hero.grants': 'Grants ability', 'hero.needTome': 'Needs the {name} tome',
       'rarity.common': 'Common', 'rarity.uncommon': 'Uncommon', 'rarity.rare': 'Rare', 'rarity.epic': 'Epic', 'rarity.legendary': 'Legendary',
       'empire.title': 'Empire Development', 'empire.affinity': 'Affinity', 'empire.tree.general': 'General', 'empire.buy': 'Purchase', 'empire.rite': 'Rite', 'empire.affinityReq': 'Needs {aff} affinity {n}',
       'empire.noBuy': 'Empire skill purchase rules are not available yet.', 'empire.imperium': 'Imperium', 'empire.owned': 'Owned skills', 'empire.needPrereq': 'Needs prerequisite',
@@ -1064,16 +1064,20 @@
   const HERO_SLOTS = ['weapon', 'offhand', 'armor', 'helm', 'trinket', 'mount'];
   function heroList(g, player) { return S() && S().playerHeroes ? S().playerHeroes(g, player.id) : g.heroes.filter(h => h.owner === player.id); }
   function heroXpNeed(g, hero) {
+    // Rules.heroXpForLevel(level) takes the level number (the xp needed to leave it)
     const f = fn('Rules', 'heroXpForLevel');
-    if (f) { try { const n = f(g, hero); if (n > 0) return n; } catch (e) { /* ignore */ } }
+    if (f) { try { const n = f(hero.level || 1); if (n > 0) return n; } catch (e) { /* ignore */ } }
     const C = rulesC();
     return Math.round(num(C.HERO_XP_PER_LEVEL, 60) * Math.pow(1.15, Math.max(0, (hero.level || 1) - 1)));
   }
-  function heroSkillsFor(hero) {
+  const tomeOfSkill = (id) => { const f = fn('Rules', 'tomeOfSkill'); return f ? f(id) : null; };
+  function heroSkillsFor(hero, player) {
     const all = D().list('heroSkills');
+    const unlocked = (player && player.unlocked && player.unlocked.skills) || [];
     return {
       classList: all.filter(s => s.class === hero.classId),
-      generalList: all.filter(s => !s.class && !s.rulerType),
+      // tome-taught skills join the list once researched (before that they are research rewards, not choices)
+      generalList: all.filter(s => !s.class && !s.rulerType && (!tomeOfSkill(s.id) || unlocked.includes(s.id) || (hero.skills || []).includes(s.id))),
       rulerList: hero.isRuler ? all.filter(s => s.rulerType && s.rulerType === hero.rulerType) : [],
     };
   }
@@ -1105,7 +1109,8 @@
   }
   function skillCard(game, hero, sk) {
     const learned = (hero.skills || []).includes(sk.id);
-    const avail = !learned && heroAvailable(game, hero, sk.id);
+    // Rules.heroAvailableSkills lists what is unlocked, not what is affordable: a point is needed too
+    const avail = !learned && heroAvailable(game, hero, sk.id) && num(hero.skillPoints) > 0 && !hero.dead;
     const cls = 'sc-skill' + (learned ? ' learned' : '') + (avail ? ' available' : (!learned ? ' locked' : '')) + (sk.signature ? ' signature' : '');
     const abilDef = sk.ability ? get('abilities', sk.ability) : null;
     let lockReason = '';
@@ -1113,6 +1118,8 @@
       if ((hero.level || 1) < (sk.minLevel || 1)) lockReason = t('hero.minLevel', { n: sk.minLevel || 1 });
       else if ((sk.prereq || []).some(p => !(hero.skills || []).includes(p))) lockReason = t('hero.needPrereq');
       else if (num(hero.skillPoints) <= 0) lockReason = t('hero.noPoints');
+      else if (hero.dead) lockReason = t('hero.dead');
+      else if (sk.tome || tomeOfSkill(sk.id)) { const tid = sk.tome || tomeOfSkill(sk.id), tm = get('tomes', tid); lockReason = t('hero.needTome', { name: tm ? L(tm.name) : tid }); }
     }
     const card = mk('div', { class: cls },
       mk('div', { class: 'sname' }, sk.signature ? icon('star', 12) : null, ' ', L(sk.name)),
@@ -1189,7 +1196,7 @@
       let hero = (ctx.state.heroId !== undefined ? S().hero(g, ctx.state.heroId) : null) || heroes.find(h => h.isRuler) || heroes[0];
       if (!hero || hero.owner !== player.id) return emptyNote(t('sc.notFound'));
       const unit = hero.unitId >= 0 ? S().unit(g, hero.unitId) : null;
-      const { classList, generalList, rulerList } = heroSkillsFor(hero);
+      const { classList, generalList, rulerList } = heroSkillsFor(hero, player);
       const cls = get('heroClasses', hero.classId);
       const left = mk('div', { class: 'sc-col-side' }, heroTabs(ctx, g, heroes, hero.id));
       const midParts = [
@@ -1445,7 +1452,12 @@
         box.appendChild(mk('table', null, rows));
       }
       box.appendChild(mk('div', { class: 'aow-row', style: 'display:flex;gap:12px;margin-top:6px' },
-        btn(t('vic.continue'), () => closeScreen(), { kind: 'gold', large: true }),
+        btn(t('vic.continue'), () => {
+          // keep playing after the result: Turn.endTurn only stops for a victory nobody has acknowledged yet
+          if (g && g.victory) g.victory.continued = true;
+          const mood = fn('Music', 'setMood'); if (mood) { try { mood('peace'); } catch (e) { /* audio optional */ } }
+          closeScreen();
+        }, { kind: 'gold', large: true }),
         btn(t('vic.menu'), () => { const f = fn('UI', 'quitToMenu'); if (f) f(); else closeScreen(); }, { large: true })));
       return box;
     },
@@ -1578,6 +1590,18 @@
       const g = game(); if (!g || !p) return;
       const me = human(g); if (!me || p.to !== me.id) return;
       Screens.showProposal(p.proposal || p);
+    });
+    // someone won (Turn → Events 'victory' {type, winner}): show the victory / defeat screen once the turn has
+    // finished processing (the event fires in the middle of Turn.endTurn)
+    AOW.Events.on('victory', (v) => {
+      if (!v) return;
+      setTimeout(() => {
+        const g = game(); if (!g || !g.victory || g.victory.continued) return;
+        const me = human(g), won = !!(me && me.id === v.winner);
+        const show = fn('UI', 'showScreen'); if (show) show('victory', { type: v.type, winner: v.winner });
+        const mood = fn('Music', 'setMood'); if (mood) { try { mood(won ? 'victory' : 'defeat'); } catch (e) { /* audio optional */ } }
+        sfx(won ? 'victory_fanfare' : 'defeat');
+      }, 0);
     });
   }
   Screens.registerAll();
