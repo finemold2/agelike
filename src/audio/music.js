@@ -4,7 +4,8 @@
 //   Music.prev(), Music.stop(), Music.isPlaying(), Music.nowPlaying() → {id,title,composer,moods} | null
 //   Music.setVolume(v), Music.onChange(cb) → off(), Music.list() → [{id,title,composer,moods,lengthSec}]
 //   Music.playlist(mood?) → ids for a mood (or {mood:[ids]} for all moods)
-//   Music.getMood(), Music.previewNotes(notes, instrumentName, bpm) (raw [[beat,midi,dur,vel]] test playback)
+//   Music.getMood(), Music.fitsMood(mood?) (the playing song suits the mood — songs of a mood without its own
+//     pieces fall back: battle → tension, victory → peace, …), Music.previewNotes(notes, instrumentName, bpm) (raw [[beat,midi,dur,vel]] test playback)
 //   Music.position() → seconds into the current song
 //   Music.renderOffline(songId, seconds, ctx) → Promise<AudioBuffer>  binds AOW.Audio to `ctx` (an
 //     OfflineAudioContext; rebinds with {force:true} if AOW.Audio already points elsewhere), schedules
@@ -38,7 +39,17 @@
   function songs() { return AOW.Songs || {}; }
   function songById(id) { return id ? songs()[id] || null : null; }
   function allIds() { return Object.keys(songs()); }
-  function idsForMood(m) { return allIds().filter(id => (songs()[id].moods || []).indexOf(m) >= 0); }
+  function taggedFor(m) { return allIds().filter(id => (songs()[id].moods || []).indexOf(m) >= 0); }
+  // the song sets are calm classical pieces and none is tagged 'battle': a mood without songs of its own
+  // borrows the closest one (battle → tension, victory → peace…) instead of silently keeping the old piece
+  const MOOD_FALLBACK = { battle: ['tension', 'defeat'], tension: ['defeat'], victory: ['peace'], defeat: ['tension'], menu: ['peace'], peace: ['menu'] };
+  function moodsFor(m) {
+    if (taggedFor(m).length) return [m];
+    for (const f of MOOD_FALLBACK[m] || []) if (taggedFor(f).length) return [f];
+    return [m];
+  }
+  function idsForMood(m) { const ms = moodsFor(m); return allIds().filter(id => (songs()[id].moods || []).some(x => ms.indexOf(x) >= 0)); }
+  function songFits(song, m) { const ms = moodsFor(m); return (song.moods || []).some(x => ms.indexOf(x) >= 0); }
   function lengthSec(song) {
     if (song.lengthSec) return song.lengthSec;
     let end = song.lengthBeats || 0;
@@ -237,14 +248,19 @@
   /** 'menu'|'peace'|'tension'|'battle'|'victory'|'defeat' — battle/victory/defeat switch immediately, others at the next song */
   Music.setMood = function (m) {
     if (!m || m === mood) return;
+    const prev = mood;
     mood = m;
     if (stopped || !current) return;
-    if (IMMEDIATE_MOODS[m] && (current.song.moods || []).indexOf(m) < 0) {
+    // battle/victory/defeat cut in at once; leaving one of them (battle over → peace) also switches right away
+    // instead of letting the battle piece play on for minutes over the world map
+    if ((IMMEDIATE_MOODS[m] || IMMEDIATE_MOODS[prev]) && !songFits(current.song, m)) {
       const pool = idsForMood(m);
       if (pool.length) Music.play(pickNext(m, current.id));
     }
   };
   Music.getMood = function () { return mood; };
+  /** does the playing song suit the current mood (directly or through the mood fallback)? */
+  Music.fitsMood = function (m) { return !!current && songFits(current.song, m || mood); };
   Music.isPlaying = function () { return !!current && !paused && !stopped; };
   Music.isPaused = function () { return paused; };
   Music.nowPlaying = function () { return current ? info(current.song) : null; };

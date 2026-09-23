@@ -82,6 +82,9 @@
     const t0 = now();
     const hp = Turn.humanPid(game);
     if (game.victory) return game.victory;
+    // everything notified from here on (AI phase, upkeep, the human's next turn) belongs to the human's next
+    // turn in the HUD feed — the AI phase still runs under the old game.turn number
+    game.notifSince = game.nextId && game.nextId.notification ? game.nextId.notification - 1 : 0;
     if (Events()) Events().emit('turn:end', { pid: hp, turn: game.turn });
     // AI players act inside the turn the human just finished
     for (const p of game.players) {

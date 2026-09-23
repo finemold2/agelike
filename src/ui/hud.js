@@ -277,7 +277,10 @@
     const wrap = el('div', { class: 'hud-notifications' });
     const g = game(), p = human();
     if (!g || !p) return wrap;
-    const list = (g.notifications || []).filter(n => n.turn === g.turn && (n.pid === p.id || n.pid === -1 || n.pid === undefined)).slice(-10).reverse();
+    // this turn's feed = everything since the human last ended a turn (Turn.endTurn stamps game.notifSince), so the
+    // news of the AI phase (attacks, raids, lost cities) stays listed next to this turn's own events
+    const since = g.notifSince !== undefined ? g.notifSince : -1;
+    const list = (g.notifications || []).filter(n => (since >= 0 ? n.id > since : n.turn === g.turn) && (n.pid === p.id || n.pid === -1 || n.pid === undefined)).slice(-10).reverse();
     for (const n of list) {
       wrap.appendChild(el('div', { class: 'hud-notif', style: { '--kind': notifKindClass(n.kind) }, onclick: () => onNotifClick(n) },
         UI.icon(n.icon || (n.kind === 'bad' ? 'cross' : n.kind === 'warn' ? 'warning' : n.kind === 'good' ? 'check' : 'info'), 17),
@@ -736,6 +739,12 @@
     return root;
   }
   function refreshSelection() { if (!els) return; const fresh = renderSelection(); els.selection.replaceWith(fresh); els.selection = fresh; }
+  let notifTimer = 0;
+  /** re-render only the notification list (debounced: a burst of 'notify' events costs one rebuild) */
+  function scheduleNotifRefresh() {
+    if (notifTimer) return;
+    notifTimer = setTimeout(() => { notifTimer = 0; if (!els || !root) return; const fresh = renderNotifications(); els.notif.replaceWith(fresh); els.notif = fresh; }, 0);
+  }
   function refreshAll() {
     if (!root) return;
     const fresh = { topbar: renderTopbar(), minimap: els.minimap, notif: renderNotifications(), selection: renderSelection(), bottom: renderBottomBar(), endturn: buildEndTurn() };
@@ -753,6 +762,7 @@
       off.push(AOW.Events.on('hex:click', onHexClick));
       off.push(AOW.Events.on('hex:dblclick', onHexDblClick));
       off.push(AOW.Events.on('hex:hover', onHexHover));
+      off.push(AOW.Events.on('notify', scheduleNotifRefresh));
       for (const name of ['turn:begin', 'city:changed', 'army:moved', 'research:complete', 'spell:cast', 'select:army', 'select:city', 'select:none', 'battle:end', 'game:new']) {
         off.push(AOW.Events.on(name, () => refreshAll()));
       }
@@ -760,7 +770,7 @@
     },
     close() {
       while (off.length) { const f = off.pop(); try { f(); } catch (e) { /* ignore */ } }
-      clearTimeout(hoverTimer);
+      clearTimeout(hoverTimer); clearTimeout(notifTimer); notifTimer = 0;
       if (hasFn('WorldRender', 'highlight')) safe(() => AOW.WorldRender.highlight(null, 'none'));
       root = null; els = null; mmCanvas = null; mmCtx = null; turnOverlayEl = null;
     },

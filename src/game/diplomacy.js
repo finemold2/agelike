@@ -129,10 +129,14 @@
     game.log.push({ turn: game.turn, pid, kind: 'diplomacy', text });
     if (game.log.length > C.LOG_MAX) game.log.splice(0, game.log.length - C.LOG_MAX);
   }
-  function notify(game, pids, kind, text) {
-    const humanInvolved = pids.some(pid => game.players[pid] && game.players[pid].isHuman);
-    if (!humanInvolved || !AOW.Events) return;
-    try { AOW.Events.emit('notify', { kind, text, icon: 'crown' }); } catch (e) { /* ignore */ }
+  /** Tell the human about a diplomatic event that concerns them (AI↔AI affairs stay in the log only). */
+  function notify(game, pids, kind, text, opts) {
+    const hp = pids.find(pid => game.players[pid] && game.players[pid].isHuman);
+    if (hp === undefined) return;
+    // through Rules.notify so it also lands in the HUD notification list
+    if (AOW.Rules && typeof AOW.Rules.notify === 'function') { try { AOW.Rules.notify(game, hp, kind, text, 'diplomacy', null, opts); } catch (e) { /* ignore */ } return; }
+    if (!AOW.Events) return;
+    try { AOW.Events.emit('notify', { kind, text, icon: 'diplomacy', low: !!(opts && opts.low) }); } catch (e) { /* ignore */ }
   }
   function emit(name, payload) { if (AOW.Events) { try { AOW.Events.emit(name, payload); } catch (e) { /* ignore */ } } }
 
@@ -484,7 +488,7 @@
     const msg = t('dip.msg.proposal', { from: pname(game, from), kind: AOW.L ? AOW.L(Diplomacy.kindName(kind)) : kind });
     logLine(game, from, msg);
     emit('diplomacy:proposal', { from, to, kind, terms, proposal });
-    notify(game, [to], 'info', msg);
+    notify(game, [to], 'info', msg, { low: true });   // the proposal modal is the loud part
     return { ok: true, pending: true, accepted: false, reason: null, proposal };
   };
   /** Proposals waiting for player pid's answer. */

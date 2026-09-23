@@ -87,9 +87,14 @@
       const errs = AOW.Data.validate();
       if (errs.length) console.warn('[Data.validate] ' + errs.length + ' problems', errs.slice(0, 40));
     } catch (e) { console.warn('validate failed', e); }
-    // audio unlock on first gesture
+    // audio unlock on first gesture: create the AudioContext and start the mood playlist (nothing else ever
+    // calls Music.play, so without this the game stays silent)
     const unlock = () => {
-      try { if (hasFn('Audio', 'init')) AOW.Audio.init(); if (hasFn('Music', 'setMood') && !AOW.game) AOW.Music.setMood('menu'); } catch (e) { console.warn(e); }
+      try {
+        if (hasFn('Audio', 'init')) AOW.Audio.init();
+        if (hasFn('Music', 'setMood')) AOW.Music.setMood(AOW.battle ? 'battle' : AOW.game ? 'peace' : 'menu');
+        if (hasFn('Music', 'play') && hasFn('Music', 'isPlaying') && !AOW.Music.isPlaying() && !(hasFn('Music', 'isPaused') && AOW.Music.isPaused())) AOW.Music.play(null);
+      } catch (e) { console.warn(e); }
       window.removeEventListener('pointerdown', unlock); window.removeEventListener('keydown', unlock);
     };
     window.addEventListener('pointerdown', unlock); window.addEventListener('keydown', unlock);
