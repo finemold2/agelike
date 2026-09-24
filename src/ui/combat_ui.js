@@ -29,7 +29,7 @@
   // ------------------------------------------------------------------ i18n
   AOW.I18n.add({
     ko: {
-      'battle.round': '{n}라운드', 'battle.you': '아군', 'battle.enemy': '적군', 'battle.sideN': '{n}번 진영',
+      'battle.round': '{n}라운드', 'battle.you': '아군', 'battle.enemy': '적군', 'battle.sideN': '{n}번 진영', 'battle.guardiansOf': '{name} 수호자', 'battle.lairBeasts': '소굴의 괴물들', 'battle.wild': '야생 세력',
       'battle.autoResolve': '자동 전투', 'battle.autoResolveTip': '전투를 자동으로 해결합니다', 'battle.autoResolveConfirm': '전투를 자동으로 해결할까요?\n직접 지휘할 수 없게 됩니다.',
       'battle.retreat': '후퇴', 'battle.retreatTip': '전장에서 후퇴합니다', 'battle.retreatLocked': '3라운드부터 후퇴할 수 있습니다',
       'battle.retreatConfirm': '후퇴하시겠습니까?\n부대가 전장을 이탈합니다.',
@@ -44,7 +44,7 @@
       'battle.inspired': '사기 충천', 'battle.breach': '성벽 붕괴!', 'battle.notYourTurn': '지금은 행동할 수 없습니다', 'battle.spellCast': '{name} 시전',
     },
     en: {
-      'battle.round': 'Round {n}', 'battle.you': 'Your forces', 'battle.enemy': 'Enemy', 'battle.sideN': 'Side {n}',
+      'battle.round': 'Round {n}', 'battle.you': 'Your forces', 'battle.enemy': 'Enemy', 'battle.sideN': 'Side {n}', 'battle.guardiansOf': 'Guardians of {name}', 'battle.lairBeasts': 'Lair monsters', 'battle.wild': 'Wild forces',
       'battle.autoResolve': 'Auto-resolve', 'battle.autoResolveTip': 'Resolve this battle automatically', 'battle.autoResolveConfirm': 'Auto-resolve this battle?\nYou will no longer command it directly.',
       'battle.retreat': 'Retreat', 'battle.retreatTip': 'Withdraw from the battlefield', 'battle.retreatLocked': 'Available from round 3',
       'battle.retreatConfirm': 'Retreat from battle?\nYour army will leave the field.',
@@ -169,6 +169,16 @@
     const g = AOW.game, pid = sidePlayerId(battle, s);
     const p = g && pid !== null && pid !== undefined ? g.players[pid] : null;
     if (p) return p.name || (p.isHuman ? t('battle.you') : t('battle.enemy'));
+    // a neutral side is named after what it holds (wonder guardians, lair beasts, a free city's garrison)
+    const hex = battle && battle.hexIdx;
+    if (g && hex !== undefined && hex !== null && hex >= 0 && AOW.State) {
+      const st = AOW.State.structureAt ? safe(() => AOW.State.structureAt(g, hex), null) : null;
+      if (st && st.kind === 'wonder' && AOW.Data.has('wonders', st.refId)) return t('battle.guardiansOf', { name: L(AOW.Data.get('wonders', st.refId).name) });
+      if (st && st.kind === 'infestation') return t('battle.lairBeasts');
+      const c = AOW.State.cityAt ? safe(() => AOW.State.cityAt(g, hex), null) : null;
+      if (c && c.owner < 0) return c.name;
+      return t('battle.wild');
+    }
     return t('battle.sideN', { n: s + 1 });
   }
   function currentSide() {
@@ -709,8 +719,15 @@
       if (xpMine) body.appendChild(el('div', { class: 'aow-small aow-gold' }, t('battle.xpGained', { n: UI.fmt(xpMine) })));
       if (result.loot && typeof result.loot === 'object') {
         const row = el('div', { class: 'aow-row aow-wrap aow-gap-s' });
+        if (result.loot.title) body.appendChild(el('div', { class: 'aow-gold aow-small' }, L(result.loot.title)));
         for (const k of Object.keys(result.loot)) if (typeof result.loot[k] === 'number' && result.loot[k]) row.appendChild(UI.resource(k, result.loot[k]));
         if (row.children.length) body.appendChild(row);
+        // items found at a cleared site go to the vault (equip them in the hero screen)
+        const items = Array.isArray(result.loot.items) ? result.loot.items : [];
+        for (const id of items) {
+          const it = AOW.Data && AOW.Data.has('items', id) ? AOW.Data.get('items', id) : null;
+          body.appendChild(el('div', { class: 'aow-row aow-gap-s aow-small battle-loot-item' }, UI.icon(UI.iconName(it && it.icon, 'item_' + (it ? it.slot : 'trinket'), 'star') || 'star', 18), el('b', null, it ? L(it.name) : id)));
+        }
       }
       const cityId = result.capturedCityId !== undefined ? result.capturedCityId : null;
       const cityName = cityId != null && AOW.game && AOW.State && AOW.State.city

@@ -886,18 +886,67 @@ a { color: var(--gold-light); }
   };
   try { const saved = localStorage.getItem('aow.lang'); if (saved && (saved === 'ko' || saved === 'en')) I18n.lang = saved; } catch (e) { /* ignore */ }
 
+  // ------------------------------------------------------------------ Korean particles (josa)
+  // I18n.jongseong(word) → final-consonant index of the word's last readable syllable: 0 = none (open syllable),
+  //   8 = ㄹ, other > 0 = some batchim, -1 = unknown. Digits and Latin endings are read the Korean way
+  //   (1 일, 3 삼, 6 육, 7 칠, 8 팔, 0 영; …l/…m/…n/…ng/…k/…p).
+  // I18n.josa(word, '이/가'|'을/를'|'은/는'|'과/와'|'으로/로'|'아/야'|'이나/나'|'이랑/랑') → word + the right particle
+  //   (either order of the pair is accepted; '으로/로' takes 로 after ㄹ). I18n.particle(word, pair) → particle only.
+  // Templates may write {name:이/가} to get the value followed by the right particle (AOW.t / AOW.L params).
+  const DIGIT_JONG = { 0: 21, 1: 8, 2: 0, 3: 16, 4: 0, 5: 0, 6: 1, 7: 8, 8: 8, 9: 0 };
+  const WITH_BATCHIM = { '이': 1, '을': 1, '은': 1, '과': 1, '으로': 1, '아': 1, '이나': 1, '이랑': 1, '이여': 1, '이다': 1 };
+  I18n.jongseong = function (word) {
+    const s = String(word === null || word === undefined ? '' : word);
+    for (let i = s.length - 1; i >= 0; i--) {
+      const c = s.charCodeAt(i), ch = s[i];
+      if (c >= 0xAC00 && c <= 0xD7A3) return (c - 0xAC00) % 28;
+      if (ch >= '0' && ch <= '9') return DIGIT_JONG[ch];
+      if (/[a-zA-Z]/.test(ch)) {
+        const tail = s.slice(Math.max(0, i - 1), i + 1).toLowerCase();
+        if (tail === 'ng') return 21;
+        const l = ch.toLowerCase();
+        return l === 'l' ? 8 : l === 'm' ? 16 : l === 'n' ? 4 : l === 'k' ? 1 : l === 'p' ? 17 : 0;
+      }
+      if (c >= 0x3131 && c <= 0x314E) return 1;       // a bare jamo consonant (ㄱ…ㅎ)
+      // closing brackets, quotes, punctuation, spaces: look further left
+    }
+    return -1;
+  };
+  I18n.particle = function (word, pair) {
+    const parts = String(pair || '').split('/');
+    if (parts.length !== 2) return '';
+    const withB = WITH_BATCHIM[parts[0]] ? parts[0] : parts[1];
+    const without = withB === parts[0] ? parts[1] : parts[0];
+    const j = I18n.jongseong(word);
+    if (j <= 0) return without;
+    if (withB === '으로' && j === 8) return without;   // ㄹ-final takes 로 (서울로, 마을로)
+    return withB;
+  };
+  I18n.josa = function (word, pair) {
+    const w = String(word === null || word === undefined ? '' : word);
+    return w + I18n.particle(w, pair);
+  };
+  /** replace {key} and {key:이/가} placeholders */
+  function fill(s, params) {
+    return s.replace(/\{(\w+)(?::([^{}/]+\/[^{}]+))?\}/g, (m, k, pair) => {
+      if (params[k] === undefined) return m;
+      return pair ? I18n.josa(params[k], pair) : params[k];
+    });
+  }
+  I18n.fill = fill;
+
   AOW.t = function (key, params) {
     let s = dict[I18n.lang][key];
     if (s === undefined) s = dict.en[key];
     if (s === undefined) s = key;
-    if (params) s = s.replace(/\{(\w+)\}/g, (m, k) => (params[k] !== undefined ? params[k] : m));
+    if (params) s = fill(s, params);
     return s;
   };
   AOW.L = function (obj, params) {
     if (obj == null) return '';
     if (typeof obj === 'string') return AOW.t(obj, params);
     let s = obj[I18n.lang] || obj.en || obj.ko || '';
-    if (params) s = s.replace(/\{(\w+)\}/g, (m, k) => (params[k] !== undefined ? params[k] : m));
+    if (params) s = fill(s, params);
     return s;
   };
   AOW.I18n = I18n;
@@ -1297,7 +1346,8 @@ a { color: var(--gold-light); }
 //   TerrainArt.drawRivers(ctx, x, y, info)           info.river bitmask (bit d = edge toward dir d)
 //   TerrainArt.drawRoads(ctx, x, y, info)            info.road bitmask
 //   TerrainArt.drawHexDecor(ctx, x, y, info, zoom)   trees, hills, peaks, ruins, crystals… (call after all bases, row order)
-//   TerrainArt.drawWater(ctx, x, y, info, t)         cheap animated shimmer (t seconds)
+//   TerrainArt.drawWater(ctx, x, y, info, t, batch?) cheap animated shimmer (t seconds); with batch = TerrainArt.waterBatch()
+//                                                    the strokes are bucketed and drawn by TerrainArt.flushWaterBatch(ctx, batch)
 //   TerrainArt.drawFog(ctx, x, y, kind)              'unexplored' | 'explored' (one hex; prefer fillFog for regions)
 //   TerrainArt.fillFog(ctx, x, y, w, h)              seamless unexplored parchment over a whole rect (world-aligned
 //                                                    pattern, no hex clip) — the caller masks & feathers it
@@ -1682,14 +1732,38 @@ a { color: var(--gold-light); }
   };
 
   // ================================================================ water shimmer
-  TerrainArt.drawWater = function (ctx, x, y, info, t) {
+  // Batched shimmer: pass `batch` (from TerrainArt.waterBatch()) to drawWater and the ripples/foam of every hex
+  // are appended to a few Path2D buckets keyed by (quantised) alpha instead of being stroked one by one;
+  // TerrainArt.flushWaterBatch(ctx, batch) then strokes each bucket once — a screen of ocean goes from ~700
+  // tiny strokes to ~30, which is what made the 15 Hz water redraw cost 50–80 ms under software raster.
+  const WATER_Q = 48;                               // alpha quantisation steps per 1.0 (≈0.02)
+  TerrainArt.waterBatch = function () { return { ripple: new Map(), foam: new Map() }; };
+  function waterBucket(map, alpha) {
+    const q = Math.round(alpha * WATER_Q);
+    if (q <= 0) return null;
+    let p = map.get(q);
+    if (!p) { p = new Path2D(); map.set(q, p); }
+    return p;
+  }
+  function pathSink(p) { return { beginPath() {}, moveTo(x, y) { p.moveTo(x, y); }, lineTo(x, y) { p.lineTo(x, y); } }; }
+  TerrainArt.flushWaterBatch = function (ctx, batch, keep) {   // keep: stroke but leave the buckets for reuse
+    if (!batch) return;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 0.9;
+    for (const [q, p] of batch.ripple) { ctx.strokeStyle = 'rgba(210,240,255,' + (q / WATER_Q).toFixed(3) + ')'; ctx.stroke(p); }
+    ctx.lineWidth = 1.4;
+    for (const [q, p] of batch.foam) { ctx.strokeStyle = 'rgba(255,255,255,' + (q / WATER_Q).toFixed(3) + ')'; ctx.stroke(p); }
+    ctx.restore();
+    if (!keep) { batch.ripple.clear(); batch.foam.clear(); }
+  };
+  TerrainArt.drawWater = function (ctx, x, y, info, t, batch) {
     const terr = info.terrain || 'ocean';
     if (!WATER[terr]) return;
     const s = info.size || Hex.SIZE;
     const rng = rngFor(info, 40);
     const time = t || 0;
-    ctx.save();
-    ctx.lineCap = 'round';
+    if (!batch) { ctx.save(); ctx.lineCap = 'round'; }
     const n = terr === 'ocean' ? 4 : 3;
     for (let i = 0; i < n; i++) {
       let px, py;
@@ -1698,6 +1772,11 @@ a { color: var(--gold-light); }
       const a = 0.5 + 0.5 * Math.sin(time * spd + ph);
       if (a < 0.08) continue;
       const drift = Math.sin(time * 0.5 + ph) * 2;
+      if (batch) {
+        const p = waterBucket(batch.ripple, a * 0.34);
+        if (p) { p.moveTo(x + px - len / 2 + drift, y + py); p.quadraticCurveTo(x + px + drift, y + py - 1.6, x + px + len / 2 + drift, y + py); }
+        continue;
+      }
       ctx.strokeStyle = 'rgba(210,240,255,' + (a * 0.34).toFixed(3) + ')';
       ctx.lineWidth = 0.9;
       ctx.beginPath();
@@ -1713,12 +1792,17 @@ a { color: var(--gold-light); }
       const ph = rng.next() * TAU;
       const a = 0.5 + 0.5 * Math.sin(time * 1.1 + ph);
       if (a < 0.15) continue;
+      if (batch) {
+        const p = waterBucket(batch.foam, a * 0.3);
+        if (p) wavyEdgeLine(pathSink(p), x, y, s, d, rngFor(info, 50 + d), -0.14 - 0.05 * a, 0.03, 8);
+        continue;
+      }
       ctx.strokeStyle = 'rgba(255,255,255,' + (a * 0.3).toFixed(3) + ')';
       ctx.lineWidth = 1.4;
       wavyEdgeLine(ctx, x, y, s, d, rngFor(info, 50 + d), -0.14 - 0.05 * a, 0.03, 8);
       ctx.stroke();
     }
-    ctx.restore();
+    if (!batch) ctx.restore();
   };
 
   // ================================================================ fog
@@ -19427,6 +19511,7 @@ a { color: var(--gold-light); }
 (function (AOW) {
   'use strict';
   const Data = AOW.Data;
+  const J = (w, pair) => AOW.I18n.josa(w, pair);
 
   const RARITIES = ['common', 'uncommon', 'rare', 'epic', 'legendary'];
   const RADJ = {
@@ -19457,7 +19542,7 @@ a { color: var(--gold-light); }
     for (const r of RARITIES) {
       const b = RBAND[r], adj = RADJ[r];
       const statusPart = statusId ? { id: statusId, chance: b.chance } : null;
-      const dko = `${adj.ko} ${baseKo}. 공격 시 ${CH_KO[channel]} 피해 +${b.dmg}` + (statusPart ? `, ${b.chance}% 확률로 ${ST_KO[statusId]}을(를) 입힙니다.` : '를 더합니다.');
+      const dko = `${adj.ko} ${baseKo}. 공격 시 ${CH_KO[channel]} 피해 +${b.dmg}` + (statusPart ? `, ${b.chance}% 확률로 ${J(ST_KO[statusId], '을/를')} 입힙니다.` : AOW.I18n.particle(b.dmg, '을/를') + ' 더합니다.');
       const den = `${adj.en} ${baseEn}. Attacks deal +${b.dmg} ${CH_EN[channel]} damage` + (statusPart ? `, with a ${b.chance}% chance to inflict ${ST_EN[statusId]}.` : '.');
       IT({
         id: `${baseId}_${r}`, name: { ko: `${adj.ko} ${baseKo}`, en: `${adj.en} ${baseEn}` }, desc: { ko: dko, en: den },
@@ -19501,7 +19586,7 @@ a { color: var(--gold-light); }
       const b = RBAND[r], adj = RADJ[r];
       const eff = {}; eff[statKey] = b.stat;
       const grant = abilityByRarity && abilityByRarity[r];
-      const dko = `${adj.ko} ${baseKo}. 착용 시 ${statLabelKo(statKey)} +${b.stat}${grant ? `, ${grant.ko}을(를) 얻습니다.` : '.'}`;
+      const dko = `${adj.ko} ${baseKo}. 착용 시 ${statLabelKo(statKey)} +${b.stat}${grant ? `, ${J(grant.ko, '을/를')} 얻습니다.` : '.'}`;
       const den = `${adj.en} ${baseEn}. Grants +${b.stat} ${statLabelEn(statKey)}${grant ? ` and the ${grant.en} ability.` : '.'}`;
       IT({
         id: `${baseId}_${r}`, name: { ko: `${adj.ko} ${baseKo}`, en: `${adj.en} ${baseEn}` }, desc: { ko: dko, en: den },
@@ -19515,7 +19600,7 @@ a { color: var(--gold-light); }
     for (const r of RARITIES) {
       const b = RBAND[r], adj = RADJ[r];
       const eff = { mp: 1 + Math.floor(b.stat / 3), hp: hpBase + b.stat * 2 };
-      const dko = `${adj.ko} ${baseKo}. 이동력 +${eff.mp}, 체력 +${eff.hp}${ability ? `, ${ability.ko}을(를) 얻습니다.` : '.'}`;
+      const dko = `${adj.ko} ${baseKo}. 이동력 +${eff.mp}, 체력 +${eff.hp}${ability ? `, ${J(ability.ko, '을/를')} 얻습니다.` : '.'}`;
       const den = `${adj.en} ${baseEn}. +${eff.mp} Movement and +${eff.hp} HP${ability ? `, granting ${ability.en}.` : '.'}`;
       IT({
         id: `${baseId}_${r}`, name: { ko: `${adj.ko} ${baseKo}`, en: `${adj.en} ${baseEn}` }, desc: { ko: dko, en: den },
@@ -20681,7 +20766,8 @@ a { color: var(--gold-light); }
   State.playerArmies = (game, pid) => game.armies.filter(a => a.owner === pid);
   State.allUnitsOfPlayer = (game, pid) => game.units.filter(u => u.owner === pid);
   State.playerHeroes = (game, pid) => game.heroes.filter(h => h.owner === pid);
-  State.capital = function (game, pid) { const p = game.players[pid]; return p ? State.city(game, p.capitalId) : null; };
+  /** the player's capital — only while they still own it (a lost capital must not keep serving as their seat) */
+  State.capital = function (game, pid) { const p = game.players[pid]; const c = p ? State.city(game, p.capitalId) : null; return c && c.owner === pid ? c : null; };
 
   State.provinceOf = function (game, idx) { const p = game.province[idx]; return p >= 0 ? game.provinces[p] : null; };
   State.terrainName = (game, idx) => State.TERRAINS[game.terrain[idx]];
@@ -21952,6 +22038,11 @@ a { color: var(--gold-light); }
   const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
   const L = (ko, en) => ({ ko, en });
   Rules.L = L;
+  // Korean particle after a (possibly bilingual) name, e.g. J(city.name, '이/가') → '하늘성이'
+  const J = (w, pair) => AOW.I18n.josa(w, pair);
+  const KO = o => (o && typeof o === 'object' ? (o.ko || o.en || '') : String(o === null || o === undefined ? '' : o));
+  const EN = o => (o && typeof o === 'object' ? (o.en || o.ko || '') : String(o === null || o === undefined ? '' : o));
+  const tIn = (lang, key) => ((AOW.I18n.dict[lang] || {})[key] || AOW.t(key));
 
   // ------------------------------------------------------------------ i18n
   AOW.I18n.add({
@@ -21972,7 +22063,8 @@ a { color: var(--gold-light); }
       'rules.reason.notAdjacent': '인접하지 않았습니다.', 'rules.reason.nothingToAttack': '공격할 대상이 없습니다.', 'rules.reason.notAtWar': '전쟁 중이 아닙니다.',
       'rules.reason.freeCityPeace': '자유도시와 평화 상태입니다. 먼저 전쟁을 선포하세요.', 'rules.reason.sameOwner': '아군입니다.', 'rules.reason.tooMany': '부대는 최대 6유닛입니다.',
       'rules.reason.differentHex': '같은 칸에 있어야 합니다.', 'rules.reason.unknownTome': '알 수 없는 서입니다.', 'rules.reason.tomeOwned': '이미 선택한 서입니다.',
-      'rules.reason.tierLocked': '서 등급이 잠겨 있습니다.', 'rules.reason.affinityLow': '친화가 부족합니다.', 'rules.reason.oneTierFive': '5등급 서는 하나만 선택할 수 있습니다.',
+      'rules.reason.tierLocked': '이 등급의 마법서는 아직 잠겨 있습니다.', 'rules.reason.affinityLow': '친화가 부족합니다.',
+      'rules.reason.tierLockedN': '마법서를 {n}권 먼저 선택해야 합니다 (현재 {have}권).', 'rules.reason.affinityLowN': '{aff} 친화 {n} 이상이 필요합니다 (현재 {have}).', 'rules.reason.oneTierFive': '5등급 서는 하나만 선택할 수 있습니다.',
       'rules.reason.notInTome': '선택한 서의 내용이 아닙니다.', 'rules.reason.alreadyResearched': '이미 연구했습니다.', 'rules.reason.unknownSpell': '알 수 없는 주문입니다.',
       'rules.reason.notKnown': '아직 배우지 않은 주문입니다.', 'rules.reason.combatOnly': '전투 중에만 시전할 수 있습니다.', 'rules.reason.alreadyActive': '이미 활성화된 주문입니다.',
       'rules.reason.casting': '다른 주문을 시전하는 중입니다.', 'rules.reason.badTarget': '잘못된 대상입니다.', 'rules.reason.notInDomain': '아군 영역 안이어야 합니다.',
@@ -22001,7 +22093,8 @@ a { color: var(--gold-light); }
       'rules.reason.notAdjacent': 'Not adjacent.', 'rules.reason.nothingToAttack': 'Nothing to attack.', 'rules.reason.notAtWar': 'Not at war.',
       'rules.reason.freeCityPeace': 'At peace with this free city. Declare war first.', 'rules.reason.sameOwner': 'Friendly.', 'rules.reason.tooMany': 'An army holds at most 6 units.',
       'rules.reason.differentHex': 'Must be on the same hex.', 'rules.reason.unknownTome': 'Unknown tome.', 'rules.reason.tomeOwned': 'Tome already chosen.',
-      'rules.reason.tierLocked': 'Tome tier locked.', 'rules.reason.affinityLow': 'Affinity too low.', 'rules.reason.oneTierFive': 'Only one tier V tome may be chosen.',
+      'rules.reason.tierLocked': 'This tome tier is still locked.', 'rules.reason.affinityLow': 'Affinity too low.',
+      'rules.reason.tierLockedN': 'Select {n} tomes first ({have} so far).', 'rules.reason.affinityLowN': 'Needs {aff} affinity {n} (you have {have}).', 'rules.reason.oneTierFive': 'Only one tier V tome may be chosen.',
       'rules.reason.notInTome': 'Not part of a chosen tome.', 'rules.reason.alreadyResearched': 'Already researched.', 'rules.reason.unknownSpell': 'Unknown spell.',
       'rules.reason.notKnown': 'Spell not learned.', 'rules.reason.combatOnly': 'Can only be cast in battle.', 'rules.reason.alreadyActive': 'Spell already active.',
       'rules.reason.casting': 'Another spell is being cast.', 'rules.reason.badTarget': 'Invalid target.', 'rules.reason.notInDomain': 'Must be inside your domain.',
@@ -22126,16 +22219,28 @@ a { color: var(--gold-light); }
   };
 
   // ------------------------------------------------------------------ notifications (shared with Turn)
-  /** Push a notification {turn, pid, kind, text:{ko,en}, icon, ref}; emits 'notify' for human players. */
-  Rules.notify = function (game, pid, kind, text, icon, ref) {
-    const n = { id: S().newId(game, 'notification'), turn: game.turn, pid, kind, text, icon: icon || null, ref: ref || null };
+  /**
+   * Push a notification {turn, pid, kind, text:{ko,en}, icon, ref, low} for the HUMAN player and emit 'notify'.
+   * Events about AI realms, free cities or marauders (pid < 0 / non-human pid) are dropped here — they never
+   * reach the human's feed (and never evict the human's own entries from the capped list). Realm-wide events
+   * everyone should see go through Rules.notifyWorld. opts.low = routine news (rank-ups, production done…)
+   * that only belongs in the HUD list, not in a centre-screen toast.
+   */
+  Rules.notify = function (game, pid, kind, text, icon, ref, opts) {
+    opts = opts || {};
+    const world = !!opts.world;
+    const p = pid >= 0 ? game.players[pid] : null;
+    if (!world && !(p && p.isHuman)) return null;
+    game.notifications = game.notifications || [];
+    const n = { id: S().newId(game, 'notification'), turn: game.turn, pid: world ? -1 : pid, kind, text, icon: icon || null, ref: ref || null, low: !!opts.low };
     game.notifications.push(n);
     if (game.notifications.length > C.NOTIFICATION_KEEP) game.notifications.splice(0, game.notifications.length - C.NOTIFICATION_KEEP);
-    const p = pid >= 0 ? game.players[pid] : null;
-    // pid < 0 = a world event everyone sees
-    if ((pid < 0 || (p && p.isHuman)) && Events()) Events().emit('notify', { kind, text: AOW.L(text), icon: n.icon, ref: n.ref, notification: n });
+    if (Events()) Events().emit('notify', { kind, text: AOW.L(text), icon: n.icon, ref: n.ref, notification: n, low: n.low });
     return n;
   };
+  /** A world event every realm sees (eliminations, victory rituals, the winner). */
+  Rules.notifyWorld = function (game, kind, text, icon, ref) { return Rules.notify(game, -1, kind, text, icon, ref, { world: true }); };
+  const LOW = { low: true };
   function log(game, text) { game.log.push({ turn: game.turn, text }); if (game.log.length > 500) game.log.splice(0, game.log.length - 500); }
   Rules.log = log;
 
@@ -22547,14 +22652,14 @@ a { color: var(--gold-light); }
       const b = get('buildings', it.id);
       if (b && b.effects && b.effects.walls) city.walls = Math.max(city.walls || 0, b.effects.walls);
       Rules.invalidate(city.owner);
-      Rules.notify(game, city.owner, 'good', L(`${city.name}: ${b ? b.name.ko : it.id} 완공`, `${city.name}: ${b ? b.name.en : it.id} completed`), 'production', { cityId: city.id });
+      Rules.notify(game, city.owner, 'good', L(`${city.name}: ${b ? b.name.ko : it.id} 완공`, `${city.name}: ${b ? b.name.en : it.id} completed`), 'production', { cityId: city.id }, LOW);
     } else if (it.type === 'unit') {
       const army = Rules.garrisonArmy(game, city, true);
       const unit = Rules.createUnitFor(game, city.owner, it.id, army.id);
       if (unit) {
         const t = S().unitType(unit);
         if (Events()) Events().emit('unit:recruited', { unitId: unit.id, cityId: city.id });
-        Rules.notify(game, city.owner, 'good', L(`${city.name}: ${t.name.ko} 모집 완료`, `${city.name}: ${t.name.en} recruited`), 'recruit', { cityId: city.id, unitId: unit.id });
+        Rules.notify(game, city.owner, 'good', L(`${city.name}: ${t.name.ko} 모집 완료`, `${city.name}: ${t.name.en} recruited`), 'recruit', { cityId: city.id, unitId: unit.id }, LOW);
       }
     } else if (it.type === 'improvement') {
       Rules.placeImprovement(game, city, it.pid, it.id);
@@ -22706,7 +22811,7 @@ a { color: var(--gold-light); }
     const imp = get('improvements', id); if (!imp) return fail('unknownImprovement');
     prov.improvement = id;
     Rules.invalidate(city.owner);
-    Rules.notify(game, city.owner, 'good', L(`${city.name}: ${AOW.L(imp.name)} 건설 완료`, `${city.name}: ${AOW.L(imp.name)} built`), 'production', { cityId: city.id, provinceId: pid });
+    Rules.notify(game, city.owner, 'good', L(`${city.name}: ${KO(imp.name)} 건설 완료`, `${city.name}: ${EN(imp.name)} built`), 'production', { cityId: city.id, provinceId: pid }, LOW);
     if (Events()) Events().emit('city:changed', { cityId: city.id });
     return { ok: true, improvement: id };
   };
@@ -22789,12 +22894,12 @@ a { color: var(--gold-light); }
       st.owner = player.id;
       if (!player.annexedWonders.includes(st.id)) player.annexedWonders.push(st.id);
       const w = get('wonders', st.refId);
-      if (w) Rules.notify(game, player.id, 'good', L(`${AOW.L(w.name)} 합병 — 제국 보너스 획득`, `${AOW.L(w.name)} annexed — empire bonus gained`), 'star', { cityId: city.id, structureId: st.id });
+      if (w) Rules.notify(game, player.id, 'good', L(`${KO(w.name)} 합병 — 제국 보너스 획득`, `${EN(w.name)} annexed — empire bonus gained`), 'star', { cityId: city.id, structureId: st.id });
     }
     player.stats.territory = game.provinces.filter(p => p.owner === player.id).length;
     Rules.invalidate(player.id);
     Rules.recomputeVisibility(game, player.id);
-    Rules.notify(game, player.id, 'good', L(`${city.name}: 새 지방을 병합했습니다.`, `${city.name}: province annexed.`), 'stability', { cityId: city.id, provinceId: pid });
+    Rules.notify(game, player.id, 'good', L(`${city.name}: 새 지방을 병합했습니다.`, `${city.name}: province annexed.`), 'stability', { cityId: city.id, provinceId: pid }, LOW);
     if (Events()) Events().emit('city:changed', { cityId: city.id });
     return { ok: true, cost, provinceId: pid };
   };
@@ -22838,19 +22943,32 @@ a { color: var(--gold-light); }
     player.stats.territory = game.provinces.filter(p => p.owner === player.id).length;
     Rules.invalidate(player.id);
     Rules.recomputeVisibility(game, player.id);
-    Rules.notify(game, player.id, 'good', L(`전초기지 ${name} 건설`, `Outpost ${name} founded`), 'city', { cityId: city.id });
+    Rules.notify(game, player.id, 'good', L(`전초기지 ${name} 건설`, `Outpost ${name} founded`), 'city', { cityId: city.id }, LOW);
     if (Events()) { Events().emit('city:founded', { cityId: city.id }); Events().emit('city:changed', { cityId: city.id }); }
     return { ok: true, cityId: city.id, city };
   };
-  /** Upgrade a tier-0 outpost into a real city (imperium + city cap). */
-  Rules.upgradeOutpost = function (game, city) {
+  /** Imperium needed to raise this outpost into a city. */
+  Rules.outpostUpgradeCost = function (game, city) {
+    const player = city && city.owner >= 0 ? S().player(game, city.owner) : null;
+    const eff = player ? Rules.playerEffects(game, player) : {};
+    return Math.max(1, Math.round(C.OUTPOST_UPGRADE_IMPERIUM * (1 + clamp(eff.provinceCostPct || 0, -75, 200) / 100)));
+  };
+  /** Can this outpost be upgraded right now? → {ok, reason, cost:{imperium}} */
+  Rules.canUpgradeOutpost = function (game, city) {
     if (!city || city.owner < 0) return fail('notOwner');
     if (city.tier !== 0) return fail('notOutpost');
     const player = S().player(game, city.owner); Rules.ensurePlayer(game, player);
-    if (Rules.cityCount(game, player.id) >= Rules.cityCap(game, player.id)) return fail('cityCap');
-    const eff = Rules.playerEffects(game, player);
-    const cost = Math.max(1, Math.round(C.OUTPOST_UPGRADE_IMPERIUM * (1 + clamp(eff.provinceCostPct || 0, -75, 200) / 100)));
-    if (player.resources.imperium < cost) return fail('notEnoughImperium');
+    const cost = Rules.outpostUpgradeCost(game, city);
+    if (Rules.cityCount(game, player.id) >= Rules.cityCap(game, player.id)) return Object.assign(fail('cityCap'), { cost: { imperium: cost } });
+    if (player.resources.imperium < cost) return Object.assign(fail('notEnoughImperium'), { cost: { imperium: cost } });
+    return { ok: true, cost: { imperium: cost } };
+  };
+  /** Upgrade a tier-0 outpost into a real city (imperium + city cap). */
+  Rules.upgradeOutpost = function (game, city) {
+    const chk = Rules.canUpgradeOutpost(game, city);
+    if (!chk.ok) return chk;
+    const player = S().player(game, city.owner);
+    const cost = chk.cost.imperium;
     player.resources.imperium -= cost;
     city.tier = 1;
     city.pop = Math.max(1, city.pop);
@@ -22859,7 +22977,7 @@ a { color: var(--gold-light); }
     if (st) st.kind = 'city';
     player.stats.cities = Rules.cityCount(game, player.id);
     Rules.invalidate(player.id);
-    Rules.notify(game, player.id, 'good', L(`${city.name}이(가) 도시로 성장했습니다.`, `${city.name} has grown into a city.`), 'city', { cityId: city.id });
+    Rules.notify(game, player.id, 'good', L(`${J(city.name, '이/가')} 도시로 성장했습니다.`, `${city.name} has grown into a city.`), 'city', { cityId: city.id }, LOW);
     if (Events()) { Events().emit('city:founded', { cityId: city.id }); Events().emit('city:changed', { cityId: city.id }); }
     return { ok: true, cost: { imperium: cost } };
   };
@@ -23068,8 +23186,9 @@ a { color: var(--gold-light); }
     if (promoted) {
       Rules.syncUnit(game, unit);
       const type = S().unitType(unit);
-      Rules.notify(game, unit.owner, 'good', L(`${AOW.L(type.name)}이(가) ${Rules.rankName(unit.rank)}(으)로 승급했습니다.`,
-        `${AOW.L(type.name)} promoted to ${Rules.rankName(unit.rank)}.`), 'star', { unitId: unit.id });
+      const rk = 'rules.rank.' + clamp(unit.rank | 0, 0, C.RANK_MAX);
+      Rules.notify(game, unit.owner, 'good', L(`${J(unit.name || KO(type.name), '이/가')} ${J(tIn('ko', rk), '으로/로')} 승급했습니다.`,
+        `${unit.name || EN(type.name)} promoted to ${tIn('en', rk)}.`), 'star', { unitId: unit.id }, LOW);
     }
     if (unit.heroId !== null && unit.heroId >= 0) {
       const hero = S().hero(game, unit.heroId);
@@ -23101,6 +23220,15 @@ a { color: var(--gold-light); }
     }
     return { level: hero.level, xp: hero.xp, levels };
   };
+  /** skill id → tome id for hero skills that are tome contents (they must be researched before a hero can learn them) */
+  let tomeSkillMap = null;
+  Rules.tomeOfSkill = function (skillId) {
+    if (!tomeSkillMap) {
+      tomeSkillMap = {};
+      for (const t of Data().list('tomes')) for (const c of t.contents || []) if (c.type === 'skill') tomeSkillMap[c.id] = t.id;
+    }
+    return tomeSkillMap[skillId] || null;
+  };
   /** Hero skills the hero may learn right now (class/level/prereq/tome gated). */
   Rules.heroAvailableSkills = function (game, hero) {
     const player = S().player(game, hero.owner);
@@ -23113,6 +23241,8 @@ a { color: var(--gold-light); }
       if (sk.rulerType && sk.rulerType !== hero.rulerType) continue;
       if ((sk.minLevel || 1) > hero.level) continue;
       if (sk.tome && player && !(player.tomes || []).includes(sk.tome) && !player.unlocked.skills.includes(sk.id)) continue;
+      // skills taught by a tome (listed as tome contents) are unlocked by researching them
+      if (!sk.tome && Rules.tomeOfSkill(sk.id) && player && !player.unlocked.skills.includes(sk.id)) continue;
       let ok = true;
       for (const p of sk.prereq || []) if (!known.has(p)) { ok = false; break; }
       if (!ok) continue;
@@ -23513,7 +23643,7 @@ a { color: var(--gold-light); }
       hero.dead = true; hero.unitId = -1;
       hero.respawnTurns = C.HERO_RESPAWN_TURNS;
       hero.respawnAt = game.turn + C.HERO_RESPAWN_TURNS;
-      Rules.notify(game, hero.owner, 'bad', L(`${hero.name}이(가) 쓰러졌습니다.`, `${hero.name} has fallen.`), 'skull', { heroId: hero.id });
+      Rules.notify(game, hero.owner, 'bad', L(`${J(hero.name, '이/가')} 쓰러졌습니다.`, `${hero.name} has fallen.`), 'skull', { heroId: hero.id });
     }
     S().removeUnit(game, unit.id);
     return true;
@@ -23576,8 +23706,15 @@ a { color: var(--gold-light); }
     if (!tome) return Rules.reasonText('unknownTome');
     if ((player.tomes || []).includes(tomeId)) return Rules.reasonText('tomeOwned');
     const tier = tome.tier || 1;
-    if ((player.tomes || []).length < (TOME_TIER_TOMES[tier] || 0)) return Rules.reasonText('tierLocked');
-    if (Rules.tomeAffinity(player, tome) < (TOME_TIER_AFFINITY[tier] || 0)) return Rules.reasonText('affinityLow');
+    // specific, actionable reasons ("select 2 tomes first (1 so far)", "needs Order affinity 6 (you have 3)")
+    const have = (player.tomes || []).length, needTomes = TOME_TIER_TOMES[tier] || 0;
+    if (have < needTomes) return AOW.t('rules.reason.tierLockedN', { n: needTomes, have });
+    const needAff = TOME_TIER_AFFINITY[tier] || 0, aff = Rules.tomeAffinity(player, tome);
+    if (aff < needAff) {
+      let main = null; for (const k of Object.keys(tome.affinity || {})) if (!main || tome.affinity[k] > tome.affinity[main]) main = k;
+      const affName = main && AOW.I18n.has('ui.aff_' + main) ? AOW.t('ui.aff_' + main) : (main || '');
+      return AOW.t('rules.reason.affinityLowN', { aff: affName, n: needAff, have: aff });
+    }
     if (tier === 5) { for (const id of player.tomes || []) { const t = tomeOf(id); if (t && t.tier === 5) return Rules.reasonText('oneTierFive'); } }
     return null;
   };
@@ -23597,7 +23734,7 @@ a { color: var(--gold-light); }
     player.tomes.push(tomeId);
     for (const k of Object.keys(tome.affinity || {})) player.affinity[k] = (player.affinity[k] || 0) + tome.affinity[k];
     Rules.invalidate(player.id);
-    Rules.notify(game, player.id, 'good', L(`${AOW.L(tome.name)}을(를) 서고에 추가했습니다.`, `${AOW.L(tome.name)} added to your book.`), 'knowledge', { tomeId });
+    Rules.notify(game, player.id, 'good', L(`${J(KO(tome.name), '을/를')} 서고에 추가했습니다.`, `${EN(tome.name)} added to your book.`), 'knowledge', { tomeId }, LOW);
     if (!player.research.current) {
       const opts = Rules.researchOptions(game, player).filter(o => o.tomeId === tomeId);
       if (opts.length) Rules.startResearch(game, player, tomeId, opts[0].contentId);
@@ -23679,7 +23816,7 @@ a { color: var(--gold-light); }
     player.research.progress = 0;
     Rules.invalidate(player.id);
     if (Events()) Events().emit('research:complete', { pid: player.id, tomeId, contentId });
-    Rules.notify(game, player.id, 'good', L(`연구 완료: ${def ? AOW.L(def.name) : contentId}`, `Research complete: ${def ? AOW.L(def.name) : contentId}`), 'knowledge', { tomeId, contentId });
+    Rules.notify(game, player.id, 'good', L(`연구 완료: ${def ? KO(def.name) : contentId}`, `Research complete: ${def ? EN(def.name) : contentId}`), 'knowledge', { tomeId, contentId });
     log(game, `[research] p${player.id} ${contentId}`);
     return { ok: true, contentId, type, def };
   };
@@ -23832,10 +23969,10 @@ a { color: var(--gold-light); }
       player.casting.current = null;
       const r = Rules.applySpellEffect(game, player, sp, t);
       if (Events()) Events().emit('spell:cast', { pid: player.id, spellId, target: t });
-      Rules.notify(game, player.id, 'good', L(`${AOW.L(sp.name)} 시전`, `${AOW.L(sp.name)} cast`), 'mana', { spellId, target: t });
+      Rules.notify(game, player.id, 'good', L(`${KO(sp.name)} 시전`, `${EN(sp.name)} cast`), 'mana', { spellId, target: t }, LOW);
       return Object.assign({ ok: true, cast: true, cost }, r || {});
     }
-    Rules.notify(game, player.id, 'info', L(`${AOW.L(sp.name)} 시전 중… (${cur.progress}/${cur.need})`, `Casting ${AOW.L(sp.name)}… (${cur.progress}/${cur.need})`), 'mana', { spellId });
+    Rules.notify(game, player.id, 'info', L(`${KO(sp.name)} 시전 중… (${cur.progress}/${cur.need})`, `Casting ${EN(sp.name)}… (${cur.progress}/${cur.need})`), 'mana', { spellId }, LOW);
     return { ok: true, casting: true, progress: cur.progress, need: cur.need, cost };
   };
   /** Abort a multi-turn cast (mana is not refunded). */
@@ -23859,7 +23996,7 @@ a { color: var(--gold-light); }
     if (!sp) return null;
     const r = Rules.applySpellEffect(game, player, sp, cur.target);
     if (Events()) Events().emit('spell:cast', { pid: player.id, spellId: sp.id, target: cur.target });
-    Rules.notify(game, player.id, 'good', L(`${AOW.L(sp.name)} 시전 완료`, `${AOW.L(sp.name)} completed`), 'mana', { spellId: sp.id });
+    Rules.notify(game, player.id, 'good', L(`${KO(sp.name)} 시전 완료`, `${EN(sp.name)} completed`), 'mana', { spellId: sp.id });
     return Object.assign({ cast: true }, r || {});
   };
 
@@ -24095,7 +24232,7 @@ a { color: var(--gold-light); }
     for (const k of Object.keys(sk.affinity || {})) player.affinity[k] = (player.affinity[k] || 0) + sk.affinity[k];
     Rules.invalidate(player.id);
     for (const u of S().allUnitsOfPlayer(game, player.id)) Rules.syncUnit(game, u);
-    Rules.notify(game, player.id, 'good', L(`제국 기술 습득: ${AOW.L(sk.name)}`, `Empire skill learned: ${AOW.L(sk.name)}`), 'imperium', { empireSkill: id });
+    Rules.notify(game, player.id, 'good', L(`제국 기술 습득: ${KO(sk.name)}`, `Empire skill learned: ${EN(sk.name)}`), 'imperium', { empireSkill: id }, LOW);
     return { ok: true, cost: r.cost, id };
   };
   Rules.unlockEmpireSkill = function (game, player, id) { return Rules.buyEmpireSkill(game, player, id); };
@@ -24127,7 +24264,7 @@ a { color: var(--gold-light); }
       city.freeCity.opinion = city.freeCity.opinion || {};
       city.freeCity.opinion[pid] = C.FC.VASSAL_OPINION;
       city.freeCity.warWith = (city.freeCity.warWith || []).filter(p => p !== pid);
-      Rules.notify(game, pid, 'good', L(`${city.name}이(가) 봉신이 되었습니다.`, `${city.name} is now your vassal.`), 'crown', { cityId: city.id });
+      Rules.notify(game, pid, 'good', L(`${J(city.name, '이/가')} 봉신이 되었습니다.`, `${city.name} is now your vassal.`), 'crown', { cityId: city.id });
       if (Events()) Events().emit('city:captured', { cityId: city.id, from, to: pid, mode });
       return { ok: true, mode };
     }
@@ -24145,7 +24282,7 @@ a { color: var(--gold-light); }
       if (i >= 0) game.cities.splice(i, 1);
       if (game._maps) delete game._maps.cities;
       if (from >= 0) { const op = S().player(game, from); if (op) { op.stats.cities = Rules.cityCount(game, from); Rules.invalidate(from); } }
-      Rules.notify(game, pid, 'warn', L(`${city.name}을(를) 파괴했습니다.`, `${city.name} has been razed.`), 'skull', { hexIdx: hex });
+      Rules.notify(game, pid, 'warn', L(`${J(city.name, '을/를')} 파괴했습니다.`, `${city.name} has been razed.`), 'skull', { hexIdx: hex });
       if (Events()) Events().emit('city:captured', { cityId: city.id, from, to: pid, mode });
       return { ok: true, mode };
     }
@@ -24173,14 +24310,14 @@ a { color: var(--gold-light); }
         op.stats.territory = game.provinces.filter(p => p.owner === from).length;
         if (op.capitalId === city.id) { const next = game.cities.find(c => c.owner === from); op.capitalId = next ? next.id : -1; if (next) next.isCapital = true; }
         Rules.invalidate(from);
-        Rules.notify(game, from, 'bad', L(`${city.name}을(를) 빼앗겼습니다.`, `${city.name} has been lost!`), 'skull', { cityId: city.id });
+        Rules.notify(game, from, 'bad', L(`${J(city.name, '을/를')} 빼앗겼습니다.`, `${city.name} has been lost!`), 'skull', { cityId: city.id });
       }
     }
     player.stats.cities = Rules.cityCount(game, pid);
     player.stats.territory = game.provinces.filter(p => p.owner === pid).length;
     Rules.invalidate(pid);
     Rules.recomputeVisibility(game, pid);
-    Rules.notify(game, pid, 'good', L(`${city.name}을(를) 점령했습니다!`, `${city.name} captured!`), 'crown', { cityId: city.id });
+    Rules.notify(game, pid, 'good', L(`${J(city.name, '을/를')} 점령했습니다!`, `${city.name} captured!`), 'crown', { cityId: city.id });
     log(game, `[capture] city ${city.id} ${from} → ${pid}`);
     if (Events()) { Events().emit('city:captured', { cityId: city.id, from, to: pid, mode }); Events().emit('city:changed', { cityId: city.id }); }
     return { ok: true, mode, cityId: city.id };
@@ -24220,7 +24357,7 @@ a { color: var(--gold-light); }
         player.resources.gold -= gold;
         const gain = Math.max(1, Math.round(C.FC.GIFT_OPINION * gold / C.FC.GIFT_GOLD));
         setFcOpinion(game, city, player.id, op + gain);
-        Rules.notify(game, player.id, 'info', L(`${city.name}에 선물을 보냈습니다 (+${gain})`, `Gift sent to ${city.name} (+${gain})`), 'gold', { cityId: city.id });
+        Rules.notify(game, player.id, 'info', L(`${city.name}에 선물을 보냈습니다 (+${gain})`, `Gift sent to ${city.name} (+${gain})`), 'gold', { cityId: city.id }, LOW);
         return { ok: true, opinion: Rules.freeCityOpinion(game, city, player.id) };
       }
       case 'whisper': {
@@ -24228,7 +24365,7 @@ a { color: var(--gold-light); }
         const used = Rules.freeCities(game).filter(c => (c.freeCity.stones || []).includes(player.id)).length;
         if (used >= (player.whisperStones || 0)) return fail('notEnoughImperium');
         fc.stones.push(player.id);
-        Rules.notify(game, player.id, 'info', L(`${city.name}에 속삭임의 돌을 보냈습니다.`, `A whispering stone was sent to ${city.name}.`), 'mana', { cityId: city.id });
+        Rules.notify(game, player.id, 'info', L(`${city.name}에 속삭임의 돌을 보냈습니다.`, `A whispering stone was sent to ${city.name}.`), 'mana', { cityId: city.id }, LOW);
         return { ok: true, stones: fc.stones.slice() };
       }
       case 'vassalize': {
@@ -24238,7 +24375,7 @@ a { color: var(--gold-light); }
         fc.vassalOf = player.id;
         setFcOpinion(game, city, player.id, 0);
         Rules.invalidate(player.id);
-        Rules.notify(game, player.id, 'good', L(`${city.name}이(가) 봉신이 되었습니다.`, `${city.name} has become your vassal.`), 'crown', { cityId: city.id });
+        Rules.notify(game, player.id, 'good', L(`${J(city.name, '이/가')} 봉신이 되었습니다.`, `${city.name} has become your vassal.`), 'crown', { cityId: city.id });
         return { ok: true, vassal: true };
       }
       case 'integrate': {
@@ -24387,7 +24524,7 @@ a { color: var(--gold-light); }
 
   /** Clear a wonder / infestation once its guards are gone: pays rewards to `pid`. */
   Rules.clearStructure = function (game, structureId, pid) {
-    const st = S().structure(game, structureId);
+    const st = structureId && typeof structureId === 'object' ? structureId : S().structure(game, structureId);
     if (!st) return fail('badIndex');
     if (st.cleared) return fail('alreadyResearched');
     const guard = S().army(game, st.guardArmyId);
@@ -24407,7 +24544,7 @@ a { color: var(--gold-light); }
       reward.knowledge = r.knowledge || 0;
       reward.imperium = (r.imperium || 0) + tier * 5;
       reward.items = Rules.rollLoot(game, r.itemTier || tier, r.items || 1);
-      if (player) Rules.notify(game, pid, 'good', L(`${w ? AOW.L(w.name) : '고대 불가사의'}을(를) 정복했습니다!`, `${w ? AOW.L(w.name) : 'Ancient wonder'} cleared!`), 'star', { structureId: st.id });
+      reward.title = L(`${J(w ? KO(w.name) : '고대 불가사의', '을/를')} 정복했습니다!`, `${w ? EN(w.name) : 'Ancient wonder'} cleared!`);
     } else if (st.kind === 'infestation') {
       const tier = st.refId === 'dragon_lair' ? 3 : 2;
       reward.gold = 40 * tier;
@@ -24415,7 +24552,7 @@ a { color: var(--gold-light); }
       reward.imperium = 5 * tier;
       reward.items = Rules.rollLoot(game, tier, 1);
       st.infestationCleared = true;
-      if (player) Rules.notify(game, pid, 'good', L('소굴을 소탕했습니다!', 'Infestation destroyed!'), 'skull', { structureId: st.id });
+      reward.title = L('소굴을 소탕했습니다!', 'Infestation destroyed!');
       // the spawner is gone for good
       for (const a of game.armies.slice()) if (a.owner < 0 && a.raid && a.raid.home === st.id) a.raid.home = -1;
       S().removeStructure(game, st.id);
@@ -24427,6 +24564,15 @@ a { color: var(--gold-light); }
       player.resources.imperium += reward.imperium;
       for (const it of reward.items) player.items.push(it);
       Rules.invalidate(pid);
+      if (reward.title) {
+        // "X을 정복했습니다! 금 +75 · 제국력 +15 · 강철 검" — the spoils are part of the news
+        const RK = { gold: ['금', 'gold'], mana: ['마나', 'mana'], knowledge: ['지식', 'knowledge'], imperium: ['제국력', 'imperium'] };
+        const parts = [[], []];
+        for (const k of Object.keys(RK)) if (reward[k]) { parts[0].push(`${RK[k][0]} +${reward[k]}`); parts[1].push(`+${reward[k]} ${RK[k][1]}`); }
+        for (const id of reward.items) { const it = get('items', id); parts[0].push(it ? KO(it.name) : id); parts[1].push(it ? EN(it.name) : id); }
+        const text = parts[0].length ? L(reward.title.ko + ' ' + parts[0].join(' · '), reward.title.en + ' ' + parts[1].join(' · ')) : reward.title;
+        Rules.notify(game, pid, 'good', text, st.kind === 'wonder' ? 'star' : 'skull', { structureId: st.id, hexIdx: st.hex });
+      }
     }
     log(game, `[clear] structure ${structureId} by p${pid}`);
     return { ok: true, reward, kind: st.kind };
@@ -24519,7 +24665,7 @@ a { color: var(--gold-light); }
       if (Rules.playerAlive(game, p.id)) continue;
       p.alive = false;
       out.push(p.id);
-      Rules.notify(game, -1, 'warn', L(`${p.name} 세력이 멸망했습니다.`, `${p.name} has been eliminated.`), 'skull', { pid: p.id });
+      Rules.notifyWorld(game, 'warn', L(`${p.name} 세력이 멸망했습니다.`, `${p.name} has been eliminated.`), 'skull', { pid: p.id });
       log(game, `[eliminated] p${p.id}`);
     }
     return out;
@@ -24543,7 +24689,7 @@ a { color: var(--gold-light); }
     player.resources.mana -= cost;
     const beacons = cities.slice(0, C.BEACONS).map(c => { Rules.ensureCity(game, c); c.beacon = true; return c.id; });
     player.magicVictory = { startTurn: game.turn, turns: C.MAGIC_HOLD, beacons };
-    Rules.notify(game, -1, 'warn', L(`${player.name}이(가) 마법 승리 의식을 시작했습니다!`, `${player.name} has begun the ritual of magic victory!`), 'mana', { pid: player.id });
+    Rules.notifyWorld(game, 'warn', L(`${J(player.name, '이/가')} 마법 승리 의식을 시작했습니다!`, `${player.name} has begun the ritual of magic victory!`), 'mana', { pid: player.id });
     log(game, `[magic victory] p${player.id} started`);
     return { ok: true, beacons, cost: { mana: cost } };
   };
@@ -24620,6 +24766,7 @@ a { color: var(--gold-light); }
   const Hex = () => AOW.Hex;
   const Events = () => AOW.Events;
   const L = (ko, en) => ({ ko, en });
+  const J = (w, pair) => AOW.I18n.josa(w, pair);
   const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
   const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
   const fn = (ns, name) => (AOW[ns] && typeof AOW[ns][name] === 'function' ? AOW[ns][name] : null);
@@ -24671,7 +24818,11 @@ a { color: var(--gold-light); }
     const Rules = R();
     const t0 = now();
     const hp = Turn.humanPid(game);
-    if (game.victory) return game.victory;
+    // the game stops at a result until the player chooses to play on (victory screen → Continue sets .continued)
+    if (game.victory && !game.victory.continued) return game.victory;
+    // everything notified from here on (AI phase, upkeep, the human's next turn) belongs to the human's next
+    // turn in the HUD feed — the AI phase still runs under the old game.turn number
+    game.notifSince = game.nextId && game.nextId.notification ? game.nextId.notification - 1 : 0;
     if (Events()) Events().emit('turn:end', { pid: hp, turn: game.turn });
     // AI players act inside the turn the human just finished
     for (const p of game.players) {
@@ -24679,14 +24830,14 @@ a { color: var(--gold-light); }
       const play = fn('AI', 'playTurn');
       if (play) { try { play(game, p.id); } catch (e) { AOW.warn('AI.playTurn p' + p.id, e); } }
       try { Turn.processPlayer(game, p.id); } catch (e) { AOW.warn('processPlayer p' + p.id, e); }
-      if (game.victory) break;
+      if (game.victory && !game.victory.continued) break;
     }
     game.turn++;
     if (hp >= 0) { try { Turn.processPlayer(game, hp); } catch (e) { AOW.warn('processPlayer human', e); } }
     else { try { Turn.worldTick(game); } catch (e) { AOW.warn('worldTick', e); } }
     Turn.beginTurn(game);
     game.turnStats = { ms: Math.round((now() - t0) * 10) / 10 };
-    return game.victory || null;
+    return game.victory && !game.victory.continued ? game.victory : null;
   };
 
   /** Announce the start of the human player's turn. */
@@ -24758,7 +24909,7 @@ a { color: var(--gold-light); }
           out.grown.push(city.id);
           const tier = Math.min(Rules.cityTierForPop(city.pop), C_(Rules).MAX_TIER);
           if (tier > city.tier) city.tier = tier;
-          Rules.notify(game, pid, 'good', L(`${city.name}의 인구가 ${city.pop}(으)로 늘었습니다.`, `${city.name} has grown to ${city.pop} population.`), 'pop', { cityId: city.id });
+          Rules.notify(game, pid, 'good', L(`${city.name}의 인구가 ${J(city.pop, '으로/로')} 늘었습니다.`, `${city.name} has grown to ${city.pop} population.`), 'pop', { cityId: city.id }, { low: true });
           if (Events()) Events().emit('city:changed', { cityId: city.id });
         }
       }
@@ -24836,7 +24987,7 @@ a { color: var(--gold-light); }
       unit.heroId = hero.id; unit.name = hero.name; unit.formId = player.formId;
       hero.unitId = unit.id; hero.dead = false; hero.respawnTurns = 0; hero.respawnAt = undefined;
       Rules.syncUnit(game, unit, true);
-      Rules.notify(game, pid, 'good', L(`${hero.name}이(가) 돌아왔습니다.`, `${hero.name} has returned.`), 'crown', { heroId: hero.id, cityId: cap.id });
+      Rules.notify(game, pid, 'good', L(`${J(hero.name, '이/가')} 돌아왔습니다.`, `${hero.name} has returned.`), 'crown', { heroId: hero.id, cityId: cap.id });
     }
 
     // --- free-city allegiance from this player's whispering stones is handled in the world tick
@@ -24853,7 +25004,8 @@ a { color: var(--gold-light); }
       game.victory = v;
       if (Events()) Events().emit('victory', v);
       const w = S().player(game, v.winner);
-      Rules.notify(game, -1, 'good', L(`${w ? w.name : ''} 승리! (${v.type})`, `${w ? w.name : ''} wins! (${v.type})`), 'crown', v);
+      const VT = { military: ['군사 승리', 'military victory'], magic: ['마법 승리', 'magic victory'], expansion: ['확장 승리', 'expansion victory'], score: ['점수 승리', 'score victory'] }[v.type] || [v.type, v.type];
+      Rules.notifyWorld(game, 'good', L(`${w ? w.name : ''} — ${VT[0]}!`, `${w ? w.name : ''} wins — ${VT[1]}!`), 'crown', v);
     }
     return out;
   };
@@ -24944,7 +25096,7 @@ a { color: var(--gold-light); }
             const loot = Math.min(p.resources.gold, C.PILLAGE_GOLD);
             p.resources.gold -= loot;
             Rules.addStabilityMod(game, city, 'pillaged', C.PILLAGE_STABILITY, 5, L('약탈당함', 'Pillaged'));
-            Rules.notify(game, city.owner, 'bad', L(`${city.name}이(가) 약탈당했습니다 (−${loot} 금)`, `${city.name} was pillaged (−${loot} gold)`), 'skull', { cityId: city.id });
+            Rules.notify(game, city.owner, 'bad', L(`${J(city.name, '이/가')} 약탈당했습니다 (−${loot} 금)`, `${city.name} was pillaged (−${loot} gold)`), 'skull', { cityId: city.id });
           }
         }
       } else if (res.encounter && res.encounter.armyIds && res.encounter.armyIds.length) {
@@ -27553,8 +27705,13 @@ a { color: var(--gold-light); }
       }
       const struct = St.structureAt ? St.structureAt(game, battle.hexIdx) : null;
       if (struct && !struct.cleared) {
-        result.clearedStructureId = struct.id;
-        if (Ru && typeof Ru.clearStructure === 'function') { try { Ru.clearStructure(game, struct, battle.sidePlayers[0]); } catch (e) { /* optional */ } }
+        // guards that fled the field scatter — they do not keep holding the site they lost
+        if (fled && struct.guardArmyId >= 0 && loserArmies.includes(struct.guardArmyId)) St.removeArmy(game, struct.guardArmyId);
+        // Rules.clearStructure takes the structure id (passing the object silently failed: no wonder was ever
+        // cleared or rewarded by a battle fought/auto-resolved through the battle UI)
+        let cleared = null;
+        if (Ru && typeof Ru.clearStructure === 'function') { try { cleared = Ru.clearStructure(game, struct.id, battle.sidePlayers[0]); } catch (e) { console.error('[Combat.finish] clearStructure', e); } }
+        if (cleared && cleared.ok) { result.clearedStructureId = struct.id; result.loot = Object.assign({}, cleared.reward); }
       }
     }
     battle.result = result;
@@ -27745,10 +27902,10 @@ a { color: var(--gold-light); }
         'dip.factor.treaties': '조약', 'dip.factor.commonEnemies': '공동의 적', 'dip.factor.vassals': '봉신 경쟁', 'dip.factor.war': '전쟁 중', 'dip.factor.reputation': '평판',
         'dip.factor.bonus': '외교 보너스', 'dip.factor.mood': '최근 사건', 'dip.factor.truce': '휴전',
         'dip.opinion.hostile': '적대적', 'dip.opinion.unfriendly': '비우호적', 'dip.opinion.neutral': '중립', 'dip.opinion.friendly': '우호적', 'dip.opinion.admiring': '매우 우호적',
-        'dip.msg.proposal': '{from}이(가) {kind}을(를) 제안했습니다.', 'dip.msg.accepted': '{who}이(가) {kind}을(를) 수락했습니다.', 'dip.msg.declined': '{who}이(가) {kind}을(를) 거절했습니다.',
-        'dip.msg.warDeclared': '{from}이(가) {to}에게 선전포고했습니다!', 'dip.msg.peace': '{a}과(와) {b}이(가) 평화를 맺었습니다.', 'dip.msg.treatyBroken': '{who}이(가) {kind}을(를) 파기했습니다.',
-        'dip.msg.gift': '{from}이(가) {to}에게 선물을 보냈습니다.', 'dip.msg.demand': '{from}이(가) {to}에게 공물을 요구했습니다.', 'dip.msg.joinedWar': '{who}이(가) 동맹을 따라 {to}과(와)의 전쟁에 참전했습니다.',
-        'dip.msg.truceEnded': '{a}과(와) {b}의 휴전이 끝났습니다.', 'dip.msg.napExpired': '{a}과(와) {b}의 불가침 조약이 만료되었습니다.', 'dip.msg.tradeLapsed': '{a}과(와) {b}의 교역이 중단되었습니다.',
+        'dip.msg.proposal': '{from:이/가} {kind:을/를} 제안했습니다.', 'dip.msg.accepted': '{who:이/가} {kind:을/를} 수락했습니다.', 'dip.msg.declined': '{who:이/가} {kind:을/를} 거절했습니다.',
+        'dip.msg.warDeclared': '{from:이/가} {to}에게 선전포고했습니다!', 'dip.msg.peace': '{a:과/와} {b:이/가} 평화를 맺었습니다.', 'dip.msg.treatyBroken': '{who:이/가} {kind:을/를} 파기했습니다.',
+        'dip.msg.gift': '{from:이/가} {to}에게 선물을 보냈습니다.', 'dip.msg.demand': '{from:이/가} {to}에게 공물을 요구했습니다.', 'dip.msg.joinedWar': '{who:이/가} 동맹을 따라 {to:과/와}의 전쟁에 참전했습니다.',
+        'dip.msg.truceEnded': '{a:과/와} {b}의 휴전이 끝났습니다.', 'dip.msg.napExpired': '{a:과/와} {b}의 불가침 조약이 만료되었습니다.', 'dip.msg.tradeLapsed': '{a:과/와} {b}의 교역이 중단되었습니다.',
       },
       en: {
         'dip.state.peace': 'Peace', 'dip.state.war': 'War', 'dip.state.alliance': 'Alliance', 'dip.state.defensive_pact': 'Defensive Pact', 'dip.state.non_aggression': 'Non-Aggression Pact', 'dip.state.truce': 'Truce',
@@ -27766,6 +27923,20 @@ a { color: var(--gold-light); }
     });
   }
   const t = (key, params) => (typeof AOW.t === 'function' ? AOW.t(key, params) : key);
+  /** the same message in both languages ({ko,en}) so a stored notification follows a later language switch;
+   *  params.kindId is resolved per language through 'dip.kind.<id>' */
+  const tL = (key, params) => {
+    const out = {};
+    for (const lang of ['ko', 'en']) {
+      const d = (AOW.I18n && AOW.I18n.dict && AOW.I18n.dict[lang]) || {};
+      const p = Object.assign({}, params);
+      if (p.kindId) p.kind = d['dip.kind.' + p.kindId] || p.kindId;
+      const tpl = d[key] !== undefined ? d[key] : t(key);
+      out[lang] = AOW.I18n && AOW.I18n.fill ? AOW.I18n.fill(tpl, p) : tpl;
+    }
+    return out;
+  };
+  const Lx = o => (AOW.L ? AOW.L(o) : o.en);
   Diplomacy.stateName = state => R(t('dip.state.' + state), (AOW.I18n && AOW.I18n.dict && AOW.I18n.dict.en['dip.state.' + state]) || state);
   Diplomacy.kindName = kind => R(t('dip.kind.' + kind), (AOW.I18n && AOW.I18n.dict && AOW.I18n.dict.en['dip.kind.' + kind]) || kind);
   const pname = (game, pid) => { const p = game.players[pid]; return p ? p.name : ('#' + pid); };
@@ -27813,10 +27984,14 @@ a { color: var(--gold-light); }
     game.log.push({ turn: game.turn, pid, kind: 'diplomacy', text });
     if (game.log.length > C.LOG_MAX) game.log.splice(0, game.log.length - C.LOG_MAX);
   }
-  function notify(game, pids, kind, text) {
-    const humanInvolved = pids.some(pid => game.players[pid] && game.players[pid].isHuman);
-    if (!humanInvolved || !AOW.Events) return;
-    try { AOW.Events.emit('notify', { kind, text, icon: 'crown' }); } catch (e) { /* ignore */ }
+  /** Tell the human about a diplomatic event that concerns them (AI↔AI affairs stay in the log only). */
+  function notify(game, pids, kind, text, opts) {
+    const hp = pids.find(pid => game.players[pid] && game.players[pid].isHuman);
+    if (hp === undefined) return;
+    // through Rules.notify so it also lands in the HUD notification list
+    if (AOW.Rules && typeof AOW.Rules.notify === 'function') { try { AOW.Rules.notify(game, hp, kind, text, 'diplomacy', null, opts); } catch (e) { /* ignore */ } return; }
+    if (!AOW.Events) return;
+    try { AOW.Events.emit('notify', { kind, text: typeof text === 'object' ? Lx(text) : text, icon: 'diplomacy', low: !!(opts && opts.low) }); } catch (e) { /* ignore */ }
   }
   function emit(name, payload) { if (AOW.Events) { try { AOW.Events.emit(name, payload); } catch (e) { /* ignore */ } } }
 
@@ -28062,7 +28237,7 @@ a { color: var(--gold-light); }
     const ra = Diplomacy.rel(game, a, b), rb = Diplomacy.rel(game, b, a);
     ra.mood -= 10; rb.mood -= 20;
     logLine(game, a, t('dip.msg.warDeclared', { from: pname(game, a), to: pname(game, b) }));
-    if (!opts.silent) notify(game, [a, b], 'bad', t('dip.msg.warDeclared', { from: pname(game, a), to: pname(game, b) }));
+    if (!opts.silent) notify(game, [a, b], 'bad', tL('dip.msg.warDeclared', { from: pname(game, a), to: pname(game, b) }));
     // drag allies
     for (const c of others(game, a)) {
       if (c === b) continue;
@@ -28070,11 +28245,11 @@ a { color: var(--gold-light); }
       if ((cb === 'alliance' || cb === 'defensive_pact') && ca !== 'alliance' && ca !== 'war' && Diplomacy.canDeclareWar(game, c, a).ok) {
         Diplomacy.declareWar(game, c, a, { justified: true, viaAlly: true, silent: true });
         logLine(game, c, t('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, a) }));
-        notify(game, [c, a], 'warn', t('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, a) }));
+        notify(game, [c, a], 'warn', tL('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, a) }));
       } else if (ca === 'alliance' && cb !== 'alliance' && cb !== 'defensive_pact' && cb !== 'war' && !opts.viaAlly && Diplomacy.canDeclareWar(game, c, b).ok && FRIENDLY[cb] <= 0) {
         Diplomacy.declareWar(game, c, b, { justified: justified, viaAlly: true, silent: true });
         logLine(game, c, t('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, b) }));
-        notify(game, [c, b], 'warn', t('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, b) }));
+        notify(game, [c, b], 'warn', tL('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, b) }));
       }
     }
     return { ok: true, reason: null };
@@ -28091,7 +28266,7 @@ a { color: var(--gold-light); }
     ra.warScore = rb.warScore = 0;
     ra.mood += 5; rb.mood += 5;
     logLine(game, a, t('dip.msg.peace', { a: pname(game, a), b: pname(game, b) }));
-    notify(game, [a, b], 'good', t('dip.msg.peace', { a: pname(game, a), b: pname(game, b) }));
+    notify(game, [a, b], 'good', tL('dip.msg.peace', { a: pname(game, a), b: pname(game, b) }));
     return { ok: true };
   };
 
@@ -28157,18 +28332,18 @@ a { color: var(--gold-light); }
     if (isAI(game, to)) {
       const ans = Diplomacy.aiRespond(game, proposal);
       if (ans.accept) applyProposal(game, proposal); else refuseProposal(game, proposal);
-      const msg = t(ans.accept ? 'dip.msg.accepted' : 'dip.msg.declined', { who: pname(game, to), kind: AOW.L ? AOW.L(Diplomacy.kindName(kind)) : kind });
-      logLine(game, to, msg);
+      const msg = tL(ans.accept ? 'dip.msg.accepted' : 'dip.msg.declined', { who: pname(game, to), kindId: kind });
+      logLine(game, to, Lx(msg));
       notify(game, [from, to], ans.accept ? 'good' : 'warn', msg);
       return { ok: true, accepted: !!ans.accept, reason: ans.reason, proposal };
     }
     if (!game.pendingProposals) game.pendingProposals = [];
     game.pendingProposals = game.pendingProposals.filter(p => !(p.from === from && p.to === to && p.kind === kind));
     game.pendingProposals.push(proposal);
-    const msg = t('dip.msg.proposal', { from: pname(game, from), kind: AOW.L ? AOW.L(Diplomacy.kindName(kind)) : kind });
-    logLine(game, from, msg);
+    const msg = tL('dip.msg.proposal', { from: pname(game, from), kindId: kind });
+    logLine(game, from, Lx(msg));
     emit('diplomacy:proposal', { from, to, kind, terms, proposal });
-    notify(game, [to], 'info', msg);
+    notify(game, [to], 'info', msg, { low: true });   // the proposal modal is the loud part
     return { ok: true, pending: true, accepted: false, reason: null, proposal };
   };
   /** Proposals waiting for player pid's answer. */
@@ -28215,16 +28390,16 @@ a { color: var(--gold-light); }
         Diplomacy.addGrievance(game, to, from, 'broken_treaty', tr === 'open_borders' || tr === 'trade' ? 10 : C.GRIEVANCE.broken_treaty);
         bumpReputation(game, from, tr === 'open_borders' || tr === 'trade' ? -3 : C.REPUTATION_BREAK);
         const r = Diplomacy.rel(game, to, from); if (r) r.mood -= 15;
-        const msg = t('dip.msg.treatyBroken', { who: pname(game, from), kind: AOW.L ? AOW.L(Diplomacy.kindName(tr)) : tr });
-        logLine(game, from, msg); notify(game, [from, to], 'warn', msg);
+        const msg = tL('dip.msg.treatyBroken', { who: pname(game, from), kindId: tr });
+        logLine(game, from, Lx(msg)); notify(game, [from, to], 'warn', msg);
         break;
       }
       case 'gift': {
         transfer(game, from, to, terms);
         const r = Diplomacy.rel(game, to, from);
         if (r) { r.gifts = Math.min(C.GIFT_CAP + 10, (r.gifts || 0) + resourceValue(terms) / 8); r.mood += 3; }
-        const msg = t('dip.msg.gift', { from: pname(game, from), to: pname(game, to) });
-        logLine(game, from, msg); notify(game, [from, to], 'good', msg);
+        const msg = tL('dip.msg.gift', { from: pname(game, from), to: pname(game, to) });
+        logLine(game, from, Lx(msg)); notify(game, [from, to], 'good', msg);
         break;
       }
       default: break;
@@ -29401,8 +29576,10 @@ a { color: var(--gold-light); }
 //   {frameMs, fps, builds, fogBuilds (chunk/fog rebuilds THIS frame, budget-capped), totalChunkBuilds,
 //    totalFogBuilds (lifetime), chunkMsMax, lastChunkMs, lastFogMs, chunks, drawn:{chunks,structs,armies},
 //    t:{chunks,water,borders,entities,vfx,fog,clouds,labels,vignette} per-section ms (ewma, indicative only —
-//    a software/SwiftShader canvas backend can defer rasterization past the section that recorded it)},
+//    a software/SwiftShader canvas backend can defer rasterization past the section that recorded it; set
+//    WorldRender.profileRaster = true to flush the canvas at every section mark so t shows real raster cost)},
 //   WorldRender.resize(), WorldRender.setZoom(z, sx, sy), WorldRender.hoverIdx, WorldRender.chunkCount().
+// The screen vignette is a CSS overlay div (.world-vignette) inserted after the canvas by init().
 // Events emitted: 'hex:hover' {idx}, 'hex:click' {idx, button, shift, ctrl, alt, x, y}, 'hex:dblclick' {idx}.
 //
 // Info object handed to TerrainArt.drawChunk's getInfo(col,row):
@@ -29414,6 +29591,7 @@ a { color: var(--gold-light); }
   const ZOOM_MIN = 0.35, ZOOM_MAX = 2.2;
   const LOD_ZOOM = 0.7;                  // zoom ≥ LOD_ZOOM → detailed chunks, else simplified half-res chunks
   const LOD_SCALE = [0.5, 1];            // canvas scale per LOD
+  const VIEW_BG = '#0b1320';             // colour beyond the map edge (view clear + opaque chunk backing)
   const MAX_CHUNK_BUILDS = 2;            // terrain chunk rebuilds per frame
   const MAX_FOG_BUILDS = 3;              // fog chunk rebuilds per frame
   const MAX_CHUNKS = 90;                 // LRU cap of cached chunk canvases (all LODs)
@@ -29461,7 +29639,8 @@ a { color: var(--gold-light); }
   const scratchInfo = { terrain: 'grass', feature: 'none', height: 0.4, seed: 1, river: 0, road: 0, neighbors: null, neighborHeights: null, neighborSnow: null, coast: 0, snow: 0, owner: null, size: 36 };
   let minimapCache = { cv: null, w: 0, h: 0, dirty: true, fogDirty: true, lastFog: 0 };
   let vignette = { cv: null, w: 0, h: 0 };
-  let waterLayer = { cv: null, ctx: null, w: 0, h: 0, stamp: -1, camX: 0, camY: 0, zoom: 0 };
+  let vignetteEl = null;           // CSS overlay used instead of drawVignette() once init() has run
+  let waterLayer = { key: null, batch: null };     // cached shimmer strokes (see drawWaterLayer)
   let cloudSprites = null;
   let bound = false;
 
@@ -29477,6 +29656,14 @@ a { color: var(--gold-light); }
   WR.init = function (cv, g) {
     canvas = cv;
     ctx = cv.getContext('2d');
+    // the screen vignette is a CSS overlay (composited by the browser) instead of a full-screen canvas blit every
+    // frame — that blit alone cost ~4 ms/frame under software rasterization
+    if (!vignetteEl && cv.parentNode) {
+      vignetteEl = document.createElement('div');
+      vignetteEl.className = 'world-vignette';
+      vignetteEl.style.cssText = 'position:absolute;inset:0;pointer-events:none;';
+      cv.parentNode.insertBefore(vignetteEl, cv.nextSibling);
+    }
     bindInput();
     WR.resize();
     if (g) WR.setGame(g);
@@ -29494,6 +29681,11 @@ a { color: var(--gold-light); }
     const pw = Math.round(viewW * dpr), ph = Math.round(viewH * dpr);
     if (canvas.width !== pw || canvas.height !== ph) { canvas.width = pw; canvas.height = ph; }
     vignette.cv = null;
+    if (vignetteEl) {
+      // same geometry as the old canvas gradient: circle, clear to 0.45·min(w,h), 0.42 dark at 0.72·max(w,h)
+      const r0 = Math.round(Math.min(viewW, viewH) * 0.45), r1 = Math.round(Math.max(viewW, viewH) * 0.72);
+      vignetteEl.style.background = 'radial-gradient(circle at 50% 50%, rgba(8,10,24,0) ' + r0 + 'px, rgba(8,10,24,0.42) ' + r1 + 'px)';
+    }
   };
 
   WR.setGame = function (g) {
@@ -29502,7 +29694,7 @@ a { color: var(--gold-light); }
     leadCache.clear(); labelCache.clear(); moveAnims.clear();
     highlights.clear(); pathPreview = null; selection = { armyId: null, cityId: null };
     minimapCache.dirty = true; minimapCache.fogDirty = true;
-    waterLayer.stamp = -1;
+    waterLayer.key = null; waterLayer.batch = null;
     if (!g) return;
     viewerPid = 0;
     for (let i = 0; i < g.players.length; i++) if (g.players[i].isHuman) { viewerPid = i; break; }
@@ -29544,6 +29736,15 @@ a { color: var(--gold-light); }
   }
 
   // ================================================================ camera helpers
+  /** world rect covered by the union of all chunk cut rectangles (see getChunk) */
+  function chunkCover() {
+    if (!chunkCover.c || chunkCover.g !== game) {
+      const Hx = Hex();
+      chunkCover.g = game;
+      chunkCover.c = { x0: Hx.toPixel(0, 0).x - Hx.W * 0.25, x1: Hx.toPixel(game.W - 1, 0).x + Hx.W * 0.75, y0: Hx.toPixel(0, 0).y - Hx.SIZE * 0.75, y1: Hx.toPixel(0, game.H - 1).y + Hx.SIZE * 0.75 };
+    }
+    return chunkCover.c;
+  }
   function mapBounds() {
     const Hx = Hex();
     return { x0: 0, y0: 0, x1: (game.W + 0.5) * Hx.W, y1: game.H * Hx.ROW_H + Hx.SIZE * 0.5 };
@@ -29638,9 +29839,11 @@ a { color: var(--gold-light); }
       const cutY0 = Hx.toPixel(0, r0).y - Hx.SIZE * 0.75, cutY1 = Hx.toPixel(0, r1).y + Hx.SIZE * 0.75;
       const padX = Hx.W * 1.25, padTop = Hx.SIZE * 3.2, padBot = Hx.SIZE * 1.6;
       const scale = LOD_SCALE[lod];
-      const ox = cutX0 - padX, oy = cutY0 - padTop;
-      const w = Math.ceil((cutX1 - cutX0 + padX * 2) * scale), h = Math.ceil((cutY1 - cutY0 + padTop + padBot) * scale);
+      // whole-unit canvas origin: at zoom 1 the per-frame blit is then a pixel-aligned copy (see blitCut)
+      const ox = Math.floor(cutX0 - padX), oy = Math.floor(cutY0 - padTop);
+      const w = Math.ceil((cutX1 + padX - ox) * scale), h = Math.ceil((cutY1 + padBot - oy) * scale);
       ch = { lod, cx, cy, c0, c1, r0, r1, cutX0, cutY0, cutW: cutX1 - cutX0, cutH: cutY1 - cutY0, ox, oy, w, h, scale,
+        border: c0 === 0 || r0 === 0 || c1 >= game.W - 1 || r1 >= game.H - 1,
         cv: null, ctx: null, built: false, dirty: true, fogDim: null, fogCloud: null, fogBuilt: false, fogDirty: true, fogHasCloud: false, fogHasDim: false,
         borders: null, provPath: null, lastUse: 0, serial: 0, buildMs: 0 };
       map.set(k, ch);
@@ -29679,10 +29882,15 @@ a { color: var(--gold-light); }
 
   function buildChunk(ch) {
     const t0 = performance.now();
-    if (!ch.cv) { const o = Art().canvas(ch.w, ch.h); ch.cv = o.cv; ch.ctx = o.ctx; }
+    if (!ch.cv) {
+      // opaque backing store: every frame blits ~20 of these, and an opaque source lets the rasterizer copy
+      // instead of alpha-blend (≈1.5 ms/frame in software). Off-map corners get the view background colour.
+      const cv = document.createElement('canvas'); cv.width = Math.max(1, ch.w); cv.height = Math.max(1, ch.h);
+      ch.cv = cv; ch.ctx = cv.getContext('2d', { alpha: false });
+    }
     const c = ch.ctx;
     c.setTransform(1, 0, 0, 1, 0, 0);
-    c.clearRect(0, 0, ch.w, ch.h);
+    c.fillStyle = VIEW_BG; c.fillRect(0, 0, ch.w, ch.h);
     c.save();
     c.scale(ch.scale, ch.scale);
     TerrainArt().drawChunk(c, hexInfo, ch.c0 - 1, ch.c1 + 1, ch.r0 - 1, ch.r1 + 1, ch.ox, ch.oy, { zoom: ch.lod ? 1 : 0.5 });
@@ -29791,14 +29999,16 @@ a { color: var(--gold-light); }
     const t0 = performance.now();
     time += dt; frameNo++;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#0b1320';
-    ctx.fillRect(0, 0, viewW, viewH);
-    if (!game) { drawVignette(); return; }
+    if (!game) { ctx.fillStyle = VIEW_BG; ctx.fillRect(0, 0, viewW, viewH); drawVignette(); return; }
     updateCamera(dt);
     updateMoveAnims(dt);
     if (hasFn('VFX', 'update')) { try { AOW.VFX.update(dt); } catch (e) { /* ignore */ } }
     computeView();
     updateCamSnap();
+    // the chunk cuts tile the whole map opaquely (placeholders too), so the clear is only needed where the
+    // view reaches past the map — one full-screen fill saved per frame in the common case
+    const cover = chunkCover();
+    if (shake.x || shake.y || view.x0 < cover.x0 || view.x1 > cover.x1 || view.y0 < cover.y0 || view.y1 > cover.y1) { ctx.fillStyle = VIEW_BG; ctx.fillRect(0, 0, viewW, viewH); }
     const lod = cam.zoom >= LOD_ZOOM ? 1 : 0;
     // ---- terrain chunks
     const cx0 = Math.floor(view.c0 / CHUNK), cx1 = Math.floor(view.c1 / CHUNK), cy0 = Math.floor(view.r0 / CHUNK), cy1 = Math.floor(view.r1 / CHUNK);
@@ -29807,7 +30017,7 @@ a { color: var(--gold-light); }
     // order: centre-out so the middle of the screen is never the last to appear
     const order = chunkOrder(cx0, cx1, cy0, cy1);
     ctx.save();
-    ctx.translate(viewW / 2 + shake.x, viewH / 2 + shake.y);
+    ctx.translate(Math.round(viewW / 2 + shake.x), Math.round(viewH / 2 + shake.y));
     ctx.scale(cam.zoom, cam.zoom);
     ctx.translate(-camSnap.x, -camSnap.y);
     ctx.imageSmoothingEnabled = true;
@@ -29816,6 +30026,16 @@ a { color: var(--gold-light); }
       const cx = order[i], cy = order[i + 1];
       const ch = getChunk(lod, cx, cy, true);
       ch.lastUse = frameNo;
+      // a chunk that is unexplored all over would only be painted over by its (opaque) fog canvas: skip the
+      // terrain blit and build here; the fog pass fills its cut with the world-aligned parchment pattern instead
+      // (one opaque fill instead of terrain blit + alpha fog blit). The pattern is phase-locked to world space
+      // exactly like buildFog's, so it meets the neighbours' feathered fog seamlessly.
+      // (map-border chunks keep the blurred fog canvas: it fades the parchment out at the edge of the world)
+      if (ch.fogBuilt && !ch.fogDirty && ch.fogAllCloud && !ch.border && TerrainArt() && TerrainArt().fillFog) {
+        ch.patternFrame = frameNo;
+        stats.drawn.chunks++;
+        continue;
+      }
       if (ch.dirty && (builds < MAX_CHUNK_BUILDS || buildAll)) { buildChunk(ch); builds++; }
       let src = ch.built ? ch : null;
       if (!src) { const alt = getChunk(1 - lod, cx, cy, false); if (alt && alt.built) src = alt; }
@@ -29823,8 +30043,8 @@ a { color: var(--gold-light); }
         drawChunkCut(src);
         stats.drawn.chunks++;
       } else {
-        // not yet rendered: flat placeholder in the average terrain colour of the chunk
-        ctx.fillStyle = 'rgba(40,70,60,0.5)';
+        // not yet rendered: flat opaque placeholder (the view is not cleared under the map, see chunkCover)
+        ctx.fillStyle = '#1a2d2e';
         ctx.fillRect(ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
       }
     }
@@ -29837,7 +30057,7 @@ a { color: var(--gold-light); }
     __p = mark('water', __p);
     // ---- world-space overlays (borders, structures, armies, highlights, fog …)
     ctx.save();
-    ctx.translate(viewW / 2 + shake.x, viewH / 2 + shake.y);
+    ctx.translate(Math.round(viewW / 2 + shake.x), Math.round(viewH / 2 + shake.y));
     ctx.scale(cam.zoom, cam.zoom);
     ctx.translate(-camSnap.x, -camSnap.y);
     drawBorders(lod, cx0, cx1, cy0, cy1);
@@ -29855,7 +30075,20 @@ a { color: var(--gold-light); }
       const ch = getChunk(lod, order[i], order[i + 1], false);
       if (!ch) continue;
       if (ch.fogDirty && (fogBuilds < MAX_FOG_BUILDS || buildAll)) { buildFog(ch); fogBuilds++; }
-      if (ch.fogBuilt) drawFogChunk(ch);
+      if (ch.patternFrame === frameNo) {
+        // fully unexplored (see the chunk pass): opaque parchment over whatever borders/armies lie beneath
+        const e = 1 / cam.zoom;                        // 1 screen px of overlap: no anti-aliased seam between cuts
+        TerrainArt().setOrigin(0, 0);
+        TerrainArt().fillFog(ctx, ch.cutX0 - e, ch.cutY0 - e, ch.cutW + 2 * e, ch.cutH + 2 * e);
+      } else if (ch.fogBuilt && ch.fogAllDim && !ch.border) {
+        // explored-but-unseen all over: the pre-built veil canvas is one flat colour here — a solid translucent
+        // fill of the same cut rect is identical and far cheaper to rasterize than an image blit
+        ctx.fillStyle = veilFill();
+        if (ch.scale === 1 && cam.zoom === 1) {                 // same whole-pixel edges as blitCut's neighbours
+          const x0 = Math.round(ch.cutX0), y0 = Math.round(ch.cutY0);
+          ctx.fillRect(x0, y0, Math.round(ch.cutX0 + ch.cutW) - x0, Math.round(ch.cutY0 + ch.cutH) - y0);
+        } else ctx.fillRect(ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
+      } else if (ch.fogBuilt) drawFogChunk(ch);
     }
     __p = mark('fog', __p);
     if (cam.zoom >= 0.8) drawCloudShadows();
@@ -29868,7 +30101,8 @@ a { color: var(--gold-light); }
     __p = mark('vignette', __p);
     if (hasFn('VFX', 'drawScreen')) { try { ctx.setTransform(dpr, 0, 0, dpr, 0, 0); AOW.VFX.drawScreen(ctx, viewW, viewH); } catch (e) { /* ignore */ } }
     if (WR.debug) drawDebug();
-    function mark(name, prev) { const now = performance.now(); __t[name] = (__t[name] || 0) * 0.9 + (now - prev) * 0.1; return now; }
+    // WR.profileRaster: force the canvas to rasterize at every mark so stats.t shows real per-layer raster cost
+    function mark(name, prev) { if (WR.profileRaster) ctx.getImageData(0, 0, 1, 1); const now = performance.now(); __t[name] = (__t[name] || 0) * 0.9 + (now - prev) * 0.1; return now; }
     const ms = performance.now() - t0;
     stats.frameMs = stats.frameMs * 0.9 + ms * 0.1;
     stats.fps = stats.fps * 0.95 + (1 / Math.max(1e-3, dt)) * 0.05;
@@ -29887,25 +30121,37 @@ a { color: var(--gold-light); }
     return orderBuf;
   }
 
-  function drawChunkCut(ch) {
+  function drawChunkCut(ch) { blitCut(ch.cv, ch); }
+  /**
+   * Draw a chunk-aligned canvas (terrain or fog) over its cut rectangle. At a 1:1 scale (detail chunks at zoom 1,
+   * the common case) the cut is snapped to whole pixels — neighbours share the same rounded edge, so there is
+   * no gap — which turns the blit into a plain copy instead of a filtered, sub-pixel resample.
+   */
+  function blitCut(cv, ch) {
     const s = ch.scale;
+    if (s === 1 && cam.zoom === 1) {
+      const x0 = Math.round(ch.cutX0), y0 = Math.round(ch.cutY0), x1 = Math.round(ch.cutX0 + ch.cutW), y1 = Math.round(ch.cutY0 + ch.cutH);
+      ctx.drawImage(cv, x0 - ch.ox, y0 - ch.oy, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+      return;
+    }
     const sx = (ch.cutX0 - ch.ox) * s, sy = (ch.cutY0 - ch.oy) * s;
-    ctx.drawImage(ch.cv, sx, sy, ch.cutW * s, ch.cutH * s, ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
+    ctx.drawImage(cv, sx, sy, ch.cutW * s, ch.cutH * s, ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
   }
 
   // ================================================================ water shimmer layer
   function drawWaterLayer() {
+    // The shimmer animates at 15 Hz. Its ripples/foam are collected (TerrainArt.waterBatch) into a few Path2D
+    // buckets in WORLD space, rebuilt only when the 15 Hz stamp or the visible hex range changes, and stroked
+    // straight onto the frame every frame (~30 strokes). No offscreen layer: blitting a viewport-sized layer
+    // canvas forced a 50–80 ms raster flush every few frames under software/SwiftShader rendering.
+    const TA = TerrainArt();
+    if (!TA || !TA.waterBatch) return;
     const stamp = Math.floor(time * 15);
-    const w = Math.ceil(viewW), h = Math.ceil(viewH);
-    if (!waterLayer.cv || waterLayer.w !== w || waterLayer.h !== h) {
-      const o = Art().canvas(w, h); waterLayer.cv = o.cv; waterLayer.ctx = o.ctx; waterLayer.w = w; waterLayer.h = h; waterLayer.stamp = -1;
-    }
-    const moved = waterLayer.camX !== cam.x || waterLayer.camY !== cam.y || waterLayer.zoom !== cam.zoom;
-    if (waterLayer.stamp !== stamp || moved) {
-      const c = waterLayer.ctx, g = game, Hx = Hex(), T = State().TERRAINS, WM = State().WATER_MAX;
-      c.setTransform(1, 0, 0, 1, 0, 0);
-      c.clearRect(0, 0, w, h);
-      c.translate(viewW / 2, viewH / 2); c.scale(cam.zoom, cam.zoom); c.translate(-camSnap.x, -camSnap.y);
+    const key = stamp + '|' + view.c0 + ',' + view.c1 + ',' + view.r0 + ',' + view.r1 + '|' + viewerPid;
+    if (waterLayer.key !== key) {
+      waterLayer.key = key;
+      const g = game, Hx = Hex(), T = State().TERRAINS, WM = State().WATER_MAX;
+      const batch = waterLayer.batch = TA.waterBatch();
       const info = scratchInfo; info.size = Hx.SIZE; info.neighbors = null;
       const tt = stamp / 15;
       const vis = g.visible[viewerPid], ex = g.explored[viewerPid];
@@ -29916,11 +30162,17 @@ a { color: var(--gold-light); }
         if (vis && !vis[i]) continue;
         const p = Hx.toPixel(col, r);
         info.terrain = T[g.terrain[i]]; info.seed = seedArr[i]; info.coast = coastArr[i];
-        TerrainArt().drawWater(c, p.x, p.y, info, tt);
+        TA.drawWater(null, p.x, p.y, info, tt, batch);
       }
-      waterLayer.stamp = stamp; waterLayer.camX = cam.x; waterLayer.camY = cam.y; waterLayer.zoom = cam.zoom;
     }
-    ctx.drawImage(waterLayer.cv, shake.x, shake.y);
+    const batch = waterLayer.batch;
+    if (!batch || (!batch.ripple.size && !batch.foam.size)) return;
+    ctx.save();
+    ctx.translate(Math.round(viewW / 2 + shake.x), Math.round(viewH / 2 + shake.y));
+    ctx.scale(cam.zoom, cam.zoom);
+    ctx.translate(-camSnap.x, -camSnap.y);
+    TA.flushWaterBatch(ctx, batch, true);
+    ctx.restore();
   }
 
   // ================================================================ domain & province borders
@@ -30362,6 +30614,12 @@ a { color: var(--gold-light); }
   // Both layers are painted as ONE continuous wash over the whole chunk and then masked by the (blurred)
   // union of the hexes they cover, so nothing in the fog follows a hex silhouette. The blur radii below are
   // world px: ~1.5 hexes of feather for the unexplored cloud bank, ~1 hex for the "explored but unseen" veil.
+  let veilCss = null;
+  function veilFill() {             // the veil layer's colour at the alpha buildFog composites it with
+    if (!veilCss) { const TA = TerrainArt(); veilCss = Color().alpha((TA && TA.FOG_VEIL) || 'rgb(118,122,138)', FOG_VEIL_ALPHA); }
+    return veilCss;
+  }
+  const FOG_VEIL_ALPHA = 0.55;
   const FOG_MASK_GROW = 7;       // world px the mask extends past the hex edge before blurring
   const FOG_BLUR_CLOUD = 26;     // world px gaussian radius on the unexplored edge (Hex.SIZE is 36)
   const FOG_BLUR_VEIL = 16;      // world px gaussian radius on the explored-but-unseen edge
@@ -30371,14 +30629,15 @@ a { color: var(--gold-light); }
     const t0 = performance.now();
     const ex = g.explored[viewerPid], vis = g.visible[viewerPid];
     ch.fogDirty = false; ch.fogBuilt = true;
-    if (!ex) { ch.fogHasDim = false; ch.fogHasCloud = false; return; }
+    if (!ex) { ch.fogHasDim = false; ch.fogHasCloud = false; ch.fogAllCloud = false; ch.fogAllDim = false; return; }
     const c0 = Math.max(0, ch.c0 - 1), c1 = Math.min(g.W - 1, ch.c1 + 1), r0 = Math.max(0, ch.r0 - 1), r1 = Math.min(g.H - 1, ch.r1 + 1);
-    let anyDim = false, anyCloud = false;
-    for (let r = r0; r <= r1 && !(anyDim && anyCloud); r++) for (let c = c0; c <= c1; c++) {
+    let anyDim = false, anyCloud = false, allCloud = true, allDim = true;
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
       const i = r * g.W + c;
-      if (!ex[i]) anyCloud = true; else if (vis && !vis[i]) anyDim = true;
+      if (!ex[i]) { anyCloud = true; allDim = false; }
+      else { allCloud = false; if (vis && !vis[i]) anyDim = true; else allDim = false; }
     }
-    ch.fogHasDim = anyDim; ch.fogHasCloud = anyCloud;
+    ch.fogHasDim = anyDim; ch.fogHasCloud = anyCloud; ch.fogAllCloud = anyCloud && allCloud; ch.fogAllDim = anyDim && allDim;
     if (!anyDim && !anyCloud) return;
     if (!fogScratch.cv) { const o = Art().canvas(ch.w, ch.h); fogScratch.cv = o.cv; fogScratch.ctx = o.ctx; }
     if (fogScratch.cv.width < ch.w || fogScratch.cv.height < ch.h) { fogScratch.cv.width = Math.max(fogScratch.cv.width, ch.w); fogScratch.cv.height = Math.max(fogScratch.cv.height, ch.h); }
@@ -30423,7 +30682,7 @@ a { color: var(--gold-light); }
       d.fillStyle = (TA && TA.FOG_VEIL) || 'rgb(118,122,138)'; d.fillRect(0, 0, ch.w, ch.h);
       buildMask(i => ex[i] && vis && !vis[i], FOG_MASK_GROW);
       applyMask(d, FOG_BLUR_VEIL);
-      out.globalAlpha = 0.55;
+      out.globalAlpha = FOG_VEIL_ALPHA;
       out.drawImage(ch.fogDim.cv, 0, 0, ch.w, ch.h);
       out.globalAlpha = 1;
     }
@@ -30447,9 +30706,7 @@ a { color: var(--gold-light); }
   }
   function drawFogChunk(ch) {
     if ((!ch.fogHasDim && !ch.fogHasCloud) || !ch.fogOut) return;
-    const s = ch.scale;
-    const sx = (ch.cutX0 - ch.ox) * s, sy = (ch.cutY0 - ch.oy) * s, sw = ch.cutW * s, sh = ch.cutH * s;
-    ctx.drawImage(ch.fogOut.cv, sx, sy, sw, sh, ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
+    blitCut(ch.fogOut.cv, ch);
   }
 
   // ================================================================ cloud shadows, vignette, labels, debug
@@ -30483,6 +30740,7 @@ a { color: var(--gold-light); }
   }
   function drawVignette() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (vignetteEl) { const want = canvas && canvas.hidden ? 'none' : ''; if (vignetteEl.style.display !== want) vignetteEl.style.display = want; return; }
     if (!vignette.cv || vignette.w !== viewW || vignette.h !== viewH) {
       const o = Art().canvas(Math.max(2, viewW / 4), Math.max(2, viewH / 4));
       const w = o.cv.width, h = o.cv.height;
@@ -31575,7 +31833,9 @@ a { color: var(--gold-light); }
   function drawGroundOverlays() {
     // water shimmer
     if (AOW.TerrainArt && typeof AOW.TerrainArt.drawWater === 'function') {
-      for (const k of cells) if (k.water) { try { AOW.TerrainArt.drawWater(ctx, k.x, k.y, { terrain: k.terrain, seed: k.seed, size: SIZE }, time); } catch (e) { /* optional */ } }
+      const TA = AOW.TerrainArt, batch = TA.waterBatch ? TA.waterBatch() : null;   // bucketed strokes (see TerrainArt.waterBatch)
+      for (const k of cells) if (k.water) { try { TA.drawWater(ctx, k.x, k.y, { terrain: k.terrain, seed: k.seed, size: SIZE }, time, batch); } catch (e) { /* optional */ } }
+      if (batch) { try { TA.flushWaterBatch(ctx, batch); } catch (e) { /* optional */ } }
     }
     // deployment zones (round 1)
     if (showDeployment()) {
@@ -33127,7 +33387,8 @@ a { color: var(--gold-light); }
 //   Music.prev(), Music.stop(), Music.isPlaying(), Music.nowPlaying() → {id,title,composer,moods} | null
 //   Music.setVolume(v), Music.onChange(cb) → off(), Music.list() → [{id,title,composer,moods,lengthSec}]
 //   Music.playlist(mood?) → ids for a mood (or {mood:[ids]} for all moods)
-//   Music.getMood(), Music.previewNotes(notes, instrumentName, bpm) (raw [[beat,midi,dur,vel]] test playback)
+//   Music.getMood(), Music.fitsMood(mood?) (the playing song suits the mood — songs of a mood without its own
+//     pieces fall back: battle → tension, victory → peace, …), Music.previewNotes(notes, instrumentName, bpm) (raw [[beat,midi,dur,vel]] test playback)
 //   Music.position() → seconds into the current song
 //   Music.renderOffline(songId, seconds, ctx) → Promise<AudioBuffer>  binds AOW.Audio to `ctx` (an
 //     OfflineAudioContext; rebinds with {force:true} if AOW.Audio already points elsewhere), schedules
@@ -33161,7 +33422,17 @@ a { color: var(--gold-light); }
   function songs() { return AOW.Songs || {}; }
   function songById(id) { return id ? songs()[id] || null : null; }
   function allIds() { return Object.keys(songs()); }
-  function idsForMood(m) { return allIds().filter(id => (songs()[id].moods || []).indexOf(m) >= 0); }
+  function taggedFor(m) { return allIds().filter(id => (songs()[id].moods || []).indexOf(m) >= 0); }
+  // the song sets are calm classical pieces and none is tagged 'battle': a mood without songs of its own
+  // borrows the closest one (battle → tension, victory → peace…) instead of silently keeping the old piece
+  const MOOD_FALLBACK = { battle: ['tension', 'defeat'], tension: ['defeat'], victory: ['peace'], defeat: ['tension'], menu: ['peace'], peace: ['menu'] };
+  function moodsFor(m) {
+    if (taggedFor(m).length) return [m];
+    for (const f of MOOD_FALLBACK[m] || []) if (taggedFor(f).length) return [f];
+    return [m];
+  }
+  function idsForMood(m) { const ms = moodsFor(m); return allIds().filter(id => (songs()[id].moods || []).some(x => ms.indexOf(x) >= 0)); }
+  function songFits(song, m) { const ms = moodsFor(m); return (song.moods || []).some(x => ms.indexOf(x) >= 0); }
   function lengthSec(song) {
     if (song.lengthSec) return song.lengthSec;
     let end = song.lengthBeats || 0;
@@ -33360,14 +33631,19 @@ a { color: var(--gold-light); }
   /** 'menu'|'peace'|'tension'|'battle'|'victory'|'defeat' — battle/victory/defeat switch immediately, others at the next song */
   Music.setMood = function (m) {
     if (!m || m === mood) return;
+    const prev = mood;
     mood = m;
     if (stopped || !current) return;
-    if (IMMEDIATE_MOODS[m] && (current.song.moods || []).indexOf(m) < 0) {
+    // battle/victory/defeat cut in at once; leaving one of them (battle over → peace) also switches right away
+    // instead of letting the battle piece play on for minutes over the world map
+    if ((IMMEDIATE_MOODS[m] || IMMEDIATE_MOODS[prev]) && !songFits(current.song, m)) {
       const pool = idsForMood(m);
       if (pool.length) Music.play(pickNext(m, current.id));
     }
   };
   Music.getMood = function () { return mood; };
+  /** does the playing song suit the current mood (directly or through the mood fallback)? */
+  Music.fitsMood = function (m) { return !!current && songFits(current.song, m || mood); };
   Music.isPlaying = function () { return !!current && !paused && !stopped; };
   Music.isPaused = function () { return paused; };
   Music.nowPlaying = function () { return current ? info(current.song) : null; };
@@ -35765,6 +36041,7 @@ a { color: var(--gold-light); }
 //   UI.roman(n), UI.ROMAN                                'I'..'V'
 //   UI.iconName(candidates…)                             first candidate AOW.Icons knows (or '')
 //   UI.layers {screen, hud, toast, tooltip}              the four layer elements
+//   UI.TOAST_MAX / UI.TOAST_TIMEOUT                      centre-toast cap (3) and auto-dismiss (5000 ms); 'notify' {low:true} → HUD list only
 //   Screen definitions may also carry: full:true (opaque full-screen), dim:false (no backdrop), tick(dt), relang() (called on language change instead of re-open)
 //   UI.button(...) marks the element with el._aowSetDisabled(bool) and el._aowSetLabel(str) helpers; UI.panel returns el with el.body / el.setTitle(str).
 //   Modal api: {el, body, close(), setButtons([...])}; button onClick(ev, api) returning false keeps the modal open.
@@ -36020,7 +36297,12 @@ a { color: var(--gold-light); }
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('mousemove', e => { tipPos.x = e.clientX; tipPos.y = e.clientY; }, { passive: true });
     window.addEventListener('blur', () => UI.hideTooltip());
-    AOW.Events.on('notify', p => { if (!p) return; UI.toast(p.kind || 'info', typeof p.text === 'object' ? L(p.text) : (p.text || ''), { icon: p.icon, onClick: p.onClick, timeout: p.timeout, title: p.title }); });
+    // routine news (rank-ups, production finished, own-action confirmations: notify {low:true}) only goes to the
+    // HUD notification list; everything else also gets a centre toast
+    AOW.Events.on('notify', p => {
+      if (!p || p.low || (p.notification && p.notification.low)) return;
+      UI.toast(p.kind || 'info', typeof p.text === 'object' ? L(p.text) : (p.text || ''), { icon: p.icon, onClick: p.onClick, timeout: p.timeout, title: p.title });
+    });
     AOW.Events.on('i18n:changed', () => relangAll());
     AOW.Events.on('game:new', () => { UI.closeModals(); UI.hideTooltip(); UI.selected = { armyId: null, cityId: null, unitId: null }; });
     UI.css(SETTINGS_CSS);
@@ -36220,6 +36502,8 @@ a { color: var(--gold-light); }
   UI.closeModals = function () { while (modals.length) modals[modals.length - 1].close(); };
 
   // ------------------------------------------------------------------ toasts
+  UI.TOAST_MAX = 3;           // centre toasts visible at once (older ones are dismissed)
+  UI.TOAST_TIMEOUT = 5000;    // every toast auto-dismisses after at most 5 s (o.sticky keeps one up)
   UI.toast = function (kind, text, o) {
     if (kind && typeof kind === 'object') { o = kind; kind = o.kind; text = o.text; }
     o = o || {};
@@ -36232,9 +36516,15 @@ a { color: var(--gold-light); }
       el('button', { class: 'aow-toast__close', type: 'button', onclick: e => { e.stopPropagation(); remove(); } }, '×'));
     const remove = () => { if (removed) return; removed = true; item.classList.add('aow-toast--out'); setTimeout(() => item.remove(), 240); };
     if (o.onClick) item.addEventListener('click', () => { safe(() => o.onClick()); remove(); });
+    // the same message already on screen (e.g. several "battle won" in one AI phase): refresh it instead of stacking
+    const live = () => Array.from(layer.children).filter(c => c.classList && c.classList.contains('aow-toast') && !c.classList.contains('aow-toast--out'));
+    for (const c of live()) if (c._aowText === kind + '|' + text && typeof c.close === 'function') c.close();
+    item._aowText = kind + '|' + text;
     layer.appendChild(item);
-    while (layer.children.length > 6) layer.firstChild.remove();
-    const timeout = o.timeout === undefined ? 5000 : o.timeout;
+    // at most UI.TOAST_MAX toasts on screen: the oldest make room (the HUD notification list keeps the history)
+    const shown = live();
+    for (let i = 0; i < shown.length - UI.TOAST_MAX; i++) shown[i].close ? shown[i].close() : shown[i].remove();
+    const timeout = o.sticky ? 0 : Math.min(UI.TOAST_TIMEOUT, o.timeout > 0 ? o.timeout : UI.TOAST_TIMEOUT);
     if (timeout > 0) setTimeout(remove, timeout);
     if (o.sound !== false) { if (kind === 'warn' || kind === 'bad') sfx('alert', { volume: 0.6 }); else if (kind === 'good') sfx('notification', { volume: 0.5 }); }
     item.close = remove;
@@ -36615,6 +36905,9 @@ a { color: var(--gold-light); }
 .settings-section > .aow-h3 { margin-bottom: 2px; padding-bottom: 4px; border-bottom: 1px solid var(--border-soft); }
 .settings-row { display: flex; align-items: center; gap: 10px; min-height: 28px; }
 .settings-row > label:first-child, .settings-row > span:first-child { flex: 0 0 132px; color: var(--text-dim); font-size: 12.5px; }
+.settings-row > label.aow-check:first-child { flex: 1 1 auto; }            /* checkbox rows: the label is the whole row */
+.settings-row .aow-segment { flex: 0 0 auto; }
+.settings-row .aow-segment button { white-space: nowrap; }
 .settings-row .aow-slider { flex: 1 1 auto; }
 .settings-row .settings-val { flex: 0 0 40px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; color: var(--gold-light); }
 .settings-np { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; background: rgba(0,0,0,0.3); border-radius: 4px; border: 1px solid var(--border-soft); }
@@ -37915,6 +38208,8 @@ a { color: var(--gold-light); }
       'hud.castHint': '{name} — 지도에서 대상을 선택하세요. (우클릭으로 취소)', 'hud.castCancelled': '주문 시전을 취소했습니다.', 'hud.castDone': '{name} 시전 완료.',
       'hud.encounter.title': '교전', 'hud.encounter.ours': '아군 전력', 'hud.encounter.theirs': '적 전력', 'hud.attack': '공격', 'hud.autoResolve': '자동 전투',
       'hud.autoWin': '승리했습니다!', 'hud.autoLose': '패배했습니다…', 'hud.freeCity.title': '자유 도시', 'hud.freeCity.gift': '선물', 'hud.freeCity.vassalize': '봉신화 요청', 'hud.freeCity.declareWar': '전쟁 선포',
+      'hud.freeCity.whisper': '속삭임의 돌', 'hud.freeCity.whisperTip': '매 턴 이 도시의 호감도가 오릅니다.', 'hud.freeCity.integrate': '제국에 편입', 'hud.freeCity.isVassal': '우리의 봉신 도시입니다.',
+      'hud.freeCity.giftTip': '금 {gold:을/를} 보내 호감도를 높입니다.', 'hud.freeCity.needOpinion': '호감도 {n} 이상 필요',
       'hud.unclaimed': '미개척 지방', 'hud.queueEmpty': '생산 대기열이 비어 있습니다', 'hud.provinceYields': '지방 산출', 'hud.improvement': '개선물', 'hud.resource': '자원', 'hud.units': '유닛',
       'hud.endTurnUnavailable': '아직 턴 종료 규칙이 준비되지 않았습니다.', 'hud.moveUnavailable': '아직 이동 규칙이 준비되지 않았습니다.', 'hud.base': '기본', 'hud.vassalTribute': '봉신 조공', 'hud.opinion': '호감도',
     },
@@ -37930,6 +38225,8 @@ a { color: var(--gold-light); }
       'hud.castHint': '{name} — choose a target on the map. (right-click to cancel)', 'hud.castCancelled': 'Cast cancelled.', 'hud.castDone': '{name} cast.',
       'hud.encounter.title': 'Encounter', 'hud.encounter.ours': 'Our strength', 'hud.encounter.theirs': 'Their strength', 'hud.attack': 'Attack', 'hud.autoResolve': 'Auto-resolve',
       'hud.autoWin': 'Victory!', 'hud.autoLose': 'Defeat…', 'hud.freeCity.title': 'Free city', 'hud.freeCity.gift': 'Gift', 'hud.freeCity.vassalize': 'Demand vassalage', 'hud.freeCity.declareWar': 'Declare war',
+      'hud.freeCity.whisper': 'Whispering stone', 'hud.freeCity.whisperTip': 'Raises this city\'s opinion of you every turn.', 'hud.freeCity.integrate': 'Integrate', 'hud.freeCity.isVassal': 'This city is our vassal.',
+      'hud.freeCity.giftTip': 'Send {gold} gold to raise its opinion.', 'hud.freeCity.needOpinion': 'Needs opinion {n}+',
       'hud.unclaimed': 'Unclaimed province', 'hud.queueEmpty': 'Production queue is empty', 'hud.provinceYields': 'Province yields', 'hud.improvement': 'Improvement', 'hud.resource': 'Resource', 'hud.units': 'units',
       'hud.endTurnUnavailable': 'Turn rules are not ready yet.', 'hud.moveUnavailable': 'Movement rules are not ready yet.', 'hud.base': 'Base', 'hud.vassalTribute': 'Vassal tribute', 'hud.opinion': 'Opinion',
     },
@@ -38099,7 +38396,7 @@ a { color: var(--gold-light); }
       overlayMode = overlayMode === mode ? 'none' : mode;
       if (hasFn('WorldRender', 'setOverlay')) safe(() => AOW.WorldRender.setOverlay(overlayMode));
       renderMinimapOverlayButtons(overlays);
-    }, { icon, kind: 'ghost', small: true, tooltip: t(tipKey) }));
+    }, { icon, kind: 'ghost', small: true, tooltip: () => t(tipKey) }));   // a function: the minimap is kept across relang
     ovBtn('provinces', UI.iconName('annex', 'eye'), 'hud.overlay.provinces');
     ovBtn('yields', UI.iconName('gold'), 'hud.overlay.yields');
     frame.appendChild(overlays);
@@ -38140,15 +38437,28 @@ a { color: var(--gold-light); }
   function onNotifClick(n) {
     const g = game(); if (!g) return;
     const ref = n.ref || {};
-    if (ref.cityId !== undefined && ref.cityId !== null) { const c = S().city(g, ref.cityId); if (c) { if (hasFn('WorldRender', 'centerOn')) safe(() => AOW.WorldRender.centerOn(c.hex, true)); UI.select({ cityId: c.id }); } }
-    else if (ref.armyId !== undefined && ref.armyId !== null) { const a = S().army(g, ref.armyId); if (a) { if (hasFn('WorldRender', 'centerOn')) safe(() => AOW.WorldRender.centerOn(a.hex, true)); UI.select({ armyId: a.id }); } }
-    else if (ref.hex !== undefined && ref.hex !== null && hasFn('WorldRender', 'centerOn')) safe(() => AOW.WorldRender.centerOn(ref.hex, true));
+    const given = v => v !== undefined && v !== null && v >= 0;
+    const centre = idx => { if (hasFn('WorldRender', 'centerOn')) safe(() => AOW.WorldRender.centerOn(idx, true)); };
+    const unit = given(ref.unitId) ? S().unit(g, ref.unitId) : null;
+    const armyId = given(ref.armyId) ? ref.armyId : (unit && given(unit.armyId) ? unit.armyId : null);
+    const hex = given(ref.hex) ? ref.hex : given(ref.hexIdx) ? ref.hexIdx : null;
+    if (given(ref.heroId) && !given(ref.cityId)) { UI.showScreen('hero', { heroId: ref.heroId }); return; }
+    if (ref.tomeId || ref.contentId) { UI.showScreen('research'); return; }
+    if (ref.empireSkill) { UI.showScreen('empire'); return; }
+    if (given(ref.cityId)) { const c = S().city(g, ref.cityId); if (c) { centre(c.hex); UI.select({ cityId: c.id }); } }
+    else if (armyId !== null) { const a = S().army(g, armyId); if (a) { centre(a.hex); if (a.owner === (human() || {}).id) UI.select({ armyId: a.id }); } }
+    else if (hex !== null) centre(hex);
+    else if (given(ref.structureId)) { const st = S().structure(g, ref.structureId); if (st && st.hex >= 0) centre(st.hex); }
+    else if (ref.spellId) UI.showScreen('spellbook');
   }
   function renderNotifications() {
     const wrap = el('div', { class: 'hud-notifications' });
     const g = game(), p = human();
     if (!g || !p) return wrap;
-    const list = (g.notifications || []).filter(n => n.turn === g.turn && (n.pid === p.id || n.pid === -1 || n.pid === undefined)).slice(-10).reverse();
+    // this turn's feed = everything since the human last ended a turn (Turn.endTurn stamps game.notifSince), so the
+    // news of the AI phase (attacks, raids, lost cities) stays listed next to this turn's own events
+    const since = g.notifSince !== undefined ? g.notifSince : -1;
+    const list = (g.notifications || []).filter(n => (since >= 0 ? n.id > since : n.turn === g.turn) && (n.pid === p.id || n.pid === -1 || n.pid === undefined)).slice(-10).reverse();
     for (const n of list) {
       wrap.appendChild(el('div', { class: 'hud-notif', style: { '--kind': notifKindClass(n.kind) }, onclick: () => onNotifClick(n) },
         UI.icon(n.icon || (n.kind === 'bad' ? 'cross' : n.kind === 'warn' ? 'warning' : n.kind === 'good' ? 'check' : 'info'), 17),
@@ -38219,7 +38529,7 @@ a { color: var(--gold-light); }
       UI.icon(city.tier === 0 ? 'outpost' : 'cities', 30),
       el('div', { class: 'aow-grow' },
         el('div', { class: 'hud-cityhead__name' }, city.name, city.isCapital ? UI.icon('crown', 15) : null),
-        el('div', { class: 'aow-dim aow-small' }, isFree ? t('hud.selection.freeCity') : (UI.roman(city.tier) + ' · ' + t('ui.res_pop') + ' ' + UI.fmt(city.pop))))));
+        el('div', { class: 'aow-dim aow-small hud-cityhead__tier' }, isFree ? t('hud.selection.freeCity') : ((UI.roman(city.tier) + ' ' + (AOW.Screens && AOW.Screens.tierName ? AOW.Screens.tierName(city.tier) : '')).trim() + ' · ' + t('ui.res_pop') + ' ' + UI.fmt(city.pop))))));
     if (!isFree) {
       const y = hasFn('Rules', 'cityYields') ? safe(() => AOW.Rules.cityYields(g, city), null) : null;
       if (y) {
@@ -38230,7 +38540,10 @@ a { color: var(--gold-light); }
       const q = (city.queue || [])[0];
       box.push(el('div', { class: 'aow-small' }, q ? (t('ui.production') + ': ' + (q.type === 'unit' && AOW.Data.has('units', q.id) ? L(AOW.Data.get('units', q.id).name) : q.id)) : el('span', { class: 'aow-warn' }, t('hud.queueEmpty'))));
     } else {
-      box.push(el('div', { class: 'aow-small aow-dim' }, city.freeCity.culture || ''));
+      const fc = city.freeCity, D = AOW.Data;
+      const culture = fc.culture && D.has('cultures', fc.culture) ? L(D.get('cultures', fc.culture).name) : '';
+      const form = fc.form && D.has('forms', fc.form) ? L(D.get('forms', fc.form).name) : '';
+      box.push(el('div', { class: 'aow-small aow-dim' }, [form, culture].filter(Boolean).join(' · ')));
       box.push(renderFreeCityOptions(g, p, city));
     }
     if (isOwn) box.push(el('div', { class: 'hud-actions' }, UI.button(t('hud.openCity'), () => UI.showScreen('city', { cityId: city.id }), { icon: 'cities', kind: 'gold' })));
@@ -38241,9 +38554,16 @@ a { color: var(--gold-light); }
     const has = hasFn('Rules', 'freeCityAction');
     const opinion = hasFn('Rules', 'freeCityOpinion') ? safe(() => AOW.Rules.freeCityOpinion(g, city, p.id), null) : null;
     if (opinion !== null) wrap.appendChild(el('div', { class: 'aow-small aow-dim', style: { width: '100%' } }, t('hud.opinion') + ': ', el('b', null, UI.fmtSigned(opinion))));
-    wrap.appendChild(UI.button(t('hud.freeCity.gift'), () => afterAction(call('Rules', 'freeCityAction', g, p, city, 'gift')), { icon: 'gold', small: true, disabled: !has }));
-    wrap.appendChild(UI.button(t('hud.freeCity.vassalize'), () => afterAction(call('Rules', 'freeCityAction', g, p, city, 'vassalize')), { icon: UI.iconName('alliance', 'flag'), small: true, disabled: !has }));
-    wrap.appendChild(UI.button(t('hud.freeCity.declareWar'), () => afterAction(call('Rules', 'freeCityAction', g, p, city, 'declare')), { icon: 'sword', small: true, kind: 'danger', disabled: !has }));
+    const fc = city.freeCity || {};
+    const C = (AOW.Rules && AOW.Rules.C && AOW.Rules.C.FC) || {};
+    const mine = fc.vassalOf === p.id, atWar = (fc.warWith || []).includes(p.id), stone = (fc.stones || []).includes(p.id);
+    if (mine) wrap.appendChild(el('div', { class: 'aow-small aow-good', style: { width: '100%' } }, t('hud.freeCity.isVassal')));
+    const act = (label, action, o) => wrap.appendChild(UI.button(label, () => afterAction(call('Rules', 'freeCityAction', g, p, city, action)), Object.assign({ small: true, disabled: !has }, o)));
+    act(t('hud.freeCity.gift'), 'gift', { icon: 'gold', tooltip: C.GIFT_GOLD ? t('hud.freeCity.giftTip', { gold: C.GIFT_GOLD }) : null, disabled: !has || atWar });
+    act(t('hud.freeCity.whisper'), 'whisper', { icon: 'mana', disabled: !has || stone || atWar, tooltip: t('hud.freeCity.whisperTip') });
+    if (mine) act(t('hud.freeCity.integrate'), 'integrate', { icon: 'cities', kind: 'gold' });
+    else act(t('hud.freeCity.vassalize'), 'vassalize', { icon: UI.iconName('alliance', 'flag'), disabled: !has || atWar || fc.vassalOf >= 0, tooltip: C.VASSAL_OPINION ? t('hud.freeCity.needOpinion', { n: C.VASSAL_OPINION }) : null });
+    act(t('hud.freeCity.declareWar'), 'declare', { icon: 'sword', kind: 'danger', disabled: !has || atWar });
     return wrap;
   }
 
@@ -38607,6 +38927,12 @@ a { color: var(--gold-light); }
     return root;
   }
   function refreshSelection() { if (!els) return; const fresh = renderSelection(); els.selection.replaceWith(fresh); els.selection = fresh; }
+  let notifTimer = 0;
+  /** re-render only the notification list (debounced: a burst of 'notify' events costs one rebuild) */
+  function scheduleNotifRefresh() {
+    if (notifTimer) return;
+    notifTimer = setTimeout(() => { notifTimer = 0; if (!els || !root) return; const fresh = renderNotifications(); els.notif.replaceWith(fresh); els.notif = fresh; }, 0);
+  }
   function refreshAll() {
     if (!root) return;
     const fresh = { topbar: renderTopbar(), minimap: els.minimap, notif: renderNotifications(), selection: renderSelection(), bottom: renderBottomBar(), endturn: buildEndTurn() };
@@ -38624,6 +38950,7 @@ a { color: var(--gold-light); }
       off.push(AOW.Events.on('hex:click', onHexClick));
       off.push(AOW.Events.on('hex:dblclick', onHexDblClick));
       off.push(AOW.Events.on('hex:hover', onHexHover));
+      off.push(AOW.Events.on('notify', scheduleNotifRefresh));
       for (const name of ['turn:begin', 'city:changed', 'army:moved', 'research:complete', 'spell:cast', 'select:army', 'select:city', 'select:none', 'battle:end', 'game:new']) {
         off.push(AOW.Events.on(name, () => refreshAll()));
       }
@@ -38631,7 +38958,7 @@ a { color: var(--gold-light); }
     },
     close() {
       while (off.length) { const f = off.pop(); try { f(); } catch (e) { /* ignore */ } }
-      clearTimeout(hoverTimer);
+      clearTimeout(hoverTimer); clearTimeout(notifTimer); notifTimer = 0;
       if (hasFn('WorldRender', 'highlight')) safe(() => AOW.WorldRender.highlight(null, 'none'));
       root = null; els = null; mmCanvas = null; mmCtx = null; turnOverlayEl = null;
     },
@@ -38729,6 +39056,7 @@ a { color: var(--gold-light); }
       'city.ownedProvinces': '보유 지방', 'city.annexable': '병합 가능한 지방', 'city.annex': '병합', 'city.annexCost': '병합 비용', 'city.noAnnex': '병합할 수 있는 인접 지방이 없습니다.',
       'city.improvement': '개선물', 'city.buildImprovement': '개선물 건설…', 'city.noImprovement': '개선물 없음', 'city.resourceNode': '자원', 'city.material': '마법 재료',
       'city.homeProvince': '중심 지방', 'city.garrisonEmpty': '주둔한 유닛이 없습니다.', 'city.enchantEmpty': '적용된 도시 마법이 없습니다.', 'city.dispel': '해제',
+      'city.outpostNote': '전초기지입니다. 도시로 승격하면 인구가 자라고 건설과 모집을 할 수 있습니다.', 'city.upgrade': '도시로 승격', 'city.cityCapInfo': '도시 {n}/{cap}',
       'city.buildings': '건물', 'city.walls': '성벽', 'city.yields': '산출', 'city.cannotAfford': '자원이 부족합니다.', 'city.notOwner': '내 도시가 아닙니다.',
       // research
       'research.title': '연구', 'research.tomes': '마법서 서가', 'research.selected': '선택한 마법서', 'research.options': '연구 가능', 'research.current': '현재 연구',
@@ -38751,7 +39079,7 @@ a { color: var(--gold-light); }
       'hero.inventory': '보관함', 'hero.inventoryEmpty': '보관 중인 아이템이 없습니다.', 'hero.equip': '장착', 'hero.unequip': '해제', 'hero.ruler': '군주', 'hero.dead': '전사',
       'hero.slot.weapon': '무기', 'hero.slot.offhand': '보조', 'hero.slot.armor': '갑옷', 'hero.slot.helm': '투구', 'hero.slot.trinket': '장신구', 'hero.slot.mount': '탈것',
       'hero.signature': '전용 기술', 'hero.tier': '{n}단계', 'hero.minLevel': '레벨 {n} 필요', 'hero.needPrereq': '선행 기술 필요', 'hero.noPoints': '기술 점수가 없습니다',
-      'hero.stats': '능력치', 'hero.general': '일반 기술', 'hero.class': '직업', 'hero.grants': '능력 부여',
+      'hero.stats': '능력치', 'hero.general': '일반 기술', 'hero.class': '직업', 'hero.grants': '능력 부여', 'hero.needTome': '{name:을/를} 먼저 선택해야 합니다',
       'rarity.common': '일반', 'rarity.uncommon': '고급', 'rarity.rare': '희귀', 'rarity.epic': '영웅', 'rarity.legendary': '전설',
       // empire
       'empire.title': '제국 개발', 'empire.affinity': '친화도', 'empire.tree.general': '일반', 'empire.buy': '구매', 'empire.rite': '의식', 'empire.affinityReq': '{aff} 친화 {n} 필요',
@@ -38760,15 +39088,15 @@ a { color: var(--gold-light); }
       'dip.title': '외교', 'dip.state.peace': '평화', 'dip.state.war': '전쟁', 'dip.state.alliance': '동맹', 'dip.state.defensive_pact': '방어 동맹', 'dip.state.non_aggression': '불가침',
       'dip.opinion': '호감도', 'dip.treaties': '조약', 'dip.warScore': '전쟁 점수', 'dip.propose.peace': '평화 제안', 'dip.propose.non_aggression': '불가침', 'dip.propose.defensive_pact': '방어 동맹',
       'dip.propose.alliance': '동맹', 'dip.declareWar': '선전포고', 'dip.gift': '선물', 'dip.trade': '교역', 'dip.confirmWar': '{name}에게 선전포고하시겠습니까?',
-      'dip.accepted': '{name}이(가) 제안을 받아들였습니다.', 'dip.rejected': '{name}이(가) 제안을 거절했습니다.', 'dip.sent': '제안을 보냈습니다.', 'dip.noOthers': '다른 세력이 없습니다.',
-      'dip.giftAmount': '선물할 금', 'dip.give': '주는 것', 'dip.receive': '받는 것', 'dip.terms': '조건', 'dip.incoming': '{name}의 제안', 'dip.accept': '수락', 'dip.decline': '거절',
+      'dip.accepted': '{name:이/가} 제안을 받아들였습니다.', 'dip.rejected': '{name:이/가} 제안을 거절했습니다.', 'dip.sent': '제안을 보냈습니다.', 'dip.noOthers': '다른 세력이 없습니다.',
+      'dip.giftAmount': '선물할 금', 'dip.give': '주는 것', 'dip.receive': '받는 것', 'dip.terms': '조건', 'dip.incoming': '{name}의 제안', 'dip.theirOpinion': '{name}의 호감도', 'dip.moreWaiting': '대기 중인 제안 {n}건이 더 있습니다', 'dip.accept': '수락', 'dip.decline': '거절',
       'dip.grievances': '불만', 'dip.truce': '휴전 {n}턴', 'dip.dead': '멸망', 'dip.ruler': '군주', 'dip.personality.expansionist': '확장주의', 'dip.personality.militarist': '군국주의',
       'dip.personality.scholar': '학자', 'dip.personality.diplomat': '외교관', 'dip.turns': '{n}턴', 'dip.kind.gift': '선물', 'dip.kind.trade': '교역', 'dip.kind.peace': '평화',
       'dip.kind.non_aggression': '불가침 조약', 'dip.kind.defensive_pact': '방어 동맹', 'dip.kind.alliance': '동맹', 'dip.kind.war': '선전포고', 'dip.breakdown': '호감도 내역', 'dip.failed': '제안할 수 없습니다.',
       // victory
       'vic.victory': '승리', 'vic.defeat': '패배', 'vic.type.expansion': '확장 승리', 'vic.type.magic': '마법 승리', 'vic.type.military': '군사 승리', 'vic.type.score': '점수 승리',
       'vic.type.elimination': '정복 승리', 'vic.winner': '승자', 'vic.continue': '계속하기', 'vic.menu': '메인 메뉴', 'vic.stats': '통계', 'vic.turns': '턴', 'vic.cities': '도시', 'vic.units': '유닛',
-      'vic.territory': '영토', 'vic.score': '점수', 'vic.player': '세력', 'vic.subtitle.win': '{name}의 시대가 열렸습니다.', 'vic.subtitle.lose': '{name}이(가) 이 세계의 주인이 되었습니다.',
+      'vic.territory': '영토', 'vic.score': '점수', 'vic.player': '세력', 'vic.subtitle.win': '{name}의 시대가 열렸습니다.', 'vic.subtitle.lose': '{name:이/가} 이 세계의 주인이 되었습니다.',
       // encyclopedia
       'enc.title': '백과사전', 'enc.cat.cultures': '문화', 'enc.cat.forms': '종족', 'enc.cat.units': '유닛', 'enc.cat.tomes': '마법서', 'enc.cat.spells': '주문', 'enc.cat.buildings': '건물',
       'enc.cat.heroClasses': '영웅 직업', 'enc.cat.improvements': '개선물', 'enc.cat.wonders': '고대 유적', 'enc.cat.items': '아이템', 'enc.cat.abilities': '능력', 'enc.cat.statuses': '상태 효과',
@@ -38798,6 +39126,7 @@ a { color: var(--gold-light); }
       'city.ownedProvinces': 'Owned Provinces', 'city.annexable': 'Annexable Provinces', 'city.annex': 'Annex', 'city.annexCost': 'Annex cost', 'city.noAnnex': 'No adjacent province can be annexed.',
       'city.improvement': 'Improvement', 'city.buildImprovement': 'Build improvement…', 'city.noImprovement': 'No improvement', 'city.resourceNode': 'Resource', 'city.material': 'Magic material',
       'city.homeProvince': 'Home province', 'city.garrisonEmpty': 'No units garrisoned.', 'city.enchantEmpty': 'No city enchantments active.', 'city.dispel': 'Dispel',
+      'city.outpostNote': 'This is an outpost. Upgrade it to a city so it can grow, build and recruit.', 'city.upgrade': 'Upgrade to city', 'city.cityCapInfo': 'Cities {n}/{cap}',
       'city.buildings': 'Buildings', 'city.walls': 'Walls', 'city.yields': 'Yields', 'city.cannotAfford': 'Not enough resources.', 'city.notOwner': 'Not your city.',
       'research.title': 'Research', 'research.tomes': 'Tome Shelf', 'research.selected': 'Selected Tomes', 'research.options': 'Available Research', 'research.current': 'Current Research',
       'research.none': 'No research in progress. Start one from the list on the right.', 'research.start': 'Start', 'research.researched': 'Researched',
@@ -38817,7 +39146,7 @@ a { color: var(--gold-light); }
       'hero.inventory': 'Inventory', 'hero.inventoryEmpty': 'No items in the vault.', 'hero.equip': 'Equip', 'hero.unequip': 'Unequip', 'hero.ruler': 'Ruler', 'hero.dead': 'Fallen',
       'hero.slot.weapon': 'Weapon', 'hero.slot.offhand': 'Off-hand', 'hero.slot.armor': 'Armor', 'hero.slot.helm': 'Helm', 'hero.slot.trinket': 'Trinket', 'hero.slot.mount': 'Mount',
       'hero.signature': 'Signature skill', 'hero.tier': 'Tier {n}', 'hero.minLevel': 'Needs level {n}', 'hero.needPrereq': 'Needs prerequisite skill', 'hero.noPoints': 'No skill points',
-      'hero.stats': 'Stats', 'hero.general': 'General skills', 'hero.class': 'Class', 'hero.grants': 'Grants ability',
+      'hero.stats': 'Stats', 'hero.general': 'General skills', 'hero.class': 'Class', 'hero.grants': 'Grants ability', 'hero.needTome': 'Needs the {name} tome',
       'rarity.common': 'Common', 'rarity.uncommon': 'Uncommon', 'rarity.rare': 'Rare', 'rarity.epic': 'Epic', 'rarity.legendary': 'Legendary',
       'empire.title': 'Empire Development', 'empire.affinity': 'Affinity', 'empire.tree.general': 'General', 'empire.buy': 'Purchase', 'empire.rite': 'Rite', 'empire.affinityReq': 'Needs {aff} affinity {n}',
       'empire.noBuy': 'Empire skill purchase rules are not available yet.', 'empire.imperium': 'Imperium', 'empire.owned': 'Owned skills', 'empire.needPrereq': 'Needs prerequisite',
@@ -38825,7 +39154,7 @@ a { color: var(--gold-light); }
       'dip.opinion': 'Opinion', 'dip.treaties': 'Treaties', 'dip.warScore': 'War score', 'dip.propose.peace': 'Propose Peace', 'dip.propose.non_aggression': 'Non-aggression', 'dip.propose.defensive_pact': 'Defensive Pact',
       'dip.propose.alliance': 'Alliance', 'dip.declareWar': 'Declare War', 'dip.gift': 'Gift', 'dip.trade': 'Trade', 'dip.confirmWar': 'Declare war on {name}?',
       'dip.accepted': '{name} accepted the proposal.', 'dip.rejected': '{name} rejected the proposal.', 'dip.sent': 'Proposal sent.', 'dip.noOthers': 'There are no other rulers.',
-      'dip.giftAmount': 'Gold to gift', 'dip.give': 'You give', 'dip.receive': 'You receive', 'dip.terms': 'Terms', 'dip.incoming': 'Proposal from {name}', 'dip.accept': 'Accept', 'dip.decline': 'Decline',
+      'dip.giftAmount': 'Gold to gift', 'dip.give': 'You give', 'dip.receive': 'You receive', 'dip.terms': 'Terms', 'dip.incoming': 'Proposal from {name}', 'dip.theirOpinion': '{name}\'s opinion of you', 'dip.moreWaiting': '{n} more proposal(s) waiting', 'dip.accept': 'Accept', 'dip.decline': 'Decline',
       'dip.grievances': 'Grievances', 'dip.truce': 'Truce {n} turns', 'dip.dead': 'Eliminated', 'dip.ruler': 'Ruler', 'dip.personality.expansionist': 'Expansionist', 'dip.personality.militarist': 'Militarist',
       'dip.personality.scholar': 'Scholar', 'dip.personality.diplomat': 'Diplomat', 'dip.turns': '{n} turns', 'dip.kind.gift': 'Gift', 'dip.kind.trade': 'Trade', 'dip.kind.peace': 'Peace',
       'dip.kind.non_aggression': 'Non-aggression pact', 'dip.kind.defensive_pact': 'Defensive pact', 'dip.kind.alliance': 'Alliance', 'dip.kind.war': 'Declaration of war', 'dip.breakdown': 'Opinion breakdown', 'dip.failed': 'Cannot propose.',
@@ -38978,6 +39307,9 @@ a { color: var(--gold-light); }
   const CSS = `
   .sc-root{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(6,9,16,.62);z-index:20;font-family:var(--font-body);color:var(--text)}
   .sc-root .aow-panel{display:flex;flex-direction:column;max-height:94vh}
+  .aow-screen__inner:has(> .sc-root){animation:none}
+  .sc-root > .aow-panel{animation:aow-pop .18s ease}
+  .sc-root .sc-victory{animation:aow-fade .35s ease}
   .sc-panel{width:min(1280px,96vw)}
   .sc-panel-narrow{width:min(760px,94vw)}
   .sc-body{flex:1;overflow:auto;padding:12px 14px;min-height:200px;max-height:calc(94vh - 56px)}
@@ -39347,6 +39679,26 @@ a { color: var(--gold-light); }
     head.append(left, popBox, stabBox, ownerBox);
     return head;
   }
+  /** tier-0 outposts: explain the limits and offer the upgrade to a real city (imperium + free city-cap slot) */
+  function outpostBanner(g, city, player, isOwn) {
+    if (!isOwn || city.tier !== 0) return null;
+    const chk = fn('Rules', 'canUpgradeOutpost') ? fn('Rules', 'canUpgradeOutpost')(g, city) : null;
+    const cost = chk && chk.cost ? chk.cost.imperium : num(rulesC().OUTPOST_UPGRADE_IMPERIUM, 0);
+    const count = fn('Rules', 'cityCount') ? fn('Rules', 'cityCount')(g, player.id) : 0;
+    const cap = fn('Rules', 'cityCap') ? fn('Rules', 'cityCap')(g, player) : num(player.cityCap, 0);
+    const b = btn(t('city.upgrade'), () => {
+      const f = fn('Rules', 'upgradeOutpost'); if (!f) { toast('warn', t('sc.unavailable')); return; }
+      if (result(f(g, city))) sfx('city_founded');
+      if (AOW.Events) AOW.Events.emit('city:changed', { cityId: city.id });
+      after('city');
+    }, { kind: 'gold', disabled: !!(chk && chk.ok === false), tooltip: chk && chk.ok === false ? reasonText(chk) : null });
+    b.classList.add('sc-upgrade');
+    return mk('div', { class: 'sc-row sc-outpost' }, icon('outpost', 30),
+      mk('div', { class: 'grow' }, mk('div', { class: 'name' }, t('city.outpostNote')),
+        mk('div', { class: 'sub' }, t('city.cityCapInfo', { n: count, cap }), '  ·  ', res('imperium', cost, { size: 14 }),
+          chk && chk.ok === false ? mk('span', { class: 'bad' }, '  ' + reasonText(chk)) : null)),
+      b);
+  }
   function cityYieldRow(g, city) {
     const y = cityYields(g, city);
     const row = mk('div', { class: 'sc-yields' });
@@ -39397,7 +39749,7 @@ a { color: var(--gold-light); }
       for (const b of list.sort((a, c) => a.tier - c.tier)) {
         const isQ = queued.has(b.id);
         const cost = num(b.cost && b.cost.production, 0);
-        const row = mk('div', { class: 'sc-row' + (isQ ? ' disabled' : '') }, icon(CAT_ICON[cat], 30),
+        const row = mk('div', { class: 'sc-row' + (isQ ? ' disabled' : ''), 'data-building': b.id }, icon(CAT_ICON[cat], 30),
           mk('div', { class: 'grow' }, mk('div', { class: 'name' }, L(b.name), ' ', mk('span', { class: 'sc-badge' }, 'T' + b.tier)), mk('div', { class: 'sub' }, effectChips(b.effects))),
           mk('div', null, costRow(b.cost), mk('div', { class: 'sub', style: 'text-align:right' }, turnsText(turnsFor(cost, perTurn)))),
           isOwn ? btn(isQ ? t('city.queued') : t('city.build'), () => { const f = fn('Rules', 'enqueue'); if (!f) { toast('warn', t('sc.unavailable')); return; } if (result(f(g, city, { type: 'building', id: b.id }))) sfx('ui_click'); after('city'); }, { kind: 'primary', small: true, disabled: isQ }) : null);
@@ -39438,7 +39790,7 @@ a { color: var(--gold-light); }
     for (const id of ids.map(i => get('units', i)).filter(Boolean).sort((a, b) => a.tier - b.tier)) {
       let ok = { ok: true };
       if (can) { try { ok = can(g, city, id.id) || ok; } catch (e) { ok = { ok: true }; } }
-      const row = mk('div', { class: 'sc-row' + (ok.ok === false ? ' disabled' : '') }, Screens.unitPortrait(id, 52, { pid: city.owner }),
+      const row = mk('div', { class: 'sc-row' + (ok.ok === false ? ' disabled' : ''), 'data-unit': id.id }, Screens.unitPortrait(id, 52, { pid: city.owner }),
         mk('div', { class: 'grow' }, mk('div', { class: 'name' }, L(id.name), ' ', mk('span', { class: 'sc-badge' }, 'T' + id.tier), ' ', icon('role_' + id.role, 16), mk('span', { class: 'sub' }, ' ' + t('role.' + id.role))), unitStatsLine(id)),
         mk('div', null, costRow(id.cost), mk('div', { class: 'sub', style: 'text-align:right' }, turnsText(turnsFor(itemCost(g, city, { type: 'unit', id: id.id }), perTurn)))),
         isOwn ? btn(t('city.recruit'), () => { const f = fn('Rules', 'enqueue'); if (!f) { toast('warn', t('sc.unavailable')); return; } result(f(g, city, { type: 'unit', id: id.id })); sfx('recruit'); after('city'); }, { kind: 'primary', small: true, disabled: ok.ok === false, tooltip: ok.ok === false ? reasonText(ok) : '' }) : null);
@@ -39582,7 +39934,7 @@ a { color: var(--gold-light); }
       const tab = ctx.state.tab || 'build';
       const setTab = (id) => { ctx.state.tab = id; refreshScreen('city'); };
       const garrisonCount = garrisonUnits(g, city).length;
-      const body = [cityHeader(ctx, g, city, player, isOwn), cityYieldRow(g, city), cityQueue(g, city, isOwn, perTurn),
+      const body = [cityHeader(ctx, g, city, player, isOwn), outpostBanner(g, city, player, isOwn), cityYieldRow(g, city), cityQueue(g, city, isOwn, perTurn),
         tabs([{ id: 'build', label: t('city.tab.build'), icon: 'city' }, { id: 'recruit', label: t('city.tab.recruit'), icon: 'draft' }, { id: 'provinces', label: t('city.tab.provinces'), icon: 'node', count: (city.provinces || []).length },
           { id: 'garrison', label: t('city.tab.garrison'), icon: 'army', count: garrisonCount }, { id: 'magic', label: t('city.tab.magic'), icon: 'mana', count: (city.enchantments || []).length }], tab, setTab)];
       if (tab === 'build') body.push(buildTab(ctx, g, city, player, isOwn, perTurn));
@@ -39634,7 +39986,7 @@ a { color: var(--gold-light); }
       const row = mk('div', { class: 'sc-shelf-row' }, mk('div', { class: 'sc-shelf-tier' }, t('research.tierRow', { n: tier })));
       for (const tm of list) {
         const st = tomeState(g, player, tm);
-        const b = mk('div', { class: 'sc-book' + (st.owned ? ' owned' : '') + (st.locked ? ' locked' : ''), onclick: () => { ctx.state.viewTome = tm.id; refreshScreen('research'); } },
+        const b = mk('div', { class: 'sc-book' + (st.owned ? ' owned' : '') + (st.locked ? ' locked' : ''), 'data-tome': tm.id, onclick: () => { ctx.state.viewTome = tm.id; refreshScreen('research'); } },
           tomeIcon(tm.id, 44), mk('div', { class: 'affs' }, affIcons(tm.affinity, 9)),
           st.locked ? mk('span', { class: 'lock' }, icon('lock', 12)) : null,
           mk('div', { class: 'bname' }, L(tm.name)));
@@ -39663,6 +40015,8 @@ a { color: var(--gold-light); }
         if (result(f(g, player, tome.id))) sfx('coin');
         after('research');
       }, { kind: 'primary', disabled: st.locked, tooltip: st.locked ? st.reason : t('research.selectTip'), style: 'margin-top:8px' }));
+      // why it cannot be picked yet, spelled out (not only in the disabled button's tooltip)
+      if (st.locked && st.reason) box.appendChild(mk('div', { class: 'sub bad sc-lockreason', style: 'margin-top:6px' }, icon('lock', 12), ' ' + st.reason));
     }
     box.appendChild(mk('div', { class: 'sc-h', style: 'margin-top:12px' }, t('research.contents')));
     const done = new Set((player.research && player.research.done) || []);
@@ -39744,16 +40098,20 @@ a { color: var(--gold-light); }
   const HERO_SLOTS = ['weapon', 'offhand', 'armor', 'helm', 'trinket', 'mount'];
   function heroList(g, player) { return S() && S().playerHeroes ? S().playerHeroes(g, player.id) : g.heroes.filter(h => h.owner === player.id); }
   function heroXpNeed(g, hero) {
+    // Rules.heroXpForLevel(level) takes the level number (the xp needed to leave it)
     const f = fn('Rules', 'heroXpForLevel');
-    if (f) { try { const n = f(g, hero); if (n > 0) return n; } catch (e) { /* ignore */ } }
+    if (f) { try { const n = f(hero.level || 1); if (n > 0) return n; } catch (e) { /* ignore */ } }
     const C = rulesC();
     return Math.round(num(C.HERO_XP_PER_LEVEL, 60) * Math.pow(1.15, Math.max(0, (hero.level || 1) - 1)));
   }
-  function heroSkillsFor(hero) {
+  const tomeOfSkill = (id) => { const f = fn('Rules', 'tomeOfSkill'); return f ? f(id) : null; };
+  function heroSkillsFor(hero, player) {
     const all = D().list('heroSkills');
+    const unlocked = (player && player.unlocked && player.unlocked.skills) || [];
     return {
       classList: all.filter(s => s.class === hero.classId),
-      generalList: all.filter(s => !s.class && !s.rulerType),
+      // tome-taught skills join the list once researched (before that they are research rewards, not choices)
+      generalList: all.filter(s => !s.class && !s.rulerType && (!tomeOfSkill(s.id) || unlocked.includes(s.id) || (hero.skills || []).includes(s.id))),
       rulerList: hero.isRuler ? all.filter(s => s.rulerType && s.rulerType === hero.rulerType) : [],
     };
   }
@@ -39785,7 +40143,8 @@ a { color: var(--gold-light); }
   }
   function skillCard(game, hero, sk) {
     const learned = (hero.skills || []).includes(sk.id);
-    const avail = !learned && heroAvailable(game, hero, sk.id);
+    // Rules.heroAvailableSkills lists what is unlocked, not what is affordable: a point is needed too
+    const avail = !learned && heroAvailable(game, hero, sk.id) && num(hero.skillPoints) > 0 && !hero.dead;
     const cls = 'sc-skill' + (learned ? ' learned' : '') + (avail ? ' available' : (!learned ? ' locked' : '')) + (sk.signature ? ' signature' : '');
     const abilDef = sk.ability ? get('abilities', sk.ability) : null;
     let lockReason = '';
@@ -39793,8 +40152,10 @@ a { color: var(--gold-light); }
       if ((hero.level || 1) < (sk.minLevel || 1)) lockReason = t('hero.minLevel', { n: sk.minLevel || 1 });
       else if ((sk.prereq || []).some(p => !(hero.skills || []).includes(p))) lockReason = t('hero.needPrereq');
       else if (num(hero.skillPoints) <= 0) lockReason = t('hero.noPoints');
+      else if (hero.dead) lockReason = t('hero.dead');
+      else if (sk.tome || tomeOfSkill(sk.id)) { const tid = sk.tome || tomeOfSkill(sk.id), tm = get('tomes', tid); lockReason = t('hero.needTome', { name: tm ? L(tm.name) : tid }); }
     }
-    const card = mk('div', { class: cls },
+    const card = mk('div', { class: cls, 'data-skill': sk.id },
       mk('div', { class: 'sname' }, sk.signature ? icon('star', 12) : null, ' ', L(sk.name)),
       mk('div', { class: 'sdesc' }, L(sk.desc)),
       learned ? mk('span', { class: 'sc-badge good' }, t('hero.learned'))
@@ -39840,7 +40201,7 @@ a { color: var(--gold-light); }
     if (!list.length) { box.appendChild(emptyNote(t('hero.inventoryEmpty'))); return box; }
     for (const it of list) {
       const equippedHere = hero.items && hero.items[it.slot] === it.id;
-      const row = mk('div', { class: 'sc-row' }, icon(it.icon || ('item_' + it.slot), 30),
+      const row = mk('div', { class: 'sc-row', 'data-item': it.id }, icon(it.icon || ('item_' + it.slot), 30),
         mk('div', { class: 'grow' }, mk('div', { class: 'name c-' + it.rarity }, L(it.name), ' ', mk('span', { class: 'sc-badge' }, t('rarity.' + it.rarity))), mk('div', { class: 'sub' }, Screens.effectsText(it.effects) || L(it.desc))),
         equippedHere
           ? btn(t('hero.unequip'), () => { const f = fn('Rules', 'unequipItem'); if (!f) { toast('warn', t('sc.unavailable')); return; } result(f(game, hero, it.slot)); after('hero'); }, { small: true, kind: 'danger' })
@@ -39869,7 +40230,7 @@ a { color: var(--gold-light); }
       let hero = (ctx.state.heroId !== undefined ? S().hero(g, ctx.state.heroId) : null) || heroes.find(h => h.isRuler) || heroes[0];
       if (!hero || hero.owner !== player.id) return emptyNote(t('sc.notFound'));
       const unit = hero.unitId >= 0 ? S().unit(g, hero.unitId) : null;
-      const { classList, generalList, rulerList } = heroSkillsFor(hero);
+      const { classList, generalList, rulerList } = heroSkillsFor(hero, player);
       const cls = get('heroClasses', hero.classId);
       const left = mk('div', { class: 'sc-col-side' }, heroTabs(ctx, g, heroes, hero.id));
       const midParts = [
@@ -39928,7 +40289,7 @@ a { color: var(--gold-light); }
       const prereqOk = (n.prereq || []).every(p => owned.has(p));
       const affOk = empireAffinityMeets(player, n);
       const canBuy = !isOwned && prereqOk && affOk;
-      const cell = mk('div', { class: 'sc-node' + (isOwned ? ' owned' : (canBuy ? ' available' : ' locked')) + (n.rite ? ' rite' : ''), style: { left: pos[n.id].x + 'px', top: pos[n.id].y + 'px' } },
+      const cell = mk('div', { class: 'sc-node' + (isOwned ? ' owned' : (canBuy ? ' available' : ' locked')) + (n.rite ? ' rite' : ''), 'data-empire': n.id, style: { left: pos[n.id].x + 'px', top: pos[n.id].y + 'px' } },
         mk('div', { class: 'nname' }, n.rite ? icon('star', 12) : null, L(n.name)),
         mk('div', { class: 'nsub' }, res('imperium', n.cost && n.cost.imperium, { size: 12 })),
         isOwned ? mk('span', { class: 'sc-badge good' }, t('sc.owned'))
@@ -40065,17 +40426,39 @@ a { color: var(--gold-light); }
   const proposalQueue = [];
   Screens.showProposal = function (proposal) {
     const g = game(); if (!g || !proposal) return;
+    // a proposal the engine no longer has pending (superseded by a newer one of the same kind) is not shown
+    const stillPending = p => !g.pendingProposals || p.id === undefined || g.pendingProposals.some(x => x.id === p.id);
+    if (!stillPending(proposal)) {
+      if (!(proposalModal && proposalModal.closed === false)) { const next = proposalQueue.shift(); if (next) Screens.showProposal(next); }
+      return;
+    }
     if (proposalModal && proposalModal.closed === false) {   // (=== false: the fallback modal has no such flag)
+      // one queued modal per realm and kind: a re-sent proposal replaces the waiting one
+      for (let i = proposalQueue.length - 1; i >= 0; i--) if (proposalQueue[i].from === proposal.from && proposalQueue[i].kind === proposal.kind) proposalQueue.splice(i, 1);
       if (!proposalQueue.some(p => p === proposal || (p.id !== undefined && p.id === proposal.id))) proposalQueue.push(proposal);
       return;
     }
     const from = g.players[proposal.from];
     const kindNameFn = fn('Diplomacy', 'kindName');
     const answer = (accept) => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, proposal, accept); refreshUI(); refreshScreen('diplomacy'); };
+    // what is actually on the table, from the recipient's side: the proposer's mood, what we get / give
+    const me = human(g);
+    const resList = (obj) => Object.keys(obj || {}).filter(k => num(obj[k]) > 0).map(k => (AOW.I18n.has('ui.res_' + k) ? t('ui.res_' + k) : k) + ' ' + fmt(obj[k])).join(', ');
+    const terms = proposal.terms || {};
+    const lines = [];
+    const opFn = fn('Diplomacy', 'opinion'), labFn = fn('Diplomacy', 'opinionLabel');
+    if (from && me && opFn) { const op = opFn(g, from.id, me.id); lines.push(mk('div', { class: 'sub' }, t('dip.theirOpinion', { name: from.name }) + ': ', mk('b', null, (labFn ? t('dip.opinion.' + labFn(op).key) + ' ' : '') + '(' + fmtSigned(op) + ')'))); }
+    if (proposal.kind === 'trade') {
+      if (resList(terms.give)) lines.push(mk('div', { class: 'sub good' }, t('dip.receive') + ': ' + resList(terms.give)));
+      if (resList(terms.get)) lines.push(mk('div', { class: 'sub bad' }, t('dip.give') + ': ' + resList(terms.get)));
+      if (terms.turns) lines.push(mk('div', { class: 'sub' }, t('dip.turns', { n: terms.turns })));
+    } else if (proposal.kind === 'demand' && resList(terms)) lines.push(mk('div', { class: 'sub bad' }, t('dip.give') + ': ' + resList(terms)));
+    else if (proposal.kind === 'gift' && resList(terms)) lines.push(mk('div', { class: 'sub good' }, t('dip.receive') + ': ' + resList(terms)));
+    else if (proposal.kind === 'peace' && num(terms.gold) > 0) lines.push(mk('div', { class: 'sub good' }, t('dip.receive') + ': ' + resList({ gold: terms.gold })));
     proposalModal = modal({
       title: t('dip.incoming', { name: from ? from.name : '?' }), icon: 'diplomacy', width: 420,
-      body: mk('div', null, mk('div', { class: 'sc-h' }, kindNameFn ? L(kindNameFn(proposal.kind)) : proposal.kind),
-        proposalQueue.length ? mk('div', { class: 'sub' }, '+' + proposalQueue.length) : null),
+      body: mk('div', { class: 'sc-proposal' }, mk('div', { class: 'sc-h' }, kindNameFn ? L(kindNameFn(proposal.kind)) : proposal.kind), lines,
+        proposalQueue.length ? mk('div', { class: 'sub dim', style: 'margin-top:6px' }, t('dip.moreWaiting', { n: proposalQueue.length })) : null),
       buttons: [
         { label: t('dip.decline'), kind: 'ghost', onClick: () => answer(false) },
         { label: t('dip.accept'), kind: 'primary', onClick: () => answer(true) },
@@ -40116,16 +40499,26 @@ a { color: var(--gold-light); }
         const rows = [mk('tr', null, mk('th', null, t('vic.player')), mk('th', null, t('vic.cities')), mk('th', null, t('vic.units')), mk('th', null, t('vic.territory')), mk('th', null, t('vic.score')))];
         for (const pl of g.players) {
           const isWinner = winner && pl.id === winner.id;
-          rows.push(mk('tr', null,
-            mk('td', { style: isWinner ? 'color:var(--gold-light);font-weight:700' : '' }, pl.name + (isWinner ? ' ★' : '')),
-            mk('td', null, String(num(pl.stats && pl.stats.cities))), mk('td', null, String(num(pl.stats && pl.stats.units))),
-            mk('td', null, String(num(pl.stats && pl.stats.territory))), mk('td', null, String(num(pl.stats && pl.stats.score)))));
+          const dead = pl.alive === false;
+          // live counts (a fallen realm's cached stats still show what it had before it fell)
+          const cities = g.cities.filter(c => c.owner === pl.id && c.tier >= 1).length;
+          const units = g.units.filter(u => u.owner === pl.id).length;
+          const land = g.provinces.filter(q => q.owner === pl.id).length;
+          rows.push(mk('tr', { style: dead ? 'opacity:.55' : '' },
+            mk('td', { style: isWinner ? 'color:var(--gold-light);font-weight:700' : '' }, pl.name + (isWinner ? ' ★' : ''), dead ? mk('span', { class: 'sub' }, ' (' + t('dip.dead') + ')') : null),
+            mk('td', null, String(cities)), mk('td', null, String(units)),
+            mk('td', null, String(land)), mk('td', null, String(num(pl.stats && pl.stats.score)))));
         }
         box.appendChild(mk('div', { class: 'sub' }, t('vic.turns') + ': ' + g.turn));
         box.appendChild(mk('table', null, rows));
       }
       box.appendChild(mk('div', { class: 'aow-row', style: 'display:flex;gap:12px;margin-top:6px' },
-        btn(t('vic.continue'), () => closeScreen(), { kind: 'gold', large: true }),
+        btn(t('vic.continue'), () => {
+          // keep playing after the result: Turn.endTurn only stops for a victory nobody has acknowledged yet
+          if (g && g.victory) g.victory.continued = true;
+          const mood = fn('Music', 'setMood'); if (mood) { try { mood('peace'); } catch (e) { /* audio optional */ } }
+          closeScreen();
+        }, { kind: 'gold', large: true }),
         btn(t('vic.menu'), () => { const f = fn('UI', 'quitToMenu'); if (f) f(); else closeScreen(); }, { large: true })));
       return box;
     },
@@ -40259,6 +40652,18 @@ a { color: var(--gold-light); }
       const me = human(g); if (!me || p.to !== me.id) return;
       Screens.showProposal(p.proposal || p);
     });
+    // someone won (Turn → Events 'victory' {type, winner}): show the victory / defeat screen once the turn has
+    // finished processing (the event fires in the middle of Turn.endTurn)
+    AOW.Events.on('victory', (v) => {
+      if (!v) return;
+      setTimeout(() => {
+        const g = game(); if (!g || !g.victory || g.victory.continued) return;
+        const me = human(g), won = !!(me && me.id === v.winner);
+        const show = fn('UI', 'showScreen'); if (show) show('victory', { type: v.type, winner: v.winner });
+        const mood = fn('Music', 'setMood'); if (mood) { try { mood(won ? 'victory' : 'defeat'); } catch (e) { /* audio optional */ } }
+        sfx(won ? 'victory_fanfare' : 'defeat');
+      }, 0);
+    });
   }
   Screens.registerAll();
 })(window.AOW = window.AOW || {});
@@ -40297,7 +40702,7 @@ a { color: var(--gold-light); }
   // ------------------------------------------------------------------ i18n
   AOW.I18n.add({
     ko: {
-      'battle.round': '{n}라운드', 'battle.you': '아군', 'battle.enemy': '적군', 'battle.sideN': '{n}번 진영',
+      'battle.round': '{n}라운드', 'battle.you': '아군', 'battle.enemy': '적군', 'battle.sideN': '{n}번 진영', 'battle.guardiansOf': '{name} 수호자', 'battle.lairBeasts': '소굴의 괴물들', 'battle.wild': '야생 세력',
       'battle.autoResolve': '자동 전투', 'battle.autoResolveTip': '전투를 자동으로 해결합니다', 'battle.autoResolveConfirm': '전투를 자동으로 해결할까요?\n직접 지휘할 수 없게 됩니다.',
       'battle.retreat': '후퇴', 'battle.retreatTip': '전장에서 후퇴합니다', 'battle.retreatLocked': '3라운드부터 후퇴할 수 있습니다',
       'battle.retreatConfirm': '후퇴하시겠습니까?\n부대가 전장을 이탈합니다.',
@@ -40312,7 +40717,7 @@ a { color: var(--gold-light); }
       'battle.inspired': '사기 충천', 'battle.breach': '성벽 붕괴!', 'battle.notYourTurn': '지금은 행동할 수 없습니다', 'battle.spellCast': '{name} 시전',
     },
     en: {
-      'battle.round': 'Round {n}', 'battle.you': 'Your forces', 'battle.enemy': 'Enemy', 'battle.sideN': 'Side {n}',
+      'battle.round': 'Round {n}', 'battle.you': 'Your forces', 'battle.enemy': 'Enemy', 'battle.sideN': 'Side {n}', 'battle.guardiansOf': 'Guardians of {name}', 'battle.lairBeasts': 'Lair monsters', 'battle.wild': 'Wild forces',
       'battle.autoResolve': 'Auto-resolve', 'battle.autoResolveTip': 'Resolve this battle automatically', 'battle.autoResolveConfirm': 'Auto-resolve this battle?\nYou will no longer command it directly.',
       'battle.retreat': 'Retreat', 'battle.retreatTip': 'Withdraw from the battlefield', 'battle.retreatLocked': 'Available from round 3',
       'battle.retreatConfirm': 'Retreat from battle?\nYour army will leave the field.',
@@ -40437,6 +40842,16 @@ a { color: var(--gold-light); }
     const g = AOW.game, pid = sidePlayerId(battle, s);
     const p = g && pid !== null && pid !== undefined ? g.players[pid] : null;
     if (p) return p.name || (p.isHuman ? t('battle.you') : t('battle.enemy'));
+    // a neutral side is named after what it holds (wonder guardians, lair beasts, a free city's garrison)
+    const hex = battle && battle.hexIdx;
+    if (g && hex !== undefined && hex !== null && hex >= 0 && AOW.State) {
+      const st = AOW.State.structureAt ? safe(() => AOW.State.structureAt(g, hex), null) : null;
+      if (st && st.kind === 'wonder' && AOW.Data.has('wonders', st.refId)) return t('battle.guardiansOf', { name: L(AOW.Data.get('wonders', st.refId).name) });
+      if (st && st.kind === 'infestation') return t('battle.lairBeasts');
+      const c = AOW.State.cityAt ? safe(() => AOW.State.cityAt(g, hex), null) : null;
+      if (c && c.owner < 0) return c.name;
+      return t('battle.wild');
+    }
     return t('battle.sideN', { n: s + 1 });
   }
   function currentSide() {
@@ -40977,8 +41392,15 @@ a { color: var(--gold-light); }
       if (xpMine) body.appendChild(el('div', { class: 'aow-small aow-gold' }, t('battle.xpGained', { n: UI.fmt(xpMine) })));
       if (result.loot && typeof result.loot === 'object') {
         const row = el('div', { class: 'aow-row aow-wrap aow-gap-s' });
+        if (result.loot.title) body.appendChild(el('div', { class: 'aow-gold aow-small' }, L(result.loot.title)));
         for (const k of Object.keys(result.loot)) if (typeof result.loot[k] === 'number' && result.loot[k]) row.appendChild(UI.resource(k, result.loot[k]));
         if (row.children.length) body.appendChild(row);
+        // items found at a cleared site go to the vault (equip them in the hero screen)
+        const items = Array.isArray(result.loot.items) ? result.loot.items : [];
+        for (const id of items) {
+          const it = AOW.Data && AOW.Data.has('items', id) ? AOW.Data.get('items', id) : null;
+          body.appendChild(el('div', { class: 'aow-row aow-gap-s aow-small battle-loot-item' }, UI.icon(UI.iconName(it && it.icon, 'item_' + (it ? it.slot : 'trinket'), 'star') || 'star', 18), el('b', null, it ? L(it.name) : id)));
+        }
       }
       const cityId = result.capturedCityId !== undefined ? result.capturedCityId : null;
       const cityName = cityId != null && AOW.game && AOW.State && AOW.State.city
@@ -41186,9 +41608,14 @@ a { color: var(--gold-light); }
       const errs = AOW.Data.validate();
       if (errs.length) console.warn('[Data.validate] ' + errs.length + ' problems', errs.slice(0, 40));
     } catch (e) { console.warn('validate failed', e); }
-    // audio unlock on first gesture
+    // audio unlock on first gesture: create the AudioContext and start the mood playlist (nothing else ever
+    // calls Music.play, so without this the game stays silent)
     const unlock = () => {
-      try { if (hasFn('Audio', 'init')) AOW.Audio.init(); if (hasFn('Music', 'setMood') && !AOW.game) AOW.Music.setMood('menu'); } catch (e) { console.warn(e); }
+      try {
+        if (hasFn('Audio', 'init')) AOW.Audio.init();
+        if (hasFn('Music', 'setMood')) AOW.Music.setMood(AOW.battle ? 'battle' : AOW.game ? 'peace' : 'menu');
+        if (hasFn('Music', 'play') && hasFn('Music', 'isPlaying') && !AOW.Music.isPlaying() && !(hasFn('Music', 'isPaused') && AOW.Music.isPaused())) AOW.Music.play(null);
+      } catch (e) { console.warn(e); }
       window.removeEventListener('pointerdown', unlock); window.removeEventListener('keydown', unlock);
     };
     window.addEventListener('pointerdown', unlock); window.addEventListener('keydown', unlock);
@@ -41231,6 +41658,43 @@ a { color: var(--gold-light); }
     const battle = AOW.Combat.create(g, { attackerArmyIds: [a.id], defenderArmyIds: [b.id], hexIdx: b.hex });
     AOW.Events.emit('battle:start', { battle });
     return battle.id;
+  };
+  /** move an army straight to hexIdx (no pathing/MP) and refresh vision + renderer — test setup helper */
+  Debug.teleportArmy = function (armyId, hexIdx) {
+    const g = AOW.game; if (!g) return false;
+    const a = AOW.State.army(g, armyId); if (!a) return false;
+    a.hex = hexIdx; a.path = null;
+    if (a.owner >= 0 && hasFn('Rules', 'recomputeVisibility')) AOW.Rules.recomputeVisibility(g, a.owner);
+    if (hasFn('WorldRender', 'invalidate')) AOW.WorldRender.invalidate(null);
+    if (hasFn('UI', 'refresh')) AOW.UI.refresh();
+    return true;
+  };
+  /** drop every unit of an army to `hp` (default 1) — makes a guard stack beatable in a test */
+  Debug.weakenArmy = function (armyId, hp = 1) {
+    const g = AOW.game; if (!g) return 0;
+    const a = AOW.State.army(g, armyId); if (!a) return 0;
+    for (const uid of a.units) { const u = AOW.State.unit(g, uid); if (u) u.hp = Math.min(u.hp, hp); }
+    return a.units.length;
+  };
+  /** knock a realm out of the game: its cities become free cities, its armies and vassal ties vanish and it is
+   *  marked dead at once (so it cannot act again before the next elimination check) */
+  Debug.eliminate = function (pid) {
+    const g = AOW.game; if (!g) return false;
+    const p = g.players[pid]; if (!p) return false;
+    for (const a of g.armies.slice()) if (a.owner === pid) AOW.State.removeArmy(g, a.id);
+    for (const c of g.cities) if (c.owner === pid) {
+      c.owner = -1; c.isCapital = false; c.queue = [];
+      if (p.capitalId === c.id) p.capitalId = -1;
+      c.freeCity = { culture: p.cultureId, form: p.formId, opinion: {}, vassalOf: -1, integrated: false, stones: [], warWith: [] };
+      const st = AOW.State.structureAt(g, c.hex); if (st) { st.kind = 'free_city'; st.owner = -1; }
+      for (const pr of c.provinces || []) { const prov = g.provinces[pr]; if (prov) { prov.owner = -1; for (const h of prov.hexes) g.owner[h] = -1; } }
+    }
+    for (const u of g.units.slice()) if (u.owner === pid && hasFn('State', 'removeUnit')) AOW.State.removeUnit(g, u.id);
+    for (const c of g.cities) if (c.freeCity && c.freeCity.vassalOf === pid) c.freeCity.vassalOf = -1;
+    p.alive = false;
+    if (hasFn('Rules', 'notifyWorld')) AOW.Rules.notifyWorld(g, 'warn', { ko: p.name + ' 세력이 멸망했습니다.', en: p.name + ' has been eliminated.' }, 'skull', { pid });
+    if (hasFn('WorldRender', 'invalidate')) AOW.WorldRender.invalidate(null);
+    return true;
   };
   Debug.endTurn = function (n = 1) { for (let i = 0; i < n; i++) AOW.Turn.endTurn(AOW.game); return AOW.game.turn; };
   Debug.stats = function () {

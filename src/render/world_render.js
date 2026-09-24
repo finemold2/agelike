@@ -23,8 +23,10 @@
 //   {frameMs, fps, builds, fogBuilds (chunk/fog rebuilds THIS frame, budget-capped), totalChunkBuilds,
 //    totalFogBuilds (lifetime), chunkMsMax, lastChunkMs, lastFogMs, chunks, drawn:{chunks,structs,armies},
 //    t:{chunks,water,borders,entities,vfx,fog,clouds,labels,vignette} per-section ms (ewma, indicative only —
-//    a software/SwiftShader canvas backend can defer rasterization past the section that recorded it)},
+//    a software/SwiftShader canvas backend can defer rasterization past the section that recorded it; set
+//    WorldRender.profileRaster = true to flush the canvas at every section mark so t shows real raster cost)},
 //   WorldRender.resize(), WorldRender.setZoom(z, sx, sy), WorldRender.hoverIdx, WorldRender.chunkCount().
+// The screen vignette is a CSS overlay div (.world-vignette) inserted after the canvas by init().
 // Events emitted: 'hex:hover' {idx}, 'hex:click' {idx, button, shift, ctrl, alt, x, y}, 'hex:dblclick' {idx}.
 //
 // Info object handed to TerrainArt.drawChunk's getInfo(col,row):
@@ -36,6 +38,7 @@
   const ZOOM_MIN = 0.35, ZOOM_MAX = 2.2;
   const LOD_ZOOM = 0.7;                  // zoom ≥ LOD_ZOOM → detailed chunks, else simplified half-res chunks
   const LOD_SCALE = [0.5, 1];            // canvas scale per LOD
+  const VIEW_BG = '#0b1320';             // colour beyond the map edge (view clear + opaque chunk backing)
   const MAX_CHUNK_BUILDS = 2;            // terrain chunk rebuilds per frame
   const MAX_FOG_BUILDS = 3;              // fog chunk rebuilds per frame
   const MAX_CHUNKS = 90;                 // LRU cap of cached chunk canvases (all LODs)
@@ -83,7 +86,8 @@
   const scratchInfo = { terrain: 'grass', feature: 'none', height: 0.4, seed: 1, river: 0, road: 0, neighbors: null, neighborHeights: null, neighborSnow: null, coast: 0, snow: 0, owner: null, size: 36 };
   let minimapCache = { cv: null, w: 0, h: 0, dirty: true, fogDirty: true, lastFog: 0 };
   let vignette = { cv: null, w: 0, h: 0 };
-  let waterLayer = { cv: null, ctx: null, w: 0, h: 0, stamp: -1, camX: 0, camY: 0, zoom: 0 };
+  let vignetteEl = null;           // CSS overlay used instead of drawVignette() once init() has run
+  let waterLayer = { key: null, batch: null };     // cached shimmer strokes (see drawWaterLayer)
   let cloudSprites = null;
   let bound = false;
 
@@ -99,6 +103,14 @@
   WR.init = function (cv, g) {
     canvas = cv;
     ctx = cv.getContext('2d');
+    // the screen vignette is a CSS overlay (composited by the browser) instead of a full-screen canvas blit every
+    // frame — that blit alone cost ~4 ms/frame under software rasterization
+    if (!vignetteEl && cv.parentNode) {
+      vignetteEl = document.createElement('div');
+      vignetteEl.className = 'world-vignette';
+      vignetteEl.style.cssText = 'position:absolute;inset:0;pointer-events:none;';
+      cv.parentNode.insertBefore(vignetteEl, cv.nextSibling);
+    }
     bindInput();
     WR.resize();
     if (g) WR.setGame(g);
@@ -116,6 +128,11 @@
     const pw = Math.round(viewW * dpr), ph = Math.round(viewH * dpr);
     if (canvas.width !== pw || canvas.height !== ph) { canvas.width = pw; canvas.height = ph; }
     vignette.cv = null;
+    if (vignetteEl) {
+      // same geometry as the old canvas gradient: circle, clear to 0.45·min(w,h), 0.42 dark at 0.72·max(w,h)
+      const r0 = Math.round(Math.min(viewW, viewH) * 0.45), r1 = Math.round(Math.max(viewW, viewH) * 0.72);
+      vignetteEl.style.background = 'radial-gradient(circle at 50% 50%, rgba(8,10,24,0) ' + r0 + 'px, rgba(8,10,24,0.42) ' + r1 + 'px)';
+    }
   };
 
   WR.setGame = function (g) {
@@ -124,7 +141,7 @@
     leadCache.clear(); labelCache.clear(); moveAnims.clear();
     highlights.clear(); pathPreview = null; selection = { armyId: null, cityId: null };
     minimapCache.dirty = true; minimapCache.fogDirty = true;
-    waterLayer.stamp = -1;
+    waterLayer.key = null; waterLayer.batch = null;
     if (!g) return;
     viewerPid = 0;
     for (let i = 0; i < g.players.length; i++) if (g.players[i].isHuman) { viewerPid = i; break; }
@@ -166,6 +183,15 @@
   }
 
   // ================================================================ camera helpers
+  /** world rect covered by the union of all chunk cut rectangles (see getChunk) */
+  function chunkCover() {
+    if (!chunkCover.c || chunkCover.g !== game) {
+      const Hx = Hex();
+      chunkCover.g = game;
+      chunkCover.c = { x0: Hx.toPixel(0, 0).x - Hx.W * 0.25, x1: Hx.toPixel(game.W - 1, 0).x + Hx.W * 0.75, y0: Hx.toPixel(0, 0).y - Hx.SIZE * 0.75, y1: Hx.toPixel(0, game.H - 1).y + Hx.SIZE * 0.75 };
+    }
+    return chunkCover.c;
+  }
   function mapBounds() {
     const Hx = Hex();
     return { x0: 0, y0: 0, x1: (game.W + 0.5) * Hx.W, y1: game.H * Hx.ROW_H + Hx.SIZE * 0.5 };
@@ -260,9 +286,11 @@
       const cutY0 = Hx.toPixel(0, r0).y - Hx.SIZE * 0.75, cutY1 = Hx.toPixel(0, r1).y + Hx.SIZE * 0.75;
       const padX = Hx.W * 1.25, padTop = Hx.SIZE * 3.2, padBot = Hx.SIZE * 1.6;
       const scale = LOD_SCALE[lod];
-      const ox = cutX0 - padX, oy = cutY0 - padTop;
-      const w = Math.ceil((cutX1 - cutX0 + padX * 2) * scale), h = Math.ceil((cutY1 - cutY0 + padTop + padBot) * scale);
+      // whole-unit canvas origin: at zoom 1 the per-frame blit is then a pixel-aligned copy (see blitCut)
+      const ox = Math.floor(cutX0 - padX), oy = Math.floor(cutY0 - padTop);
+      const w = Math.ceil((cutX1 + padX - ox) * scale), h = Math.ceil((cutY1 + padBot - oy) * scale);
       ch = { lod, cx, cy, c0, c1, r0, r1, cutX0, cutY0, cutW: cutX1 - cutX0, cutH: cutY1 - cutY0, ox, oy, w, h, scale,
+        border: c0 === 0 || r0 === 0 || c1 >= game.W - 1 || r1 >= game.H - 1,
         cv: null, ctx: null, built: false, dirty: true, fogDim: null, fogCloud: null, fogBuilt: false, fogDirty: true, fogHasCloud: false, fogHasDim: false,
         borders: null, provPath: null, lastUse: 0, serial: 0, buildMs: 0 };
       map.set(k, ch);
@@ -301,10 +329,15 @@
 
   function buildChunk(ch) {
     const t0 = performance.now();
-    if (!ch.cv) { const o = Art().canvas(ch.w, ch.h); ch.cv = o.cv; ch.ctx = o.ctx; }
+    if (!ch.cv) {
+      // opaque backing store: every frame blits ~20 of these, and an opaque source lets the rasterizer copy
+      // instead of alpha-blend (≈1.5 ms/frame in software). Off-map corners get the view background colour.
+      const cv = document.createElement('canvas'); cv.width = Math.max(1, ch.w); cv.height = Math.max(1, ch.h);
+      ch.cv = cv; ch.ctx = cv.getContext('2d', { alpha: false });
+    }
     const c = ch.ctx;
     c.setTransform(1, 0, 0, 1, 0, 0);
-    c.clearRect(0, 0, ch.w, ch.h);
+    c.fillStyle = VIEW_BG; c.fillRect(0, 0, ch.w, ch.h);
     c.save();
     c.scale(ch.scale, ch.scale);
     TerrainArt().drawChunk(c, hexInfo, ch.c0 - 1, ch.c1 + 1, ch.r0 - 1, ch.r1 + 1, ch.ox, ch.oy, { zoom: ch.lod ? 1 : 0.5 });
@@ -413,14 +446,16 @@
     const t0 = performance.now();
     time += dt; frameNo++;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#0b1320';
-    ctx.fillRect(0, 0, viewW, viewH);
-    if (!game) { drawVignette(); return; }
+    if (!game) { ctx.fillStyle = VIEW_BG; ctx.fillRect(0, 0, viewW, viewH); drawVignette(); return; }
     updateCamera(dt);
     updateMoveAnims(dt);
     if (hasFn('VFX', 'update')) { try { AOW.VFX.update(dt); } catch (e) { /* ignore */ } }
     computeView();
     updateCamSnap();
+    // the chunk cuts tile the whole map opaquely (placeholders too), so the clear is only needed where the
+    // view reaches past the map — one full-screen fill saved per frame in the common case
+    const cover = chunkCover();
+    if (shake.x || shake.y || view.x0 < cover.x0 || view.x1 > cover.x1 || view.y0 < cover.y0 || view.y1 > cover.y1) { ctx.fillStyle = VIEW_BG; ctx.fillRect(0, 0, viewW, viewH); }
     const lod = cam.zoom >= LOD_ZOOM ? 1 : 0;
     // ---- terrain chunks
     const cx0 = Math.floor(view.c0 / CHUNK), cx1 = Math.floor(view.c1 / CHUNK), cy0 = Math.floor(view.r0 / CHUNK), cy1 = Math.floor(view.r1 / CHUNK);
@@ -429,7 +464,7 @@
     // order: centre-out so the middle of the screen is never the last to appear
     const order = chunkOrder(cx0, cx1, cy0, cy1);
     ctx.save();
-    ctx.translate(viewW / 2 + shake.x, viewH / 2 + shake.y);
+    ctx.translate(Math.round(viewW / 2 + shake.x), Math.round(viewH / 2 + shake.y));
     ctx.scale(cam.zoom, cam.zoom);
     ctx.translate(-camSnap.x, -camSnap.y);
     ctx.imageSmoothingEnabled = true;
@@ -438,6 +473,16 @@
       const cx = order[i], cy = order[i + 1];
       const ch = getChunk(lod, cx, cy, true);
       ch.lastUse = frameNo;
+      // a chunk that is unexplored all over would only be painted over by its (opaque) fog canvas: skip the
+      // terrain blit and build here; the fog pass fills its cut with the world-aligned parchment pattern instead
+      // (one opaque fill instead of terrain blit + alpha fog blit). The pattern is phase-locked to world space
+      // exactly like buildFog's, so it meets the neighbours' feathered fog seamlessly.
+      // (map-border chunks keep the blurred fog canvas: it fades the parchment out at the edge of the world)
+      if (ch.fogBuilt && !ch.fogDirty && ch.fogAllCloud && !ch.border && TerrainArt() && TerrainArt().fillFog) {
+        ch.patternFrame = frameNo;
+        stats.drawn.chunks++;
+        continue;
+      }
       if (ch.dirty && (builds < MAX_CHUNK_BUILDS || buildAll)) { buildChunk(ch); builds++; }
       let src = ch.built ? ch : null;
       if (!src) { const alt = getChunk(1 - lod, cx, cy, false); if (alt && alt.built) src = alt; }
@@ -445,8 +490,8 @@
         drawChunkCut(src);
         stats.drawn.chunks++;
       } else {
-        // not yet rendered: flat placeholder in the average terrain colour of the chunk
-        ctx.fillStyle = 'rgba(40,70,60,0.5)';
+        // not yet rendered: flat opaque placeholder (the view is not cleared under the map, see chunkCover)
+        ctx.fillStyle = '#1a2d2e';
         ctx.fillRect(ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
       }
     }
@@ -459,7 +504,7 @@
     __p = mark('water', __p);
     // ---- world-space overlays (borders, structures, armies, highlights, fog …)
     ctx.save();
-    ctx.translate(viewW / 2 + shake.x, viewH / 2 + shake.y);
+    ctx.translate(Math.round(viewW / 2 + shake.x), Math.round(viewH / 2 + shake.y));
     ctx.scale(cam.zoom, cam.zoom);
     ctx.translate(-camSnap.x, -camSnap.y);
     drawBorders(lod, cx0, cx1, cy0, cy1);
@@ -477,7 +522,20 @@
       const ch = getChunk(lod, order[i], order[i + 1], false);
       if (!ch) continue;
       if (ch.fogDirty && (fogBuilds < MAX_FOG_BUILDS || buildAll)) { buildFog(ch); fogBuilds++; }
-      if (ch.fogBuilt) drawFogChunk(ch);
+      if (ch.patternFrame === frameNo) {
+        // fully unexplored (see the chunk pass): opaque parchment over whatever borders/armies lie beneath
+        const e = 1 / cam.zoom;                        // 1 screen px of overlap: no anti-aliased seam between cuts
+        TerrainArt().setOrigin(0, 0);
+        TerrainArt().fillFog(ctx, ch.cutX0 - e, ch.cutY0 - e, ch.cutW + 2 * e, ch.cutH + 2 * e);
+      } else if (ch.fogBuilt && ch.fogAllDim && !ch.border) {
+        // explored-but-unseen all over: the pre-built veil canvas is one flat colour here — a solid translucent
+        // fill of the same cut rect is identical and far cheaper to rasterize than an image blit
+        ctx.fillStyle = veilFill();
+        if (ch.scale === 1 && cam.zoom === 1) {                 // same whole-pixel edges as blitCut's neighbours
+          const x0 = Math.round(ch.cutX0), y0 = Math.round(ch.cutY0);
+          ctx.fillRect(x0, y0, Math.round(ch.cutX0 + ch.cutW) - x0, Math.round(ch.cutY0 + ch.cutH) - y0);
+        } else ctx.fillRect(ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
+      } else if (ch.fogBuilt) drawFogChunk(ch);
     }
     __p = mark('fog', __p);
     if (cam.zoom >= 0.8) drawCloudShadows();
@@ -490,7 +548,8 @@
     __p = mark('vignette', __p);
     if (hasFn('VFX', 'drawScreen')) { try { ctx.setTransform(dpr, 0, 0, dpr, 0, 0); AOW.VFX.drawScreen(ctx, viewW, viewH); } catch (e) { /* ignore */ } }
     if (WR.debug) drawDebug();
-    function mark(name, prev) { const now = performance.now(); __t[name] = (__t[name] || 0) * 0.9 + (now - prev) * 0.1; return now; }
+    // WR.profileRaster: force the canvas to rasterize at every mark so stats.t shows real per-layer raster cost
+    function mark(name, prev) { if (WR.profileRaster) ctx.getImageData(0, 0, 1, 1); const now = performance.now(); __t[name] = (__t[name] || 0) * 0.9 + (now - prev) * 0.1; return now; }
     const ms = performance.now() - t0;
     stats.frameMs = stats.frameMs * 0.9 + ms * 0.1;
     stats.fps = stats.fps * 0.95 + (1 / Math.max(1e-3, dt)) * 0.05;
@@ -509,25 +568,37 @@
     return orderBuf;
   }
 
-  function drawChunkCut(ch) {
+  function drawChunkCut(ch) { blitCut(ch.cv, ch); }
+  /**
+   * Draw a chunk-aligned canvas (terrain or fog) over its cut rectangle. At a 1:1 scale (detail chunks at zoom 1,
+   * the common case) the cut is snapped to whole pixels — neighbours share the same rounded edge, so there is
+   * no gap — which turns the blit into a plain copy instead of a filtered, sub-pixel resample.
+   */
+  function blitCut(cv, ch) {
     const s = ch.scale;
+    if (s === 1 && cam.zoom === 1) {
+      const x0 = Math.round(ch.cutX0), y0 = Math.round(ch.cutY0), x1 = Math.round(ch.cutX0 + ch.cutW), y1 = Math.round(ch.cutY0 + ch.cutH);
+      ctx.drawImage(cv, x0 - ch.ox, y0 - ch.oy, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+      return;
+    }
     const sx = (ch.cutX0 - ch.ox) * s, sy = (ch.cutY0 - ch.oy) * s;
-    ctx.drawImage(ch.cv, sx, sy, ch.cutW * s, ch.cutH * s, ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
+    ctx.drawImage(cv, sx, sy, ch.cutW * s, ch.cutH * s, ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
   }
 
   // ================================================================ water shimmer layer
   function drawWaterLayer() {
+    // The shimmer animates at 15 Hz. Its ripples/foam are collected (TerrainArt.waterBatch) into a few Path2D
+    // buckets in WORLD space, rebuilt only when the 15 Hz stamp or the visible hex range changes, and stroked
+    // straight onto the frame every frame (~30 strokes). No offscreen layer: blitting a viewport-sized layer
+    // canvas forced a 50–80 ms raster flush every few frames under software/SwiftShader rendering.
+    const TA = TerrainArt();
+    if (!TA || !TA.waterBatch) return;
     const stamp = Math.floor(time * 15);
-    const w = Math.ceil(viewW), h = Math.ceil(viewH);
-    if (!waterLayer.cv || waterLayer.w !== w || waterLayer.h !== h) {
-      const o = Art().canvas(w, h); waterLayer.cv = o.cv; waterLayer.ctx = o.ctx; waterLayer.w = w; waterLayer.h = h; waterLayer.stamp = -1;
-    }
-    const moved = waterLayer.camX !== cam.x || waterLayer.camY !== cam.y || waterLayer.zoom !== cam.zoom;
-    if (waterLayer.stamp !== stamp || moved) {
-      const c = waterLayer.ctx, g = game, Hx = Hex(), T = State().TERRAINS, WM = State().WATER_MAX;
-      c.setTransform(1, 0, 0, 1, 0, 0);
-      c.clearRect(0, 0, w, h);
-      c.translate(viewW / 2, viewH / 2); c.scale(cam.zoom, cam.zoom); c.translate(-camSnap.x, -camSnap.y);
+    const key = stamp + '|' + view.c0 + ',' + view.c1 + ',' + view.r0 + ',' + view.r1 + '|' + viewerPid;
+    if (waterLayer.key !== key) {
+      waterLayer.key = key;
+      const g = game, Hx = Hex(), T = State().TERRAINS, WM = State().WATER_MAX;
+      const batch = waterLayer.batch = TA.waterBatch();
       const info = scratchInfo; info.size = Hx.SIZE; info.neighbors = null;
       const tt = stamp / 15;
       const vis = g.visible[viewerPid], ex = g.explored[viewerPid];
@@ -538,11 +609,17 @@
         if (vis && !vis[i]) continue;
         const p = Hx.toPixel(col, r);
         info.terrain = T[g.terrain[i]]; info.seed = seedArr[i]; info.coast = coastArr[i];
-        TerrainArt().drawWater(c, p.x, p.y, info, tt);
+        TA.drawWater(null, p.x, p.y, info, tt, batch);
       }
-      waterLayer.stamp = stamp; waterLayer.camX = cam.x; waterLayer.camY = cam.y; waterLayer.zoom = cam.zoom;
     }
-    ctx.drawImage(waterLayer.cv, shake.x, shake.y);
+    const batch = waterLayer.batch;
+    if (!batch || (!batch.ripple.size && !batch.foam.size)) return;
+    ctx.save();
+    ctx.translate(Math.round(viewW / 2 + shake.x), Math.round(viewH / 2 + shake.y));
+    ctx.scale(cam.zoom, cam.zoom);
+    ctx.translate(-camSnap.x, -camSnap.y);
+    TA.flushWaterBatch(ctx, batch, true);
+    ctx.restore();
   }
 
   // ================================================================ domain & province borders
@@ -984,6 +1061,12 @@
   // Both layers are painted as ONE continuous wash over the whole chunk and then masked by the (blurred)
   // union of the hexes they cover, so nothing in the fog follows a hex silhouette. The blur radii below are
   // world px: ~1.5 hexes of feather for the unexplored cloud bank, ~1 hex for the "explored but unseen" veil.
+  let veilCss = null;
+  function veilFill() {             // the veil layer's colour at the alpha buildFog composites it with
+    if (!veilCss) { const TA = TerrainArt(); veilCss = Color().alpha((TA && TA.FOG_VEIL) || 'rgb(118,122,138)', FOG_VEIL_ALPHA); }
+    return veilCss;
+  }
+  const FOG_VEIL_ALPHA = 0.55;
   const FOG_MASK_GROW = 7;       // world px the mask extends past the hex edge before blurring
   const FOG_BLUR_CLOUD = 26;     // world px gaussian radius on the unexplored edge (Hex.SIZE is 36)
   const FOG_BLUR_VEIL = 16;      // world px gaussian radius on the explored-but-unseen edge
@@ -993,14 +1076,15 @@
     const t0 = performance.now();
     const ex = g.explored[viewerPid], vis = g.visible[viewerPid];
     ch.fogDirty = false; ch.fogBuilt = true;
-    if (!ex) { ch.fogHasDim = false; ch.fogHasCloud = false; return; }
+    if (!ex) { ch.fogHasDim = false; ch.fogHasCloud = false; ch.fogAllCloud = false; ch.fogAllDim = false; return; }
     const c0 = Math.max(0, ch.c0 - 1), c1 = Math.min(g.W - 1, ch.c1 + 1), r0 = Math.max(0, ch.r0 - 1), r1 = Math.min(g.H - 1, ch.r1 + 1);
-    let anyDim = false, anyCloud = false;
-    for (let r = r0; r <= r1 && !(anyDim && anyCloud); r++) for (let c = c0; c <= c1; c++) {
+    let anyDim = false, anyCloud = false, allCloud = true, allDim = true;
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
       const i = r * g.W + c;
-      if (!ex[i]) anyCloud = true; else if (vis && !vis[i]) anyDim = true;
+      if (!ex[i]) { anyCloud = true; allDim = false; }
+      else { allCloud = false; if (vis && !vis[i]) anyDim = true; else allDim = false; }
     }
-    ch.fogHasDim = anyDim; ch.fogHasCloud = anyCloud;
+    ch.fogHasDim = anyDim; ch.fogHasCloud = anyCloud; ch.fogAllCloud = anyCloud && allCloud; ch.fogAllDim = anyDim && allDim;
     if (!anyDim && !anyCloud) return;
     if (!fogScratch.cv) { const o = Art().canvas(ch.w, ch.h); fogScratch.cv = o.cv; fogScratch.ctx = o.ctx; }
     if (fogScratch.cv.width < ch.w || fogScratch.cv.height < ch.h) { fogScratch.cv.width = Math.max(fogScratch.cv.width, ch.w); fogScratch.cv.height = Math.max(fogScratch.cv.height, ch.h); }
@@ -1045,7 +1129,7 @@
       d.fillStyle = (TA && TA.FOG_VEIL) || 'rgb(118,122,138)'; d.fillRect(0, 0, ch.w, ch.h);
       buildMask(i => ex[i] && vis && !vis[i], FOG_MASK_GROW);
       applyMask(d, FOG_BLUR_VEIL);
-      out.globalAlpha = 0.55;
+      out.globalAlpha = FOG_VEIL_ALPHA;
       out.drawImage(ch.fogDim.cv, 0, 0, ch.w, ch.h);
       out.globalAlpha = 1;
     }
@@ -1069,9 +1153,7 @@
   }
   function drawFogChunk(ch) {
     if ((!ch.fogHasDim && !ch.fogHasCloud) || !ch.fogOut) return;
-    const s = ch.scale;
-    const sx = (ch.cutX0 - ch.ox) * s, sy = (ch.cutY0 - ch.oy) * s, sw = ch.cutW * s, sh = ch.cutH * s;
-    ctx.drawImage(ch.fogOut.cv, sx, sy, sw, sh, ch.cutX0, ch.cutY0, ch.cutW, ch.cutH);
+    blitCut(ch.fogOut.cv, ch);
   }
 
   // ================================================================ cloud shadows, vignette, labels, debug
@@ -1105,6 +1187,7 @@
   }
   function drawVignette() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (vignetteEl) { const want = canvas && canvas.hidden ? 'none' : ''; if (vignetteEl.style.display !== want) vignetteEl.style.display = want; return; }
     if (!vignette.cv || vignette.w !== viewW || vignette.h !== viewH) {
       const o = Art().canvas(Math.max(2, viewW / 4), Math.max(2, viewH / 4));
       const w = o.cv.width, h = o.cv.height;

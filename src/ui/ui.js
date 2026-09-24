@@ -877,6 +877,9 @@
 .settings-section > .aow-h3 { margin-bottom: 2px; padding-bottom: 4px; border-bottom: 1px solid var(--border-soft); }
 .settings-row { display: flex; align-items: center; gap: 10px; min-height: 28px; }
 .settings-row > label:first-child, .settings-row > span:first-child { flex: 0 0 132px; color: var(--text-dim); font-size: 12.5px; }
+.settings-row > label.aow-check:first-child { flex: 1 1 auto; }            /* checkbox rows: the label is the whole row */
+.settings-row .aow-segment { flex: 0 0 auto; }
+.settings-row .aow-segment button { white-space: nowrap; }
 .settings-row .aow-slider { flex: 1 1 auto; }
 .settings-row .settings-val { flex: 0 0 40px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; color: var(--gold-light); }
 .settings-np { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; background: rgba(0,0,0,0.3); border-radius: 4px; border: 1px solid var(--border-soft); }

@@ -462,7 +462,8 @@
   State.playerArmies = (game, pid) => game.armies.filter(a => a.owner === pid);
   State.allUnitsOfPlayer = (game, pid) => game.units.filter(u => u.owner === pid);
   State.playerHeroes = (game, pid) => game.heroes.filter(h => h.owner === pid);
-  State.capital = function (game, pid) { const p = game.players[pid]; return p ? State.city(game, p.capitalId) : null; };
+  /** the player's capital — only while they still own it (a lost capital must not keep serving as their seat) */
+  State.capital = function (game, pid) { const p = game.players[pid]; const c = p ? State.city(game, p.capitalId) : null; return c && c.owner === pid ? c : null; };
 
   State.provinceOf = function (game, idx) { const p = game.province[idx]; return p >= 0 ? game.provinces[p] : null; };
   State.terrainName = (game, idx) => State.TERRAINS[game.terrain[idx]];

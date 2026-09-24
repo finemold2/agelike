@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 // tools/e2e.js — human-flow end-to-end test (Playwright). Plays a real game through the DOM + canvas UI:
 // menu → new game → faction creation → army selection/movement → city → research/screens → end turns →
-// a tactical battle fought through the battle UI → an auto-resolved battle → world spell → save/reload → fast turns.
+// a tactical battle fought through the battle UI → an auto-resolved battle → world spell → save/reload → fast turns,
+// then a second pass over the secondary flows: notifications/toasts, settings, English UI (every screen, persisted
+// over a reload), music, hero progression, wonder clearing, city growth + tier-2 recruits, outposts, free cities,
+// empire skills + tome gating, a 1280×720 layout check, world-render timing and the victory screen.
 //
 // Every interaction goes through the real UI: DOM clicks on real selectors (page.click) and mouse clicks at
 // screen coordinates obtained from AOW.WorldRender.hexToScreen / AOW.CombatRender.hexToScreen. page.evaluate
 // is only used for READ-ONLY state queries, plus three deliberate exceptions: muting the audio at boot,
 // scrolling the camera to a hex that is off-screen or under HUD chrome (WorldRender.centerOn), and the final
 // "25 fast turns" loop. A regression in the UI wiring therefore fails the test instead of being bypassed.
+// The secondary pass additionally uses AOW.Debug / direct state writes for SETUP ONLY (teleport a stack next to a
+// wonder, weaken its guards, top up resources/xp, finish a queue item, knock the rivals out) — the action under
+// test itself (attack, learn, gift, buy, build, recruit, found, upgrade, end turn, continue) is always a UI click.
 //
-// usage: node tools/e2e.js [--seed NAME] [--headed] [--slowmo MS] [--timeout MS] [--no-shots]
+// usage: node tools/e2e.js [--seed NAME] [--headed] [--slowmo MS] [--timeout MS] [--no-shots] [--only secondary]
 // exit code 0 = whole flow passed, 1 = a step failed or the page threw.
 const path = require('path');
 const fs = require('fs');
@@ -25,6 +31,7 @@ const flag = k => args.includes('--' + k);
 const SEED = opt('seed', 'e2e');
 const STEP_TIMEOUT = +opt('timeout', 30000);
 const NO_SHOTS = flag('no-shots');
+const ONLY = opt('only', null);          // 'secondary' → boot + the secondary pass only (faster iteration)
 
 let page = null, browser = null;
 const errors = [];
@@ -122,6 +129,14 @@ function assertNoErrors(n, label) {
 
 // ================================================================== the flow
 async function run() {
+  await bootFlow();
+  if (ONLY !== 'secondary') await mainFlow();
+  await secondaryFlow();
+  step('Summary');
+  assert(errors.length === 0, 'no page errors during the whole run');
+}
+
+async function bootFlow() {
   // ---------------------------------------------------------------- 1. boot + menu + faction
   step('Load index.html and reach the main menu');
   await page.goto('file://' + path.join(ROOT, 'index.html'), { waitUntil: 'load' });
@@ -131,8 +146,14 @@ async function run() {
   await shot('menu');
 
   step('새 게임 → new game setup → 세력 생성 → faction creator');
+  const musicBefore = await ev(() => AOW.Music.isPlaying());
   await click('.aow-screen[data-screen="menu"] button:has-text("새 게임")');
   await waitFn(() => AOW.UI.currentScreen() === 'newgame');
+  // the first click unlocks audio and starts the mood playlist
+  await waitFn(() => AOW.Music.isPlaying() && !!(AOW.Music.nowPlaying() || {}).title, null, 2000);
+  const np = await ev(() => ({ title: AOW.L(AOW.Music.nowPlaying().title), mood: AOW.Music.getMood() }));
+  assert(!musicBefore, 'no music before the first user gesture');
+  assert(!!np.title, 'music started on the first click: "' + np.title + '" (mood ' + np.mood + ')');
   assert(await exists('.aow-screen[data-screen="newgame"] .ng-grid'), 'new-game screen is open');
   // seed so the run is reproducible
   await page.fill('.aow-screen[data-screen="newgame"] input[data-focus="seed"]', SEED);
@@ -193,7 +214,9 @@ async function run() {
   assert(boot.capOnScreen && boot.capOffset < 460, 'camera centred on the capital (' + boot.capOffset + 'px from the view centre)');
   assert(boot.armies >= 1, 'player starts with ' + boot.armies + ' army stack(s)');
   assertNoErrors(0, 'new game creation');
+}
 
+async function mainFlow() {
   // ---------------------------------------------------------------- 2. select + move an army
   step('Select the starting army by clicking its hex');
   const armyInfo = await ev(() => {
@@ -270,7 +293,13 @@ async function run() {
   const camPre = await ev(() => ({ x: Math.round(AOW.WorldRender.camera.x), y: Math.round(AOW.WorldRender.camera.y) }));
   await page.locator('.hud-minimap canvas').click({ position: { x: 200, y: 130 } });
   await page.waitForTimeout(200);
-  const camPost = await ev(() => ({ x: Math.round(AOW.WorldRender.camera.x), y: Math.round(AOW.WorldRender.camera.y) }));
+  let camPost = await ev(() => ({ x: Math.round(AOW.WorldRender.camera.x), y: Math.round(AOW.WorldRender.camera.y) }));
+  if (camPre.x === camPost.x && camPre.y === camPost.y) {
+    // the spot may already be where the (map-clamped) camera sits — try the opposite corner once
+    await page.locator('.hud-minimap canvas').click({ position: { x: 40, y: 30 } });
+    await page.waitForTimeout(200);
+    camPost = await ev(() => ({ x: Math.round(AOW.WorldRender.camera.x), y: Math.round(AOW.WorldRender.camera.y) }));
+  }
   assert(camPre.x !== camPost.x || camPre.y !== camPost.y, 'clicking the minimap moved the camera');
   await click('.hud-minimap__overlays button >> nth=0');
   assert(await exists('.hud-minimap__overlays button.aow-btn--active'), 'province overlay toggled on');
@@ -463,6 +492,8 @@ async function run() {
     const mark0 = errors.length;
     await click('.hud-notif >> nth=0');
     await page.waitForTimeout(250);
+    // a notification may open its screen (research, hero, empire…) — back to the map
+    if (await ev(() => AOW.UI.currentScreen() !== 'hud')) { await page.keyboard.press('Escape'); await page.waitForTimeout(150); }
     assertNoErrors(mark0, 'clicking a turn notification');
   }
   step('Annex a province now that imperium has come in');
@@ -612,9 +643,695 @@ async function run() {
   const shown = await ev(() => ({ screen: AOW.UI.currentScreen(), modals: document.querySelectorAll('.aow-modal-backdrop').length, hud: !!document.querySelector('.hud-topbar'), turn: AOW.game.turn }));
   assert(shown.screen === 'hud' && !shown.modals && shown.hud, 'HUD is clear and responsive at turn ' + shown.turn);
   await shot('final');
+}
 
-  step('Summary');
-  assert(errors.length === 0, 'no page errors during the whole run');
+// ================================================================== secondary flows
+/**
+ * In-page scan of the visible UI (and every tooltip's content) for raw i18n keys ("hud.endTurn") and — in
+ * English mode — Korean text that is UI chrome rather than a proper name (realm/ruler/city/hero/unit names are
+ * whitelisted: they are player data, not translations). Runs inside the page.
+ */
+function SCAN_UI(o) {
+  const g = AOW.game;
+  const names = ['검증 왕국', '검증관 아리스', '한국어', '신들의 시대'];
+  if (g) {
+    for (const p of g.players) names.push(p.name, p.rulerName);
+    for (const c of g.cities) names.push(c.name);
+    for (const h of g.heroes || []) names.push(h.name);
+    for (const u of g.units) if (u.name) names.push(u.name);
+  }
+  const nm = names.filter(Boolean).sort((a, b) => b.length - a.length);
+  const RAW = /^[a-z]+\.[a-zA-Z_][a-zA-Z_.0-9]*$/;
+  const RAW_IN = /(?:^|[\s(\[:·])([a-z]+\.[a-z][a-zA-Z_]*(?:\.[a-zA-Z_0-9]+)*)(?=$|[\s),:·\]])/g;
+  const HANGUL = /[가-힣]/;
+  const strip = s => { let r = s; for (const x of nm) r = r.split(x).join(''); return r; };
+  const raw = [], korean = [];
+  const root = document.getElementById('ui');
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const n = walker.currentNode, s = n.nodeValue.trim();
+    if (!s) continue;
+    const el = n.parentElement; if (!el || el.closest('#toast-layer')) continue;
+    const r = el.getBoundingClientRect(); if (!r.width && !r.height) continue;
+    const cs = getComputedStyle(el); if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+    if (RAW.test(s)) raw.push(s);
+    if (s.length <= 2 && nm.some(x => x.startsWith(s))) continue;      // a realm banner's initial
+    if (o && o.en && HANGUL.test(strip(s))) korean.push(s.slice(0, 70) + ' <' + (el.className || el.tagName) + '>');
+  }
+  for (const e of root.querySelectorAll('*')) {
+    if (!e._aowTip) continue;
+    let c = e._aowTip;
+    try { if (typeof c === 'function') c = c(); } catch (err) { raw.push('tooltip threw: ' + err.message); continue; }
+    if (!c) continue;
+    const d = document.createElement('div');
+    if (c instanceof Node) d.appendChild(c.cloneNode(true)); else d.innerHTML = String(c);
+    const txt = d.textContent;
+    let m; RAW_IN.lastIndex = 0;
+    while ((m = RAW_IN.exec(txt))) raw.push('tooltip: ' + m[1]);
+    if (o && o.en && HANGUL.test(strip(txt))) korean.push('tooltip: ' + txt.slice(0, 70));
+  }
+  return { raw: Array.from(new Set(raw)).slice(0, 12), korean: Array.from(new Set(korean)).slice(0, 12) };
+}
+async function assertCleanUi(label, en) {
+  const r = await ev(SCAN_UI, { en: !!en });
+  assert(!r.raw.length, label + ': no raw i18n keys' + (r.raw.length ? ' — found ' + JSON.stringify(r.raw) : ''));
+  if (en) assert(!r.korean.length, label + ': no Korean UI text in English mode' + (r.korean.length ? ' — found ' + JSON.stringify(r.korean) : ''));
+}
+/** close modals and screens until only the HUD is up */
+async function ensureHud() {
+  await dismissModals('ensure HUD');
+  for (let i = 0; i < 6 && (await ev(() => AOW.UI.currentScreen())) !== 'hud'; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(120); }
+  await dismissModals('ensure HUD');
+  if ((await ev(() => AOW.UI.currentScreen())) !== 'hud') fail('could not get back to the HUD (screen ' + (await ev(() => AOW.UI.currentScreen())) + ')');
+}
+async function openNav(idx, screen) {
+  await click('.hud-nav .aow-btn--nav >> nth=' + idx);
+  await waitFn(s => AOW.UI.isOpen(s), screen);
+  await page.waitForTimeout(120);
+  // mid-way through the open animation the panel must already have its real width (it used to collapse to a
+  // couple of pixels while the pop animation's transform made the empty wrapper its containing block)
+  const w = await ev(s => Math.max(0, ...Array.from(document.querySelectorAll('.aow-screen[data-screen="' + s + '"] .aow-panel')).map(e => e.getBoundingClientRect().width)), screen);
+  if (w < 300) fail(screen + ' panel collapsed to ' + Math.round(w) + 'px while opening');
+}
+async function closeScreenEsc(screen) {
+  await page.keyboard.press('Escape');
+  await waitFn(s => !AOW.UI.isOpen(s), screen);
+}
+/** the ruler's army, respawning the ruler first (end turns) when it has fallen */
+async function rulerArmy() {
+  for (let i = 0; i < 6; i++) {
+    const r = await ev(() => {
+      const g = AOW.game, hp = g.players.find(p => p.isHuman).id;
+      const h = g.heroes.find(x => x.owner === hp && x.isRuler);
+      if (!h || h.dead) return { dead: true };
+      const u = AOW.State.unit(g, h.unitId), a = u ? AOW.State.army(g, u.armyId) : null;
+      return a ? { heroId: h.id, unitId: u.id, armyId: a.id, hex: a.hex } : { dead: true };
+    });
+    if (!r.dead) return r;
+    info('the ruler has fallen — ending a turn for the respawn');
+    await endTurnViaHud();
+  }
+  fail('the ruler never came back');
+}
+/** free passable land hex next to `hex` (no army, no structure), nearest to `near` */
+function freeNeighbourJs(q) {
+  const g = AOW.game;
+  let best = -1, bd = 1e9;
+  for (const n of AOW.Hex.neighborsIdx(q.hex, g.W, g.H)) {
+    if (n < 0 || AOW.State.isWater(g, n) || g.structure[n] >= 0 || AOW.State.armiesAt(g, n).length) continue;
+    if (!isFinite(AOW.State.hexMoveCost(g, n, 'walk'))) continue;
+    // not next to some other hostile stack (the move/attack must target exactly our goal)
+    if (AOW.Hex.neighborsIdx(n, g.W, g.H).some(m => m >= 0 && m !== q.hex && AOW.State.armiesAt(g, m).some(a => a.owner !== q.pid && a.units.length))) continue;
+    const d = q.near >= 0 ? AOW.Hex.distIdx(n, q.near, g.W) : 0;
+    if (d < bd) { bd = d; best = n; }
+  }
+  return best;
+}
+async function teleportNextTo(armyId, hex) {
+  const to = await ev(q => {
+    const g = AOW.game, a = AOW.State.army(g, q.armyId);
+    const f = new Function('q', 'return (' + q.src + ')(q)');
+    const n = f({ hex: q.hex, near: a.hex, pid: a.owner });
+    if (n < 0) return -1;
+    AOW.Debug.teleportArmy(a.id, n);
+    a.mp = AOW.Rules.armyMaxMp(g, a); a.defending = false; a.sleeping = false;
+    AOW.WorldRender.centerOn(n, false);
+    return n;
+  }, { armyId, hex, src: freeNeighbourJs.toString() });
+  if (to < 0) fail('no free hex next to ' + hex);
+  await page.waitForTimeout(120);
+  return to;
+}
+
+async function secondaryFlow() {
+  await ensureHud();
+  const HP = await ev(() => AOW.game.players.find(p => p.isHuman).id);
+
+  // ---------------------------------------------------------------- A. notifications & toasts
+  step('Notifications: only our realm’s news, natural Korean particles, at most 3 centre toasts');
+  const josa = await ev(() => {
+    const J = AOW.I18n.josa;
+    return [J('오크 전사', '이/가'), J('도적 두목', '이/가'), J('조약', '을/를'), J('평화 협정', '을/를'), J('병사', '으로/로'), J('고참병', '으로/로'), J('마을', '으로/로'), J('하늘성', '과/와'), J('별의 회의', '과/와'), J(7, '으로/로')].join(' ');
+  });
+  assert(josa === '오크 전사가 도적 두목이 조약을 평화 협정을 병사로 고참병으로 마을로 하늘성과 별의 회의와 7로', 'I18n.josa picks the particle from the last syllable: ' + josa);
+  const tpl = await ev(() => AOW.t('dip.msg.peace', { a: '검증 왕국', b: '별의 회의' }));
+  assert(tpl === '검증 왕국과 별의 회의가 평화를 맺었습니다.', '{name:과/와} template placeholders resolve: ' + tpl);
+  await ev(() => {
+    window.__toasts = { max: 0, texts: [] };
+    const layer = document.getElementById('toast-layer');
+    const live = () => layer.querySelectorAll('.aow-toast:not(.aow-toast--out)').length;
+    if (window.__toastObs) window.__toastObs.disconnect();
+    window.__toastObs = new MutationObserver(muts => {
+      for (const m of muts) for (const n of m.addedNodes) if (n.classList && n.classList.contains('aow-toast')) window.__toasts.texts.push(n.textContent.replace('×', '').trim());
+      window.__toasts.max = Math.max(window.__toasts.max, live());
+    });
+    window.__toastObs.observe(layer, { childList: true });
+  });
+  for (let i = 0; i < 3; i++) await endTurnViaHud();
+  const nt = await ev(hp => {
+    const g = AOW.game;
+    const txt = n => (typeof n.text === 'object' ? (n.text.ko || '') : String(n.text || ''));
+    const foreign = g.notifications.filter(n => n.pid !== hp && n.pid !== -1);
+    const hedged = g.notifications.filter(n => /이\(가\)|을\(를\)|은\(는\)|\(으\)로|과\(와\)/.test(txt(n))).map(txt);
+    const ranks = g.notifications.filter(n => /승급했습니다/.test(txt(n)));
+    const listTexts = Array.from(document.querySelectorAll('.hud-notif__text')).map(e => e.textContent);
+    return {
+      total: g.notifications.length, foreign: foreign.length, hedged, ranks: ranks.length, ranksLowOwn: ranks.every(n => n.low && n.pid === hp),
+      list: listTexts.length, listHedged: listTexts.filter(s => /\((가|를|는|으)\)|\(와\)/.test(s)),
+      toasts: window.__toasts, live: document.querySelectorAll('#toast-layer .aow-toast:not(.aow-toast--out)').length,
+    };
+  }, HP);
+  info(nt.total + ' notifications stored, ' + nt.list + ' in the HUD list, ' + nt.toasts.texts.length + ' toasts shown: ' + JSON.stringify(nt.toasts.texts.slice(-6)));
+  assert(nt.foreign === 0, 'every stored notification is ours or a world event (' + nt.foreign + ' foreign)');
+  assert(!nt.hedged.length && !nt.listHedged.length, 'no hedged "이(가)/을(를)" particles in the feed' + (nt.hedged.length ? ': ' + nt.hedged[0] : ''));
+  assert(nt.ranksLowOwn, nt.ranks + ' rank-up notice(s), all our own units and all list-only (low priority)');
+  assert(nt.toasts.max <= 3, 'at most 3 centre toasts at once (peak ' + nt.toasts.max + ')');
+  assert(!nt.toasts.texts.some(s => /승급했습니다|완공|모집 완료|늘었습니다/.test(s)), 'rank-ups / production / growth stay out of the centre toasts');
+  await page.waitForTimeout(5300);
+  assert(await ev(() => document.querySelectorAll('#toast-layer .aow-toast:not(.aow-toast--out)').length) === 0, 'centre toasts auto-dismiss within 5 s');
+  await ev(() => { if (window.__toastObs) window.__toastObs.disconnect(); });
+  assertNoErrors(0, 'notifications');
+
+  // ---------------------------------------------------------------- B. settings
+  step('Settings: sliders, mute and game toggles drive AOW.Audio / UI.settings');
+  await openNav(6, 'settings');
+  const SS = '.aow-screen[data-screen="settings"] ';
+  const music = page.locator(SS + '.aow-slider').nth(1);
+  await music.focus();
+  await page.keyboard.press('Home');
+  assert(await ev(() => AOW.Audio.getVolume().music) === 0, 'music slider → Home: music volume 0');
+  await page.keyboard.press('End');
+  assert(await ev(() => AOW.Audio.getVolume().music) === 1, 'music slider → End: music volume 1');
+  for (let i = 0; i < 25; i++) await page.keyboard.press('ArrowLeft');
+  const vol = await ev(() => ({ v: AOW.Audio.getVolume(), label: document.querySelectorAll('.aow-screen[data-screen="settings"] .settings-val')[1].textContent, stored: JSON.parse(localStorage.getItem('aow.audio') || '{}').music }));
+  assert(Math.abs(vol.v.music - 0.75) < 0.011 && vol.label === '75%', 'arrow keys step the music volume to ' + vol.v.music + ' (label ' + vol.label + ')');
+  assert(Math.abs(vol.stored - 0.75) < 0.011, 'volume persisted to localStorage (aow.audio.music = ' + vol.stored + ')');
+  await page.locator(SS + '.aow-slider').nth(2).focus();
+  await page.keyboard.press('Home');
+  assert(await ev(() => AOW.Audio.getVolume().sfx) === 0, 'sfx slider drives the sfx volume');
+  await page.keyboard.press('End');
+  const muted0 = await ev(() => AOW.Audio.isMuted());
+  await click(SS + 'label.aow-check:has-text("음소거")');
+  assert(await ev(() => AOW.Audio.isMuted()) === !muted0, 'mute checkbox toggles AOW.Audio mute (' + muted0 + ' → ' + !muted0 + ')');
+  await click(SS + 'label.aow-check:has-text("음소거")');
+  assert(await ev(() => AOW.Audio.isMuted()) === muted0, 'and back');
+  const es0 = await ev(() => AOW.UI.settings.edgeScroll);
+  await click(SS + 'label.aow-check:has-text("가장자리")');
+  const es1 = await ev(() => ({ v: AOW.UI.settings.edgeScroll, stored: JSON.parse(localStorage.getItem('aow.ui') || '{}').edgeScroll }));
+  assert(es1.v === !es0 && es1.stored === !es0, 'edge-scroll toggle updates UI.settings and localStorage (' + es0 + ' → ' + es1.v + ')');
+  await click(SS + 'label.aow-check:has-text("가장자리")');
+  await click(SS + '.aow-segment button:has-text("2×")');
+  assert(await ev(() => AOW.UI.settings.animSpeed) === 2, 'animation speed segment → 2×');
+  await click(SS + '.aow-segment button:has-text("1×")');
+  await shot('settings');
+
+  // ---------------------------------------------------------------- C. English UI
+  step('English: switch in settings → HUD and every screen without raw keys or Korean chrome');
+  await click(SS + '.aow-segment button:has-text("English")');
+  await waitFn(() => AOW.I18n.lang === 'en' && /Settings/.test((document.querySelector('.aow-screen[data-screen="settings"] .aow-panel__title') || {}).textContent || ''));
+  ok('language switched; the settings panel re-rendered in English');
+  await ev(() => AOW.UI.clearToasts());
+  await assertCleanUi('settings (en)', true);
+  await closeScreenEsc('settings');
+  await assertCleanUi('HUD (en)', true);
+  assert((await textOf('.hud-endturn')).indexOf('End Turn') >= 0, 'end-turn button reads "End Turn"');
+  const EN_NAV = [{ idx: 0, s: 'cities' }, { idx: 1, s: 'research' }, { idx: 2, s: 'spellbook' }, { idx: 3, s: 'empire' }, { idx: 4, s: 'hero' }, { idx: 5, s: 'diplomacy' }];
+  for (const n of EN_NAV) {
+    await openNav(n.idx, n.s);
+    await assertCleanUi(n.s + ' (en)', true);
+    if (n.s === 'research' && await exists('.aow-screen[data-screen="research"] .sc-book.locked')) {
+      await click('.aow-screen[data-screen="research"] .sc-book.locked >> nth=0');
+      await page.waitForTimeout(120);
+      await assertCleanUi('research, locked tome (en)', true);
+    }
+    if (n.s === 'hero') await shot('hero_en');
+    await closeScreenEsc(n.s);
+  }
+  const capE = await ev(() => { const c = AOW.State.capital(AOW.game, AOW.game.players.find(p => p.isHuman).id); return { hex: c.hex, id: c.id }; });
+  assert(await selectCityByClick(capE.hex, capE.id), 'capital selected');
+  await assertCleanUi('HUD city panel (en)', true);
+  await click('.hud-selection button:has-text("Open city")');
+  await waitFn(() => AOW.UI.isOpen('city'));
+  const tabsN = await page.locator('.aow-screen[data-screen="city"] .sc-tab').count();
+  for (let i = 0; i < tabsN; i++) {
+    await click('.aow-screen[data-screen="city"] .sc-tab >> nth=' + i);
+    await page.waitForTimeout(100);
+    await assertCleanUi('city tab ' + (i + 1) + '/' + tabsN + ' (en)', true);
+  }
+  await shot('city_en');
+  await closeScreenEsc('city');
+  assertNoErrors(0, 'English UI');
+
+  // ---------------------------------------------------------------- D. persistence over a reload + menu screens
+  step('English persists over a reload: menu / new game / faction in English, music restarts, Continue');
+  await page.keyboard.press('F5');
+  await waitFn(() => AOW.Main.hasSave('quick'));
+  const savedTurn = await ev(() => AOW.game.turn);
+  await page.reload({ waitUntil: 'load' });
+  await waitFn(() => !!(window.AOW && AOW.UI && AOW.UI.currentScreen() === 'menu'));
+  await ev(() => { try { AOW.Audio.setMuted(true); } catch (e) { /* optional */ } });
+  assert(await ev(() => AOW.I18n.lang) === 'en', 'language restored from localStorage after the reload');
+  await assertCleanUi('main menu (en)', true);
+  assert(!(await ev(() => AOW.Music.isPlaying())), 'music waits for a gesture after the reload');
+  await click('.aow-screen[data-screen="menu"] button:has-text("New Game")');
+  await waitFn(() => AOW.UI.currentScreen() === 'newgame');
+  await waitFn(() => AOW.Music.isPlaying() && !!(AOW.Music.nowPlaying() || {}).title, null, 2000);
+  ok('music playing within 2 s of the first click: "' + (await ev(() => AOW.L(AOW.Music.nowPlaying().title))) + '"');
+  await assertCleanUi('new game (en)', true);
+  await click('.aow-screen[data-screen="newgame"] button:has-text("Create Faction")');
+  await waitFn(() => AOW.UI.currentScreen() === 'faction');
+  const fTabs = await page.locator('.aow-screen[data-screen="faction"] .fw-tab').count();
+  for (let i = 0; i < fTabs; i++) {
+    await click('.aow-screen[data-screen="faction"] .fw-tab >> nth=' + i);
+    await page.waitForTimeout(100);
+    await assertCleanUi('faction tab ' + (i + 1) + '/' + fTabs + ' (en)', true);
+  }
+  await shot('faction_en');
+  await page.keyboard.press('Escape');
+  await waitFn(() => AOW.UI.currentScreen() === 'newgame');
+  await page.keyboard.press('Escape');
+  await waitFn(() => AOW.UI.currentScreen() === 'menu');
+  await click('.aow-screen[data-screen="menu"] button:has-text("Continue")');
+  await waitFn(() => !!window.AOW.game && AOW.UI.currentScreen() === 'hud');
+  assert(await ev(() => AOW.game.turn) === savedTurn, 'Continue restored turn ' + savedTurn);
+  await dismissModals('after continue');
+
+  step('Back to Korean through the settings screen');
+  await openNav(6, 'settings');
+  await click(SS + '.aow-segment button:has-text("한국어")');
+  await waitFn(() => AOW.I18n.lang === 'ko');
+  await closeScreenEsc('settings');
+  assert((await textOf('.hud-endturn')).indexOf('턴 종료') >= 0, 'HUD back in Korean ("턴 종료")');
+  await assertCleanUi('HUD (ko)', false);
+
+  // ---------------------------------------------------------------- E. wonder clearing (+ battle music, hero xp)
+  step('Wonder: bring the ruler’s army to a guarded wonder and clear it through the battle UI');
+  let ra = await rulerArmy();
+  const wonder = await ev(q => {
+    const g = AOW.game, a = AOW.State.army(g, q.armyId);
+    let best = null;
+    for (const st of g.structures) {
+      if (!st || st.kind !== 'wonder' || st.cleared) continue;
+      const guard = AOW.State.army(g, st.guardArmyId);
+      if (!guard || !guard.units.length) continue;
+      const d = AOW.Hex.distIdx(a.hex, st.hex, g.W);
+      if (!best || d < best.d) best = { id: st.id, hex: st.hex, guard: guard.id, d, name: AOW.L(AOW.Data.get('wonders', st.refId).name) };
+    }
+    return best;
+  }, ra);
+  assert(!!wonder, 'found an uncleared, guarded wonder: ' + (wonder && wonder.name) + ' (' + (wonder && wonder.d) + ' hexes away)');
+  const from = await teleportNextTo(ra.armyId, wonder.hex);
+  await ev(q => AOW.Debug.weakenArmy(q.guard, 1), wonder);   // (the teleport's vision update reveals the wonder)
+  const before = await ev(q => {
+    const g = AOW.game, p = g.players.find(x => x.isHuman), h = AOW.State.hero(g, q.heroId);
+    let xpTotal = h.xp; for (let l = 1; l < h.level; l++) xpTotal += AOW.Rules.heroXpForLevel(l);
+    return { gold: p.resources.gold, mana: p.resources.mana, imperium: p.resources.imperium, knowledge: p.resources.knowledge, items: (p.items || []).slice(), xpTotal, level: h.level };
+  }, ra);
+  info('setup: army #' + ra.armyId + ' placed at ' + from + ', guards weakened to 1 hp');
+  assert(await selectArmyByClick(from, ra.armyId), 'ruler’s army selected by clicking its hex');
+  await clickHex(wonder.hex);
+  await page.waitForTimeout(120);
+  if (!(await exists('.aow-modal-backdrop'))) await clickHex(wonder.hex, { wait: 250 });
+  assert(await exists('.aow-modal-backdrop button:has-text("공격")'), 'encounter modal offers 공격');
+  await click('.aow-modal-backdrop button:has-text("공격")');
+  await waitFn(() => AOW.UI.isOpen('battle') && !!AOW.battle);
+  await page.waitForTimeout(300);
+  const mood1 = await ev(() => ({ mood: AOW.Music.getMood(), playing: AOW.Music.isPlaying(), fits: AOW.Music.fitsMood('battle'), song: AOW.Music.nowPlaying() && AOW.L(AOW.Music.nowPlaying().title) }));
+  assert(mood1.mood === 'battle', 'music mood switched to battle when the battle opened');
+  assert(!mood1.playing || mood1.fits, 'the playing piece suits the battle mood ("' + mood1.song + '")');
+  const wb = await playBattle(0);          // the main flow fights by hand; here the battle bar’s 자동 전투 finishes it
+  info(JSON.stringify(wb));
+  assert(wb.finished, 'wonder battle finished (' + wb.how + ')');
+  await shot('wonder_battle');
+  await click('.aow-modal-backdrop button:has-text("확인")');
+  await waitFn(() => !AOW.UI.isOpen('battle') && !AOW.battle);
+  const mood2 = await ev(() => ({ mood: AOW.Music.getMood(), playing: AOW.Music.isPlaying(), fits: AOW.Music.fitsMood('peace') }));
+  assert(mood2.mood === 'peace' && (!mood2.playing || mood2.fits), 'music mood back to peace after the battle');
+  const after = await ev(q => {
+    const g = AOW.game, p = g.players.find(x => x.isHuman), st = g.structures[q.w.id], h = AOW.State.hero(g, q.r.heroId);
+    let xpTotal = h.xp; for (let l = 1; l < h.level; l++) xpTotal += AOW.Rules.heroXpForLevel(l);
+    return { cleared: !!st.cleared, gold: p.resources.gold, mana: p.resources.mana, imperium: p.resources.imperium, knowledge: p.resources.knowledge, items: (p.items || []).slice(), xpTotal, level: h.level, dead: h.dead,
+      note: (g.notifications.filter(n => n.ref && n.ref.structureId === q.w.id).pop() || {}).text };
+  }, { w: wonder, r: ra });
+  assert(after.cleared, 'the wonder is marked cleared');
+  assert(after.gold > before.gold && after.imperium > before.imperium, 'rewards paid: gold ' + before.gold + ' → ' + after.gold + ', imperium ' + before.imperium + ' → ' + after.imperium);
+  assert(after.note && /정복했습니다/.test(after.note.ko), 'clearing notice lists the spoils: "' + (after.note && after.note.ko) + '"');
+  if (!after.dead) assert(after.xpTotal > before.xpTotal, 'the ruler gained xp from the battle (' + before.xpTotal + ' → ' + after.xpTotal + ')');
+  info('loot: ' + (after.items.length - before.items.length) + ' new item(s) ' + JSON.stringify(after.items.slice(before.items.length)));
+  assertNoErrors(0, 'wonder clearing');
+
+  // ---------------------------------------------------------------- F. hero progression + equipment
+  step('Hero: level up, learn a skill in the hero screen, equip loot');
+  ra = await rulerArmy();
+  const lvl = await ev(q => {
+    const g = AOW.game, h = AOW.State.hero(g, q.heroId), u = AOW.State.unit(g, h.unitId);
+    const level0 = h.level;
+    AOW.Rules.grantXp(g, u, AOW.Rules.heroXpToNext(g, h) + 1);    // setup: enough xp for the next level
+    return { level0, level: h.level, sp: h.skillPoints };
+  }, ra);
+  assert(lvl.level > lvl.level0 && lvl.sp > 0, 'forced xp: level ' + lvl.level0 + ' → ' + lvl.level + ', ' + lvl.sp + ' skill point(s)');
+  await openNav(4, 'hero');
+  const HS = '.aow-screen[data-screen="hero"] ';
+  const pick = await ev(q => {
+    const g = AOW.game, h = AOW.State.hero(g, q.heroId);
+    const statKeys = ['hp', 'def', 'res', 'damage', 'dmg', 'mp', 'hpPct', 'defense', 'resistance', 'meleeDmg', 'rangedDmg'];
+    const ids = Array.from(document.querySelectorAll('.aow-screen[data-screen="hero"] .sc-skill.available[data-skill]')).map(e => e.dataset.skill).filter(id => !(h.skills || []).includes(id));
+    const withStats = ids.find(id => { const sk = AOW.Data.get('heroSkills', id); return sk && sk.effects && Object.keys(sk.effects).some(k => statKeys.includes(k)); });
+    const st = AOW.Rules.heroStats(g, h);
+    return { id: withStats || ids[0] || null, n: ids.length, stats: JSON.stringify({ hp: st.maxHp, def: st.def, res: st.res, mp: st.mp, atk: (st.attacks || []).map(a => a.damage), ab: (st.abilities || []).length, pa: (st.passives || []).length }), skills: (h.skills || []).length, sp: h.skillPoints };
+  }, ra);
+  assert(!!pick.id, pick.n + ' skill(s) can be learned — picking ' + pick.id);
+  await click(HS + '.sc-skill[data-skill="' + pick.id + '"] button');
+  await page.waitForTimeout(200);
+  const learned = await ev(q => {
+    const g = AOW.game, h = AOW.State.hero(g, q.heroId), st = AOW.Rules.heroStats(g, h);
+    return { skills: (h.skills || []).length, has: (h.skills || []).includes(q.id), sp: h.skillPoints, stats: JSON.stringify({ hp: st.maxHp, def: st.def, res: st.res, mp: st.mp, atk: (st.attacks || []).map(a => a.damage), ab: (st.abilities || []).length, pa: (st.passives || []).length }),
+      badge: !!document.querySelector('.aow-screen[data-screen="hero"] .sc-skill[data-skill="' + q.id + '"].learned') };
+  }, { heroId: ra.heroId, id: pick.id });
+  assert(learned.has && learned.skills === pick.skills + 1 && learned.sp === pick.sp - 1, 'skill learned through the UI (skills ' + pick.skills + ' → ' + learned.skills + ', points ' + pick.sp + ' → ' + learned.sp + ')');
+  assert(learned.badge, 'its card now shows as learned');
+  assert(learned.stats !== pick.stats, 'Rules.heroStats changed: ' + pick.stats + ' → ' + learned.stats);
+  await shot('hero');
+  const loot = await ev(q => {
+    const g = AOW.game, p = g.players.find(x => x.isHuman), h = AOW.State.hero(g, q.heroId);
+    const cls = AOW.Data.has('heroClasses', h.classId) ? AOW.Data.get('heroClasses', h.classId) : null;
+    for (const id of p.items || []) {
+      const it = AOW.Data.get('items', id); if (!it) continue;
+      if (it.weaponType && cls && cls.allowedWeapons && cls.allowedWeapons.length && !cls.allowedWeapons.includes(it.weaponType)) continue;
+      return { id, slot: it.slot, name: AOW.L(it.name) };
+    }
+    return null;
+  }, ra);
+  if (!loot) info('no equippable item in the vault — equip skipped');
+  else {
+    await click(HS + '.sc-row[data-item="' + loot.id + '"] button:has-text("장착")');
+    await page.waitForTimeout(150);
+    const eq = await ev(q => { const h = AOW.State.hero(AOW.game, q.heroId); return h.items && h.items[q.slot]; }, { heroId: ra.heroId, slot: loot.slot });
+    assert(eq === loot.id, 'equipped ' + loot.name + ' in the ' + loot.slot + ' slot through the hero screen');
+  }
+  await closeScreenEsc('hero');
+  assertNoErrors(0, 'hero progression');
+
+  // ---------------------------------------------------------------- G. city growth
+  step('City growth: the capital reaches the next tier and the tier label follows');
+  const grow = await ev(() => {
+    const g = AOW.game, hp = g.players.find(p => p.isHuman).id, c = AOW.State.capital(g, hp), C = AOW.Rules.C;
+    if (c.tier >= C.MAX_TIER) return { skip: true };
+    const tier0 = c.tier;
+    c.pop = C.CITY_TIERS[tier0] - 1;                          // setup: one pop short of the next tier
+    c.growth = AOW.Rules.growthNeeded(g, c) + 200;            // … with a full granary
+    return { id: c.id, hex: c.hex, tier0, pop: c.pop };
+  });
+  if (grow.skip) info('capital already at the top tier');
+  else {
+    await endTurnViaHud();
+    const g1 = await ev(id => { const c = AOW.State.city(AOW.game, id); return { tier: c.tier, pop: c.pop, name: AOW.Screens.tierName(c.tier) }; }, grow.id);
+    assert(g1.tier === grow.tier0 + 1, 'capital grew to pop ' + g1.pop + ' → tier ' + grow.tier0 + ' → ' + g1.tier + ' (' + g1.name + ')');
+    assert(await selectCityByClick(grow.hex, grow.id), 'capital selected');
+    assert(((await textOf('.hud-selection .hud-cityhead__tier')) || '').indexOf(g1.name) >= 0, 'HUD city panel shows the new tier "' + g1.name + '"');
+    await click('.hud-selection button:has-text("도시")');
+    await waitFn(() => AOW.UI.isOpen('city'));
+    assert(((await textOf('.aow-screen[data-screen="city"] .sc-city-head .sc-badge')) || '').indexOf(g1.name) >= 0, 'city screen tier badge updated to "' + g1.name + '"');
+    await closeScreenEsc('city');
+  }
+
+  // ---------------------------------------------------------------- H. barracks → tier-2 recruit
+  step('Barracks: build them from the city screen, then recruit a tier-2 unit into the garrison');
+  const CS2 = '.aow-screen[data-screen="city"] ';
+  const cap = await ev(() => { const g = AOW.game, c = AOW.State.capital(g, g.players.find(p => p.isHuman).id); return { hex: c.hex, id: c.id }; });
+  for (const bid of ['militia_post', 'barracks_1']) {
+    if (await ev(q => AOW.State.city(AOW.game, q.id).buildings.includes(q.bid), { id: cap.id, bid })) { info(bid + ' already built'); continue; }
+    await ensureHud();
+    assert(await selectCityByClick(cap.hex, cap.id), 'capital selected');
+    await click('.hud-selection button:has-text("도시")');
+    await waitFn(() => AOW.UI.isOpen('city'));
+    await click(CS2 + '.sc-tab >> nth=0');
+    await click(CS2 + '.sc-row[data-building="' + bid + '"] button:has-text("건설")');
+    await page.waitForTimeout(120);
+    const q = await ev(q => {
+      const c = AOW.State.city(AOW.game, q.id);
+      const i = c.queue.findIndex(x => x.type === 'building' && x.id === q.bid);
+      if (i < 0) return null;
+      const it = c.queue.splice(i, 1)[0]; c.queue.unshift(it);   // setup: to the front of the lane…
+      it.progress = Math.max(0, it.need - 1);                    // … and one hammer from done
+      return c.queue.map(x => x.type + ':' + x.id);
+    }, { id: cap.id, bid });
+    assert(!!q, bid + ' queued through the 건설 button (' + JSON.stringify(q) + ')');
+    await closeScreenEsc('city');
+    await endTurnViaHud();
+    assert(await ev(q => AOW.State.city(AOW.game, q.id).buildings.includes(q.bid), { id: cap.id, bid }), bid + ' completed');
+  }
+  await ev(() => AOW.Debug.giveResources(400));
+  assert(await selectCityByClick(cap.hex, cap.id), 'capital selected');
+  await click('.hud-selection button:has-text("도시")');
+  await waitFn(() => AOW.UI.isOpen('city'));
+  await click(CS2 + '.sc-tab:has-text("모집")');
+  await page.waitForTimeout(120);
+  const t2 = await ev(id => {
+    const g = AOW.game, c = AOW.State.city(g, id);
+    const rows = Array.from(document.querySelectorAll('.aow-screen[data-screen="city"] .sc-row[data-unit]')).map(e => e.dataset.unit);
+    const ok = rows.find(u => { const d = AOW.Data.get('units', u); return d && d.tier === 2 && AOW.Rules.canRecruit(g, c, u).ok; });
+    return { rows: rows.length, id: ok || null, name: ok ? AOW.L(AOW.Data.get('units', ok).name) : null };
+  }, cap.id);
+  assert(!!t2.id, 'a tier-2 unit is recruitable after the barracks: ' + t2.name);
+  await click(CS2 + '.sc-row[data-unit="' + t2.id + '"] button');
+  await page.waitForTimeout(120);
+  assert(await ev(q => AOW.State.city(AOW.game, q.id).queue.some(x => x.type === 'unit' && x.id === q.u), { id: cap.id, u: t2.id }), t2.name + ' queued through the 모집 button');
+  await ev(q => { const c = AOW.State.city(AOW.game, q.id); const it = c.queue.find(x => x.type === 'unit' && x.id === q.u); c.draft = Math.max(c.draft, it.need); }, { id: cap.id, u: t2.id });   // setup: draft in stock
+  await closeScreenEsc('city');
+  let got = 0;
+  for (let i = 0; i < 4 && !got; i++) {
+    await endTurnViaHud();
+    got = await ev(q => { const g = AOW.game, c = AOW.State.city(g, q.id); let n = 0; for (const a of AOW.State.armiesAt(g, c.hex)) if (a.owner === c.owner) for (const uid of a.units) { const u = AOW.State.unit(g, uid); if (u && u.typeId === q.u) n++; } return n; }, { id: cap.id, u: t2.id });
+  }
+  assert(got > 0, 'the tier-2 ' + t2.name + ' joined the capital garrison');
+  assertNoErrors(0, 'city growth & production');
+
+  // ---------------------------------------------------------------- I. outpost
+  step('Outpost: found one with the HUD button, then raise it to a city from the city screen');
+  ra = await rulerArmy();
+  await ev(() => AOW.Debug.giveResources(600));
+  const site = await ev(q => {
+    const g = AOW.game, p = g.players.find(x => x.isHuman), a = AOW.State.army(g, q.armyId);
+    let best = -1, bd = 1e9;
+    for (let i = 0; i < g.W * g.H; i++) {
+      if (!AOW.Rules.canFoundOutpost(g, p, i, null).ok || AOW.State.armiesAt(g, i).length) continue;
+      if (!isFinite(AOW.State.hexMoveCost(g, i, 'walk'))) continue;
+      if (AOW.Hex.neighborsIdx(i, g.W, g.H).some(m => m >= 0 && AOW.State.armiesAt(g, m).some(x => x.owner !== p.id && x.units.length))) continue;
+      const d = AOW.Hex.distIdx(a.hex, i, g.W);
+      if (d < bd) { bd = d; best = i; }
+    }
+    if (best < 0) return null;
+    AOW.Debug.teleportArmy(a.id, best);                           // setup: the stack stands on a free site
+    a.mp = AOW.Rules.armyMaxMp(g, a);
+    AOW.WorldRender.centerOn(best, false);
+    return { hex: best, cities: g.cities.filter(c => c.owner === p.id).length };
+  }, ra);
+  assert(!!site, 'found a free outpost site (hex ' + (site && site.hex) + ')');
+  await page.waitForTimeout(120);
+  assert(await selectArmyByClick(site.hex, ra.armyId), 'army selected on the site');
+  assert(await exists('.hud-actions button:has-text("전초기지 건설"):not([disabled])'), '전초기지 건설 is enabled');
+  await click('.hud-actions button:has-text("전초기지 건설")');
+  await page.waitForTimeout(200);
+  const op = await ev(hex => { const c = AOW.State.cityAt(AOW.game, hex); return c ? { id: c.id, tier: c.tier, owner: c.owner, name: c.name } : null; }, site.hex);
+  assert(op && op.tier === 0 && op.owner === HP, 'outpost ' + (op && op.name) + ' founded (tier 0)');
+  assert(await selectCityByClick(site.hex, op.id), 'outpost selected');
+  await click('.hud-selection button:has-text("도시")');
+  await waitFn(() => AOW.UI.isOpen('city'));
+  assert(await exists(CS2 + '.sc-outpost .sc-upgrade'), 'city screen offers 도시로 승격 for the outpost');
+  let capInfo = await ev(() => { const g = AOW.game, p = g.players.find(x => x.isHuman); return { n: AOW.Rules.cityCount(g, p.id), cap: AOW.Rules.cityCap(g, p) }; });
+  if (capInfo.n >= capInfo.cap) {
+    assert(await exists(CS2 + '.sc-outpost .sc-upgrade[disabled]'), 'at the city cap (' + capInfo.n + '/' + capInfo.cap + ') the upgrade is disabled');
+    await ev(() => { const g = AOW.game, p = g.players.find(x => x.isHuman); p.cityCapBonus = (p.cityCapBonus || 0) + 1; AOW.Rules.invalidate(p.id); AOW.UI.refresh(); });   // setup: one more slot
+    await page.waitForTimeout(120);
+  }
+  await click(CS2 + '.sc-outpost .sc-upgrade');
+  await page.waitForTimeout(200);
+  const up = await ev(id => { const c = AOW.State.city(AOW.game, id); return { tier: c.tier, badge: (document.querySelector('.aow-screen[data-screen="city"] .sc-city-head .sc-badge') || {}).textContent || '', banner: !!document.querySelector('.aow-screen[data-screen="city"] .sc-outpost') }; }, op.id);
+  assert(up.tier === 1 && !up.banner, 'outpost upgraded to a tier-1 city');
+  assert(up.badge.indexOf(await ev(() => AOW.Screens.tierName(1))) >= 0, 'tier badge now reads "' + up.badge + '"');
+  await shot('outpost_upgraded');
+  await closeScreenEsc('city');
+  assertNoErrors(0, 'outposts');
+
+  // ---------------------------------------------------------------- J. free city
+  step('Free city: select it with an army alongside → 선물 raises its opinion');
+  ra = await rulerArmy();
+  const fc = await ev(q => {
+    const g = AOW.game, hp = g.players.find(x => x.isHuman).id, a = AOW.State.army(g, q.armyId);
+    let best = null;
+    for (const c of g.cities) {
+      if (!c.freeCity || c.owner >= 0 || (c.freeCity.warWith || []).includes(hp)) continue;
+      const d = AOW.Hex.distIdx(a.hex, c.hex, g.W);
+      if (!best || d < best.d) best = { id: c.id, hex: c.hex, d, name: c.name };
+    }
+    return best;
+  }, ra);
+  if (!fc) info('no free city left on the map — skipped');
+  else {
+    await teleportNextTo(ra.armyId, fc.hex);
+    await ev(() => AOW.Debug.giveResources(200));
+    const op0 = await ev(q => { const g = AOW.game, p = g.players.find(x => x.isHuman); return { op: AOW.Rules.freeCityOpinion(g, AOW.State.city(g, q.id), p.id), gold: p.resources.gold }; }, fc);
+    await clickHex(fc.hex);
+    if ((await ev(() => AOW.UI.selected.cityId)) !== fc.id) await clickHex(fc.hex);
+    assert((await ev(() => AOW.UI.selected.cityId)) === fc.id, 'free city ' + fc.name + ' selected by clicking its hex');
+    assert(((await textOf('.hud-selection .aow-panel__title')) || '').indexOf('자유 도시') >= 0, 'panel titled 자유 도시');
+    await click('.hud-selection button:has-text("선물")');
+    await page.waitForTimeout(150);
+    const op1 = await ev(q => { const g = AOW.game, p = g.players.find(x => x.isHuman); return { op: AOW.Rules.freeCityOpinion(g, AOW.State.city(g, q.id), p.id), gold: p.resources.gold, text: (document.querySelector('.hud-selection') || {}).textContent || '' }; }, fc);
+    assert(op1.op > op0.op, 'opinion ' + op0.op + ' → ' + op1.op);
+    assert(op1.gold < op0.gold, 'the gift cost gold (' + op0.gold + ' → ' + op1.gold + ')');
+    assert(op1.text.indexOf(String(op1.op)) >= 0, 'panel shows the new opinion');
+    await shot('free_city');
+  }
+  assertNoErrors(0, 'free city');
+
+  // ---------------------------------------------------------------- K. empire skill + tome gating
+  step('Empire: buy a skill with imperium through the empire screen');
+  await ev(() => AOW.Debug.giveResources(500));
+  await openNav(3, 'empire');
+  const emp0 = await ev(() => { const p = AOW.game.players.find(x => x.isHuman); return { n: (p.empireSkills || []).length, imp: p.resources.imperium }; });
+  const node = await ev(() => { const e = document.querySelector('.aow-screen[data-screen="empire"] .sc-node.available[data-empire] button:not([disabled])'); return e ? e.closest('.sc-node').dataset.empire : null; });
+  assert(!!node, 'an empire skill is purchasable: ' + node);
+  await click('.aow-screen[data-screen="empire"] .sc-node[data-empire="' + node + '"] button');
+  await page.waitForTimeout(150);
+  const emp1 = await ev(id => { const p = AOW.game.players.find(x => x.isHuman); return { n: (p.empireSkills || []).length, has: (p.empireSkills || []).includes(id), imp: p.resources.imperium, owned: !!document.querySelector('.aow-screen[data-screen="empire"] .sc-node.owned[data-empire="' + id + '"]') }; }, node);
+  assert(emp1.has && emp1.n === emp0.n + 1, 'player.empireSkills ' + emp0.n + ' → ' + emp1.n);
+  assert(emp1.imp < emp0.imp && emp1.owned, 'imperium spent (' + emp0.imp + ' → ' + emp1.imp + ') and the node shows as owned');
+  await closeScreenEsc('empire');
+
+  step('Research: tome gating messages match the rules');
+  await openNav(1, 'research');
+  const RS = '.aow-screen[data-screen="research"] ';
+  const lockedId = await ev(() => { const e = document.querySelector('.aow-screen[data-screen="research"] .sc-book.locked[data-tome]'); return e ? e.dataset.tome : null; });
+  if (!lockedId) info('no locked tome left');
+  else {
+    await click(RS + '.sc-book[data-tome="' + lockedId + '"]');
+    await page.waitForTimeout(120);
+    const lk = await ev(id => ({ shown: (document.querySelector('.aow-screen[data-screen="research"] .sc-lockreason') || {}).textContent || '', rule: AOW.Rules.tomeLockReason(AOW.game, AOW.game.players.find(x => x.isHuman), id) }), lockedId);
+    assert(lk.shown.trim() === lk.rule, 'locked tome explains itself: "' + lk.shown.trim() + '"');
+    assert(await exists(RS + 'button:has-text("마법서 선택")[disabled]'), 'its 마법서 선택 button is disabled');
+  }
+  const freeId = await ev(() => { const e = document.querySelector('.aow-screen[data-screen="research"] .sc-book:not(.locked):not(.owned)[data-tome]'); return e ? e.dataset.tome : null; });
+  if (!freeId) info('no selectable tome');
+  else {
+    const n0 = await ev(() => AOW.game.players.find(x => x.isHuman).tomes.length);
+    await click(RS + '.sc-book[data-tome="' + freeId + '"]');
+    await page.waitForTimeout(120);
+    await click(RS + 'button:has-text("마법서 선택"):not([disabled])');
+    await page.waitForTimeout(150);
+    const n1 = await ev(id => { const p = AOW.game.players.find(x => x.isHuman); return { n: p.tomes.length, has: p.tomes.includes(id) }; }, freeId);
+    assert(n1.has && n1.n === n0 + 1, 'an unlocked tome was added through 마법서 선택 (' + n0 + ' → ' + n1.n + ')');
+  }
+  await closeScreenEsc('research');
+  assertNoErrors(0, 'empire & research');
+
+  // ---------------------------------------------------------------- L. 1280×720
+  step('1280×720: HUD and screens fit without overflow');
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.waitForTimeout(400);
+  const cap3 = await ev(() => { const g = AOW.game, c = AOW.State.capital(g, g.players.find(p => p.isHuman).id); AOW.WorldRender.centerOn(c.hex, false); return { hex: c.hex, id: c.id }; });
+  await selectCityByClick(cap3.hex, cap3.id);
+  const fit = await ev(() => {
+    const W = window.innerWidth, H = window.innerHeight, out = { W, H, bad: [], overlaps: [] };
+    const de = document.documentElement;
+    if (de.scrollWidth > W || de.scrollHeight > H) out.bad.push('page scrolls ' + de.scrollWidth + '×' + de.scrollHeight);
+    const rect = sel => { const e = document.querySelector(sel); if (!e) return null; const r = e.getBoundingClientRect(); return r.width && r.height ? r : null; };
+    const parts = ['.hud-topbar', '.hud-nav', '.hud-selection', '.hud-minimap', '.hud-endturn-wrap', '.hud-bottombar', '.hud-notifications'];
+    const R = {};
+    for (const s of parts) { const r = rect(s); R[s] = r; if (r && (r.left < -1 || r.top < -1 || r.right > W + 1 || r.bottom > H + 1)) out.bad.push(s + ' ' + Math.round(r.left) + ',' + Math.round(r.top) + '–' + Math.round(r.right) + ',' + Math.round(r.bottom)); }
+    const hit = (a, b) => a && b && a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1;
+    const pairs = [['.hud-selection', '.hud-bottombar'], ['.hud-selection', '.hud-minimap'], ['.hud-bottombar', '.hud-minimap'], ['.hud-bottombar', '.hud-endturn-wrap'], ['.hud-notifications', '.hud-minimap']];
+    for (const [a, b] of pairs) if (hit(R[a], R[b])) out.overlaps.push(a + ' × ' + b);
+    // the resource row must not hide the nav buttons
+    const nav = R['.hud-nav']; if (nav && nav.right > W) out.bad.push('nav cut off');
+    return out;
+  });
+  assert(!fit.bad.length, 'HUD fits 1280×720' + (fit.bad.length ? ': ' + fit.bad.join('; ') : ''));
+  assert(!fit.overlaps.length, 'HUD panels do not overlap' + (fit.overlaps.length ? ': ' + fit.overlaps.join('; ') : ''));
+  await shot('hud_1280x720');
+  for (const s of ['city', 'hero', 'research', 'empire']) {
+    if (s === 'city') { await click('.hud-selection button:has-text("도시")'); await waitFn(() => AOW.UI.isOpen('city')); await page.waitForTimeout(150); }
+    else await openNav({ hero: 4, research: 1, empire: 3 }[s], s);
+    // the panel lays out once the screen's CSS has applied — wait for a real width before measuring
+    await waitFn(s => Array.from(document.querySelectorAll('.aow-screen[data-screen="' + s + '"] .aow-panel')).some(e => e.getBoundingClientRect().width > 300), s, 5000);
+    const r = await ev(s => {
+      const W = window.innerWidth, H = window.innerHeight;
+      // the screen's main panel = its largest .aow-panel
+      let b = null;
+      for (const e of document.querySelectorAll('.aow-screen[data-screen="' + s + '"] .aow-panel')) { const r = e.getBoundingClientRect(); if (!b || r.width * r.height > b.width * b.height) b = r; }
+      if (!b) b = document.querySelector('.aow-screen[data-screen="' + s + '"]').getBoundingClientRect();
+      const de = document.documentElement;
+      return { l: Math.round(b.left), t: Math.round(b.top), r: Math.round(b.right), b: Math.round(b.bottom), W, H, sw: de.scrollWidth, sh: de.scrollHeight };
+    }, s);
+    assert(r.l >= 0 && r.t >= 0 && r.r <= r.W && r.b <= r.H && r.sw <= r.W && r.sh <= r.H, s + ' screen fits 1280×720 (panel ' + r.l + ',' + r.t + '–' + r.r + ',' + r.b + ')');
+    if (s === 'city' || s === 'hero') await shot(s + '_1280x720');
+    await closeScreenEsc(s);
+  }
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await page.waitForTimeout(300);
+  assertNoErrors(0, '1280×720 layout');
+
+  // ---------------------------------------------------------------- M. world render timing
+  step('World render timing at zoom 1 (warm cache)');
+  const perf = await ev(async () => {
+    const WR = AOW.WorldRender, g = AOW.game;
+    const z0 = WR.camera.zoom;
+    WR.setZoom(1);
+    WR.camera.zoom = 1; if ('tz' in WR.camera) WR.camera.tz = 1;
+    const c = AOW.State.capital(g, g.players.find(p => p.isHuman).id);
+    WR.centerOn(c.hex, false);
+    // a frame = WR.render + rasterizing what it recorded: the 1-px readback forces the canvas to flush, otherwise
+    // the raster work would pile up and land on an arbitrary later call instead of the frame that caused it
+    const cv = document.getElementById('world').getContext('2d');
+    const frame = () => { const t0 = performance.now(); WR.render(1 / 60); cv.getImageData(0, 0, 1, 1); return performance.now() - t0; };
+    for (let i = 0; i < 30; i++) { WR.render(1 / 60, { buildAll: i < 3 }); cv.getImageData(0, 0, 1, 1); }   // warm the chunk + fog caches
+    const times = [];
+    for (let i = 0; i < 90; i++) times.push(frame());
+    // pan across the map (chunks come and go)
+    const pan = [];
+    for (let i = 0; i < 60; i++) { WR.camera.x += 24; pan.push(frame()); }
+    // per-layer raster cost (WR.profileRaster flushes the canvas at every phase mark) — diagnostics only
+    WR.centerOn(c.hex, false);
+    for (let i = 0; i < 10; i++) WR.render(1 / 60);
+    WR.profileRaster = true;
+    const st = WR.stats().t; for (const k of Object.keys(st)) st[k] = 0;
+    for (let i = 0; i < 40; i++) WR.render(1 / 60);
+    WR.profileRaster = false;
+    const phases = {}; for (const k of Object.keys(st)) if (st[k] > 0.2) phases[k] = +st[k].toFixed(1);
+    const drawn = WR.stats().drawn;
+    WR.setZoom(z0);
+    WR.centerOn(c.hex, false);
+    times.sort((a, b) => a - b); pan.sort((a, b) => a - b);
+    const avg = a => a.reduce((s, x) => s + x, 0) / a.length;
+    return { avg: +avg(times).toFixed(2), p95: +times[Math.floor(times.length * 0.95)].toFixed(2), panAvg: +avg(pan).toFixed(2), panP95: +pan[Math.floor(pan.length * 0.95)].toFixed(2), turn: g.turn, lastTurnMs: g.turnStats && g.turnStats.ms, phases, drawn };
+  });
+  info(JSON.stringify(perf));
+  assert(perf.avg < 12, 'warm frame at zoom 1: avg ' + perf.avg + ' ms, p95 ' + perf.p95 + ' ms (turn ' + perf.turn + ')');
+  assert(perf.panAvg < 30, 'while panning (chunk builds included): avg ' + perf.panAvg + ' ms, p95 ' + perf.panP95 + ' ms');
+
+  // ---------------------------------------------------------------- N. victory (last: it ends the game)
+  step('Victory: knock out every rival → end turn → victory screen → 계속하기 → play on');
+  await ensureHud();
+  const rivals = await ev(() => { const g = AOW.game, out = []; for (const p of g.players) if (!p.isHuman && p.alive) { AOW.Debug.eliminate(p.id); out.push(p.name); } return out; });
+  info('setup: eliminated ' + rivals.join(', '));
+  await endTurnViaHud();
+  if (!(await ev(() => AOW.UI.isOpen('victory')))) info('state: ' + JSON.stringify(await ev(() => ({ v: AOW.game.victory, alive: AOW.game.players.map(p => p.alive), screen: AOW.UI.currentScreen() }))));
+  await waitFn(() => AOW.UI.isOpen('victory'), null, 5000);
+  const h1w = await ev(() => { const h = document.querySelector('.sc-victory h1'); return h ? Math.round(h.getBoundingClientRect().width) : 0; });
+  assert(h1w > 100, 'victory title laid out at full width from the first frame (' + h1w + 'px)');
+  const vic = await ev(() => ({ v: AOW.game.victory, h1: (document.querySelector('.sc-victory h1') || {}).textContent, h2: (document.querySelector('.sc-victory h2') || {}).textContent, mood: AOW.Music.getMood(), alive: AOW.game.players.filter(p => p.alive).length }));
+  assert(vic.v && vic.v.type === 'military' && vic.v.winner === HP, 'military victory recorded for us (' + vic.alive + ' realm left)');
+  assert(vic.h1 === '승리' && vic.h2 === '군사 승리', 'victory screen: "' + vic.h1 + ' — ' + vic.h2 + '"');
+  assert(vic.mood === 'victory', 'music mood → victory');
+  await shot('victory');
+  await click('.aow-screen[data-screen="victory"] button:has-text("계속하기")');
+  await waitFn(() => !AOW.UI.isOpen('victory'));
+  assert(await ev(() => AOW.UI.currentScreen() === 'hud' && AOW.game.victory.continued === true), '계속하기 closed the screen and marked the result acknowledged');
+  const tv = await ev(() => AOW.game.turn);
+  await endTurnViaHud();
+  assert(await ev(t => AOW.game.turn === t + 1 && !AOW.UI.isOpen('victory'), tv), 'turns go on after the victory (turn ' + tv + ' → ' + (tv + 1) + ')');
+  assertNoErrors(0, 'victory');
 }
 
 // ------------------------------------------------------------------ flow helpers
@@ -908,7 +1625,8 @@ async function castSpell() {
 
 // ------------------------------------------------------------------ main
 (async () => {
-  browser = await chromium.launch({ headless: !flag('headed'), slowMo: +opt('slowmo', 0) || 0 });
+  // like tools/shot.js: let the AudioContext start without a user gesture so the music checks are meaningful
+  browser = await chromium.launch({ headless: !flag('headed'), slowMo: +opt('slowmo', 0) || 0, args: ['--autoplay-policy=no-user-gesture-required'] });
   page = await browser.newPage({ viewport: { width: 1600, height: 900 }, deviceScaleFactor: 1 });
   page.on('pageerror', e => errors.push('pageerror: ' + e.message + ' @ ' + (e.stack || '').split('\n')[1]));
   page.on('console', m => { if (m.type() === 'error') errors.push('console: ' + m.text()); });

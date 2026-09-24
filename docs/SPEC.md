@@ -132,6 +132,8 @@ Emit synchronously. Canonical event names are listed in §9.
 `AOW.t(key, params)` → string with `{name}` substitution; falls back to en, then the key.
 `AOW.L(obj)` → `obj[lang] || obj.en || obj.ko || String(obj)`.
 `I18n.lang` ('ko'|'en'), `I18n.setLang(lang)` emits `i18n:changed`.
+Korean particles: never write hedged forms like `이(가)` / `을(를)`. Use `I18n.josa(word, '이/가'|'을/를'|'은/는'|'과/와'|'으로/로')`
+(→ word + the particle that fits its last syllable) in code, or `{name:이/가}` placeholders in dictionary strings.
 
 ### AOW.Data
 `Data.define(kind, obj)` registers `obj` under `Data[kind][obj.id]` (kinds: forms, cultures, traits, buildings,

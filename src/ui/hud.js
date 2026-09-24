@@ -232,7 +232,7 @@
       overlayMode = overlayMode === mode ? 'none' : mode;
       if (hasFn('WorldRender', 'setOverlay')) safe(() => AOW.WorldRender.setOverlay(overlayMode));
       renderMinimapOverlayButtons(overlays);
-    }, { icon, kind: 'ghost', small: true, tooltip: t(tipKey) }));
+    }, { icon, kind: 'ghost', small: true, tooltip: () => t(tipKey) }));   // a function: the minimap is kept across relang
     ovBtn('provinces', UI.iconName('annex', 'eye'), 'hud.overlay.provinces');
     ovBtn('yields', UI.iconName('gold'), 'hud.overlay.yields');
     frame.appendChild(overlays);
@@ -365,7 +365,7 @@
       UI.icon(city.tier === 0 ? 'outpost' : 'cities', 30),
       el('div', { class: 'aow-grow' },
         el('div', { class: 'hud-cityhead__name' }, city.name, city.isCapital ? UI.icon('crown', 15) : null),
-        el('div', { class: 'aow-dim aow-small' }, isFree ? t('hud.selection.freeCity') : (UI.roman(city.tier) + ' · ' + t('ui.res_pop') + ' ' + UI.fmt(city.pop))))));
+        el('div', { class: 'aow-dim aow-small hud-cityhead__tier' }, isFree ? t('hud.selection.freeCity') : ((UI.roman(city.tier) + ' ' + (AOW.Screens && AOW.Screens.tierName ? AOW.Screens.tierName(city.tier) : '')).trim() + ' · ' + t('ui.res_pop') + ' ' + UI.fmt(city.pop))))));
     if (!isFree) {
       const y = hasFn('Rules', 'cityYields') ? safe(() => AOW.Rules.cityYields(g, city), null) : null;
       if (y) {

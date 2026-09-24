@@ -2449,8 +2449,13 @@
       }
       const struct = St.structureAt ? St.structureAt(game, battle.hexIdx) : null;
       if (struct && !struct.cleared) {
-        result.clearedStructureId = struct.id;
-        if (Ru && typeof Ru.clearStructure === 'function') { try { Ru.clearStructure(game, struct, battle.sidePlayers[0]); } catch (e) { /* optional */ } }
+        // guards that fled the field scatter — they do not keep holding the site they lost
+        if (fled && struct.guardArmyId >= 0 && loserArmies.includes(struct.guardArmyId)) St.removeArmy(game, struct.guardArmyId);
+        // Rules.clearStructure takes the structure id (passing the object silently failed: no wonder was ever
+        // cleared or rewarded by a battle fought/auto-resolved through the battle UI)
+        let cleared = null;
+        if (Ru && typeof Ru.clearStructure === 'function') { try { cleared = Ru.clearStructure(game, struct.id, battle.sidePlayers[0]); } catch (e) { console.error('[Combat.finish] clearStructure', e); } }
+        if (cleared && cleared.ok) { result.clearedStructureId = struct.id; result.loot = Object.assign({}, cleared.reward); }
       }
     }
     battle.result = result;

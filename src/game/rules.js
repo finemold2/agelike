@@ -83,7 +83,8 @@
       'rules.reason.notAdjacent': '인접하지 않았습니다.', 'rules.reason.nothingToAttack': '공격할 대상이 없습니다.', 'rules.reason.notAtWar': '전쟁 중이 아닙니다.',
       'rules.reason.freeCityPeace': '자유도시와 평화 상태입니다. 먼저 전쟁을 선포하세요.', 'rules.reason.sameOwner': '아군입니다.', 'rules.reason.tooMany': '부대는 최대 6유닛입니다.',
       'rules.reason.differentHex': '같은 칸에 있어야 합니다.', 'rules.reason.unknownTome': '알 수 없는 서입니다.', 'rules.reason.tomeOwned': '이미 선택한 서입니다.',
-      'rules.reason.tierLocked': '서 등급이 잠겨 있습니다.', 'rules.reason.affinityLow': '친화가 부족합니다.', 'rules.reason.oneTierFive': '5등급 서는 하나만 선택할 수 있습니다.',
+      'rules.reason.tierLocked': '이 등급의 마법서는 아직 잠겨 있습니다.', 'rules.reason.affinityLow': '친화가 부족합니다.',
+      'rules.reason.tierLockedN': '마법서를 {n}권 먼저 선택해야 합니다 (현재 {have}권).', 'rules.reason.affinityLowN': '{aff} 친화 {n} 이상이 필요합니다 (현재 {have}).', 'rules.reason.oneTierFive': '5등급 서는 하나만 선택할 수 있습니다.',
       'rules.reason.notInTome': '선택한 서의 내용이 아닙니다.', 'rules.reason.alreadyResearched': '이미 연구했습니다.', 'rules.reason.unknownSpell': '알 수 없는 주문입니다.',
       'rules.reason.notKnown': '아직 배우지 않은 주문입니다.', 'rules.reason.combatOnly': '전투 중에만 시전할 수 있습니다.', 'rules.reason.alreadyActive': '이미 활성화된 주문입니다.',
       'rules.reason.casting': '다른 주문을 시전하는 중입니다.', 'rules.reason.badTarget': '잘못된 대상입니다.', 'rules.reason.notInDomain': '아군 영역 안이어야 합니다.',
@@ -112,7 +113,8 @@
       'rules.reason.notAdjacent': 'Not adjacent.', 'rules.reason.nothingToAttack': 'Nothing to attack.', 'rules.reason.notAtWar': 'Not at war.',
       'rules.reason.freeCityPeace': 'At peace with this free city. Declare war first.', 'rules.reason.sameOwner': 'Friendly.', 'rules.reason.tooMany': 'An army holds at most 6 units.',
       'rules.reason.differentHex': 'Must be on the same hex.', 'rules.reason.unknownTome': 'Unknown tome.', 'rules.reason.tomeOwned': 'Tome already chosen.',
-      'rules.reason.tierLocked': 'Tome tier locked.', 'rules.reason.affinityLow': 'Affinity too low.', 'rules.reason.oneTierFive': 'Only one tier V tome may be chosen.',
+      'rules.reason.tierLocked': 'This tome tier is still locked.', 'rules.reason.affinityLow': 'Affinity too low.',
+      'rules.reason.tierLockedN': 'Select {n} tomes first ({have} so far).', 'rules.reason.affinityLowN': 'Needs {aff} affinity {n} (you have {have}).', 'rules.reason.oneTierFive': 'Only one tier V tome may be chosen.',
       'rules.reason.notInTome': 'Not part of a chosen tome.', 'rules.reason.alreadyResearched': 'Already researched.', 'rules.reason.unknownSpell': 'Unknown spell.',
       'rules.reason.notKnown': 'Spell not learned.', 'rules.reason.combatOnly': 'Can only be cast in battle.', 'rules.reason.alreadyActive': 'Spell already active.',
       'rules.reason.casting': 'Another spell is being cast.', 'rules.reason.badTarget': 'Invalid target.', 'rules.reason.notInDomain': 'Must be inside your domain.',
@@ -965,15 +967,28 @@
     if (Events()) { Events().emit('city:founded', { cityId: city.id }); Events().emit('city:changed', { cityId: city.id }); }
     return { ok: true, cityId: city.id, city };
   };
-  /** Upgrade a tier-0 outpost into a real city (imperium + city cap). */
-  Rules.upgradeOutpost = function (game, city) {
+  /** Imperium needed to raise this outpost into a city. */
+  Rules.outpostUpgradeCost = function (game, city) {
+    const player = city && city.owner >= 0 ? S().player(game, city.owner) : null;
+    const eff = player ? Rules.playerEffects(game, player) : {};
+    return Math.max(1, Math.round(C.OUTPOST_UPGRADE_IMPERIUM * (1 + clamp(eff.provinceCostPct || 0, -75, 200) / 100)));
+  };
+  /** Can this outpost be upgraded right now? → {ok, reason, cost:{imperium}} */
+  Rules.canUpgradeOutpost = function (game, city) {
     if (!city || city.owner < 0) return fail('notOwner');
     if (city.tier !== 0) return fail('notOutpost');
     const player = S().player(game, city.owner); Rules.ensurePlayer(game, player);
-    if (Rules.cityCount(game, player.id) >= Rules.cityCap(game, player.id)) return fail('cityCap');
-    const eff = Rules.playerEffects(game, player);
-    const cost = Math.max(1, Math.round(C.OUTPOST_UPGRADE_IMPERIUM * (1 + clamp(eff.provinceCostPct || 0, -75, 200) / 100)));
-    if (player.resources.imperium < cost) return fail('notEnoughImperium');
+    const cost = Rules.outpostUpgradeCost(game, city);
+    if (Rules.cityCount(game, player.id) >= Rules.cityCap(game, player.id)) return Object.assign(fail('cityCap'), { cost: { imperium: cost } });
+    if (player.resources.imperium < cost) return Object.assign(fail('notEnoughImperium'), { cost: { imperium: cost } });
+    return { ok: true, cost: { imperium: cost } };
+  };
+  /** Upgrade a tier-0 outpost into a real city (imperium + city cap). */
+  Rules.upgradeOutpost = function (game, city) {
+    const chk = Rules.canUpgradeOutpost(game, city);
+    if (!chk.ok) return chk;
+    const player = S().player(game, city.owner);
+    const cost = chk.cost.imperium;
     player.resources.imperium -= cost;
     city.tier = 1;
     city.pop = Math.max(1, city.pop);
@@ -982,7 +997,7 @@
     if (st) st.kind = 'city';
     player.stats.cities = Rules.cityCount(game, player.id);
     Rules.invalidate(player.id);
-    Rules.notify(game, player.id, 'good', L(`${J(city.name, '이/가')} 도시로 성장했습니다.`, `${city.name} has grown into a city.`), 'city', { cityId: city.id });
+    Rules.notify(game, player.id, 'good', L(`${J(city.name, '이/가')} 도시로 성장했습니다.`, `${city.name} has grown into a city.`), 'city', { cityId: city.id }, LOW);
     if (Events()) { Events().emit('city:founded', { cityId: city.id }); Events().emit('city:changed', { cityId: city.id }); }
     return { ok: true, cost: { imperium: cost } };
   };
@@ -1711,8 +1726,15 @@
     if (!tome) return Rules.reasonText('unknownTome');
     if ((player.tomes || []).includes(tomeId)) return Rules.reasonText('tomeOwned');
     const tier = tome.tier || 1;
-    if ((player.tomes || []).length < (TOME_TIER_TOMES[tier] || 0)) return Rules.reasonText('tierLocked');
-    if (Rules.tomeAffinity(player, tome) < (TOME_TIER_AFFINITY[tier] || 0)) return Rules.reasonText('affinityLow');
+    // specific, actionable reasons ("select 2 tomes first (1 so far)", "needs Order affinity 6 (you have 3)")
+    const have = (player.tomes || []).length, needTomes = TOME_TIER_TOMES[tier] || 0;
+    if (have < needTomes) return AOW.t('rules.reason.tierLockedN', { n: needTomes, have });
+    const needAff = TOME_TIER_AFFINITY[tier] || 0, aff = Rules.tomeAffinity(player, tome);
+    if (aff < needAff) {
+      let main = null; for (const k of Object.keys(tome.affinity || {})) if (!main || tome.affinity[k] > tome.affinity[main]) main = k;
+      const affName = main && AOW.I18n.has('ui.aff_' + main) ? AOW.t('ui.aff_' + main) : (main || '');
+      return AOW.t('rules.reason.affinityLowN', { aff: affName, n: needAff, have: aff });
+    }
     if (tier === 5) { for (const id of player.tomes || []) { const t = tomeOf(id); if (t && t.tier === 5) return Rules.reasonText('oneTierFive'); } }
     return null;
   };
@@ -1732,7 +1754,7 @@
     player.tomes.push(tomeId);
     for (const k of Object.keys(tome.affinity || {})) player.affinity[k] = (player.affinity[k] || 0) + tome.affinity[k];
     Rules.invalidate(player.id);
-    Rules.notify(game, player.id, 'good', L(`${J(KO(tome.name), '을/를')} 서고에 추가했습니다.`, `${EN(tome.name)} added to your book.`), 'knowledge', { tomeId });
+    Rules.notify(game, player.id, 'good', L(`${J(KO(tome.name), '을/를')} 서고에 추가했습니다.`, `${EN(tome.name)} added to your book.`), 'knowledge', { tomeId }, LOW);
     if (!player.research.current) {
       const opts = Rules.researchOptions(game, player).filter(o => o.tomeId === tomeId);
       if (opts.length) Rules.startResearch(game, player, tomeId, opts[0].contentId);
@@ -2522,7 +2544,7 @@
 
   /** Clear a wonder / infestation once its guards are gone: pays rewards to `pid`. */
   Rules.clearStructure = function (game, structureId, pid) {
-    const st = S().structure(game, structureId);
+    const st = structureId && typeof structureId === 'object' ? structureId : S().structure(game, structureId);
     if (!st) return fail('badIndex');
     if (st.cleared) return fail('alreadyResearched');
     const guard = S().army(game, st.guardArmyId);

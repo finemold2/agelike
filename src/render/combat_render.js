@@ -759,7 +759,9 @@
   function drawGroundOverlays() {
     // water shimmer
     if (AOW.TerrainArt && typeof AOW.TerrainArt.drawWater === 'function') {
-      for (const k of cells) if (k.water) { try { AOW.TerrainArt.drawWater(ctx, k.x, k.y, { terrain: k.terrain, seed: k.seed, size: SIZE }, time); } catch (e) { /* optional */ } }
+      const TA = AOW.TerrainArt, batch = TA.waterBatch ? TA.waterBatch() : null;   // bucketed strokes (see TerrainArt.waterBatch)
+      for (const k of cells) if (k.water) { try { TA.drawWater(ctx, k.x, k.y, { terrain: k.terrain, seed: k.seed, size: SIZE }, time, batch); } catch (e) { /* optional */ } }
+      if (batch) { try { TA.flushWaterBatch(ctx, batch); } catch (e) { /* optional */ } }
     }
     // deployment zones (round 1)
     if (showDeployment()) {

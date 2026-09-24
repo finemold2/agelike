@@ -155,19 +155,23 @@
     for (const uid of a.units) { const u = AOW.State.unit(g, uid); if (u) u.hp = Math.min(u.hp, hp); }
     return a.units.length;
   };
-  /** knock a realm out of the game: its cities become free cities, its armies vanish; the next turn's
-   *  elimination check marks it dead (so Turn/Events report it the normal way) */
+  /** knock a realm out of the game: its cities become free cities, its armies and vassal ties vanish and it is
+   *  marked dead at once (so it cannot act again before the next elimination check) */
   Debug.eliminate = function (pid) {
     const g = AOW.game; if (!g) return false;
     const p = g.players[pid]; if (!p) return false;
     for (const a of g.armies.slice()) if (a.owner === pid) AOW.State.removeArmy(g, a.id);
     for (const c of g.cities) if (c.owner === pid) {
       c.owner = -1; c.isCapital = false; c.queue = [];
+      if (p.capitalId === c.id) p.capitalId = -1;
       c.freeCity = { culture: p.cultureId, form: p.formId, opinion: {}, vassalOf: -1, integrated: false, stones: [], warWith: [] };
       const st = AOW.State.structureAt(g, c.hex); if (st) { st.kind = 'free_city'; st.owner = -1; }
       for (const pr of c.provinces || []) { const prov = g.provinces[pr]; if (prov) { prov.owner = -1; for (const h of prov.hexes) g.owner[h] = -1; } }
     }
     for (const u of g.units.slice()) if (u.owner === pid && hasFn('State', 'removeUnit')) AOW.State.removeUnit(g, u.id);
+    for (const c of g.cities) if (c.freeCity && c.freeCity.vassalOf === pid) c.freeCity.vassalOf = -1;
+    p.alive = false;
+    if (hasFn('Rules', 'notifyWorld')) AOW.Rules.notifyWorld(g, 'warn', { ko: p.name + ' 세력이 멸망했습니다.', en: p.name + ' has been eliminated.' }, 'skull', { pid });
     if (hasFn('WorldRender', 'invalidate')) AOW.WorldRender.invalidate(null);
     return true;
   };

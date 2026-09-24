@@ -49,6 +49,7 @@
       'city.ownedProvinces': '보유 지방', 'city.annexable': '병합 가능한 지방', 'city.annex': '병합', 'city.annexCost': '병합 비용', 'city.noAnnex': '병합할 수 있는 인접 지방이 없습니다.',
       'city.improvement': '개선물', 'city.buildImprovement': '개선물 건설…', 'city.noImprovement': '개선물 없음', 'city.resourceNode': '자원', 'city.material': '마법 재료',
       'city.homeProvince': '중심 지방', 'city.garrisonEmpty': '주둔한 유닛이 없습니다.', 'city.enchantEmpty': '적용된 도시 마법이 없습니다.', 'city.dispel': '해제',
+      'city.outpostNote': '전초기지입니다. 도시로 승격하면 인구가 자라고 건설과 모집을 할 수 있습니다.', 'city.upgrade': '도시로 승격', 'city.cityCapInfo': '도시 {n}/{cap}',
       'city.buildings': '건물', 'city.walls': '성벽', 'city.yields': '산출', 'city.cannotAfford': '자원이 부족합니다.', 'city.notOwner': '내 도시가 아닙니다.',
       // research
       'research.title': '연구', 'research.tomes': '마법서 서가', 'research.selected': '선택한 마법서', 'research.options': '연구 가능', 'research.current': '현재 연구',
@@ -81,7 +82,7 @@
       'dip.opinion': '호감도', 'dip.treaties': '조약', 'dip.warScore': '전쟁 점수', 'dip.propose.peace': '평화 제안', 'dip.propose.non_aggression': '불가침', 'dip.propose.defensive_pact': '방어 동맹',
       'dip.propose.alliance': '동맹', 'dip.declareWar': '선전포고', 'dip.gift': '선물', 'dip.trade': '교역', 'dip.confirmWar': '{name}에게 선전포고하시겠습니까?',
       'dip.accepted': '{name:이/가} 제안을 받아들였습니다.', 'dip.rejected': '{name:이/가} 제안을 거절했습니다.', 'dip.sent': '제안을 보냈습니다.', 'dip.noOthers': '다른 세력이 없습니다.',
-      'dip.giftAmount': '선물할 금', 'dip.give': '주는 것', 'dip.receive': '받는 것', 'dip.terms': '조건', 'dip.incoming': '{name}의 제안', 'dip.accept': '수락', 'dip.decline': '거절',
+      'dip.giftAmount': '선물할 금', 'dip.give': '주는 것', 'dip.receive': '받는 것', 'dip.terms': '조건', 'dip.incoming': '{name}의 제안', 'dip.theirOpinion': '{name}의 호감도', 'dip.moreWaiting': '대기 중인 제안 {n}건이 더 있습니다', 'dip.accept': '수락', 'dip.decline': '거절',
       'dip.grievances': '불만', 'dip.truce': '휴전 {n}턴', 'dip.dead': '멸망', 'dip.ruler': '군주', 'dip.personality.expansionist': '확장주의', 'dip.personality.militarist': '군국주의',
       'dip.personality.scholar': '학자', 'dip.personality.diplomat': '외교관', 'dip.turns': '{n}턴', 'dip.kind.gift': '선물', 'dip.kind.trade': '교역', 'dip.kind.peace': '평화',
       'dip.kind.non_aggression': '불가침 조약', 'dip.kind.defensive_pact': '방어 동맹', 'dip.kind.alliance': '동맹', 'dip.kind.war': '선전포고', 'dip.breakdown': '호감도 내역', 'dip.failed': '제안할 수 없습니다.',
@@ -118,6 +119,7 @@
       'city.ownedProvinces': 'Owned Provinces', 'city.annexable': 'Annexable Provinces', 'city.annex': 'Annex', 'city.annexCost': 'Annex cost', 'city.noAnnex': 'No adjacent province can be annexed.',
       'city.improvement': 'Improvement', 'city.buildImprovement': 'Build improvement…', 'city.noImprovement': 'No improvement', 'city.resourceNode': 'Resource', 'city.material': 'Magic material',
       'city.homeProvince': 'Home province', 'city.garrisonEmpty': 'No units garrisoned.', 'city.enchantEmpty': 'No city enchantments active.', 'city.dispel': 'Dispel',
+      'city.outpostNote': 'This is an outpost. Upgrade it to a city so it can grow, build and recruit.', 'city.upgrade': 'Upgrade to city', 'city.cityCapInfo': 'Cities {n}/{cap}',
       'city.buildings': 'Buildings', 'city.walls': 'Walls', 'city.yields': 'Yields', 'city.cannotAfford': 'Not enough resources.', 'city.notOwner': 'Not your city.',
       'research.title': 'Research', 'research.tomes': 'Tome Shelf', 'research.selected': 'Selected Tomes', 'research.options': 'Available Research', 'research.current': 'Current Research',
       'research.none': 'No research in progress. Start one from the list on the right.', 'research.start': 'Start', 'research.researched': 'Researched',
@@ -145,7 +147,7 @@
       'dip.opinion': 'Opinion', 'dip.treaties': 'Treaties', 'dip.warScore': 'War score', 'dip.propose.peace': 'Propose Peace', 'dip.propose.non_aggression': 'Non-aggression', 'dip.propose.defensive_pact': 'Defensive Pact',
       'dip.propose.alliance': 'Alliance', 'dip.declareWar': 'Declare War', 'dip.gift': 'Gift', 'dip.trade': 'Trade', 'dip.confirmWar': 'Declare war on {name}?',
       'dip.accepted': '{name} accepted the proposal.', 'dip.rejected': '{name} rejected the proposal.', 'dip.sent': 'Proposal sent.', 'dip.noOthers': 'There are no other rulers.',
-      'dip.giftAmount': 'Gold to gift', 'dip.give': 'You give', 'dip.receive': 'You receive', 'dip.terms': 'Terms', 'dip.incoming': 'Proposal from {name}', 'dip.accept': 'Accept', 'dip.decline': 'Decline',
+      'dip.giftAmount': 'Gold to gift', 'dip.give': 'You give', 'dip.receive': 'You receive', 'dip.terms': 'Terms', 'dip.incoming': 'Proposal from {name}', 'dip.theirOpinion': '{name}\'s opinion of you', 'dip.moreWaiting': '{n} more proposal(s) waiting', 'dip.accept': 'Accept', 'dip.decline': 'Decline',
       'dip.grievances': 'Grievances', 'dip.truce': 'Truce {n} turns', 'dip.dead': 'Eliminated', 'dip.ruler': 'Ruler', 'dip.personality.expansionist': 'Expansionist', 'dip.personality.militarist': 'Militarist',
       'dip.personality.scholar': 'Scholar', 'dip.personality.diplomat': 'Diplomat', 'dip.turns': '{n} turns', 'dip.kind.gift': 'Gift', 'dip.kind.trade': 'Trade', 'dip.kind.peace': 'Peace',
       'dip.kind.non_aggression': 'Non-aggression pact', 'dip.kind.defensive_pact': 'Defensive pact', 'dip.kind.alliance': 'Alliance', 'dip.kind.war': 'Declaration of war', 'dip.breakdown': 'Opinion breakdown', 'dip.failed': 'Cannot propose.',
@@ -298,6 +300,9 @@
   const CSS = `
   .sc-root{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(6,9,16,.62);z-index:20;font-family:var(--font-body);color:var(--text)}
   .sc-root .aow-panel{display:flex;flex-direction:column;max-height:94vh}
+  .aow-screen__inner:has(> .sc-root){animation:none}
+  .sc-root > .aow-panel{animation:aow-pop .18s ease}
+  .sc-root .sc-victory{animation:aow-fade .35s ease}
   .sc-panel{width:min(1280px,96vw)}
   .sc-panel-narrow{width:min(760px,94vw)}
   .sc-body{flex:1;overflow:auto;padding:12px 14px;min-height:200px;max-height:calc(94vh - 56px)}
@@ -667,6 +672,26 @@
     head.append(left, popBox, stabBox, ownerBox);
     return head;
   }
+  /** tier-0 outposts: explain the limits and offer the upgrade to a real city (imperium + free city-cap slot) */
+  function outpostBanner(g, city, player, isOwn) {
+    if (!isOwn || city.tier !== 0) return null;
+    const chk = fn('Rules', 'canUpgradeOutpost') ? fn('Rules', 'canUpgradeOutpost')(g, city) : null;
+    const cost = chk && chk.cost ? chk.cost.imperium : num(rulesC().OUTPOST_UPGRADE_IMPERIUM, 0);
+    const count = fn('Rules', 'cityCount') ? fn('Rules', 'cityCount')(g, player.id) : 0;
+    const cap = fn('Rules', 'cityCap') ? fn('Rules', 'cityCap')(g, player) : num(player.cityCap, 0);
+    const b = btn(t('city.upgrade'), () => {
+      const f = fn('Rules', 'upgradeOutpost'); if (!f) { toast('warn', t('sc.unavailable')); return; }
+      if (result(f(g, city))) sfx('city_founded');
+      if (AOW.Events) AOW.Events.emit('city:changed', { cityId: city.id });
+      after('city');
+    }, { kind: 'gold', disabled: !!(chk && chk.ok === false), tooltip: chk && chk.ok === false ? reasonText(chk) : null });
+    b.classList.add('sc-upgrade');
+    return mk('div', { class: 'sc-row sc-outpost' }, icon('outpost', 30),
+      mk('div', { class: 'grow' }, mk('div', { class: 'name' }, t('city.outpostNote')),
+        mk('div', { class: 'sub' }, t('city.cityCapInfo', { n: count, cap }), '  ·  ', res('imperium', cost, { size: 14 }),
+          chk && chk.ok === false ? mk('span', { class: 'bad' }, '  ' + reasonText(chk)) : null)),
+      b);
+  }
   function cityYieldRow(g, city) {
     const y = cityYields(g, city);
     const row = mk('div', { class: 'sc-yields' });
@@ -717,7 +742,7 @@
       for (const b of list.sort((a, c) => a.tier - c.tier)) {
         const isQ = queued.has(b.id);
         const cost = num(b.cost && b.cost.production, 0);
-        const row = mk('div', { class: 'sc-row' + (isQ ? ' disabled' : '') }, icon(CAT_ICON[cat], 30),
+        const row = mk('div', { class: 'sc-row' + (isQ ? ' disabled' : ''), 'data-building': b.id }, icon(CAT_ICON[cat], 30),
           mk('div', { class: 'grow' }, mk('div', { class: 'name' }, L(b.name), ' ', mk('span', { class: 'sc-badge' }, 'T' + b.tier)), mk('div', { class: 'sub' }, effectChips(b.effects))),
           mk('div', null, costRow(b.cost), mk('div', { class: 'sub', style: 'text-align:right' }, turnsText(turnsFor(cost, perTurn)))),
           isOwn ? btn(isQ ? t('city.queued') : t('city.build'), () => { const f = fn('Rules', 'enqueue'); if (!f) { toast('warn', t('sc.unavailable')); return; } if (result(f(g, city, { type: 'building', id: b.id }))) sfx('ui_click'); after('city'); }, { kind: 'primary', small: true, disabled: isQ }) : null);
@@ -758,7 +783,7 @@
     for (const id of ids.map(i => get('units', i)).filter(Boolean).sort((a, b) => a.tier - b.tier)) {
       let ok = { ok: true };
       if (can) { try { ok = can(g, city, id.id) || ok; } catch (e) { ok = { ok: true }; } }
-      const row = mk('div', { class: 'sc-row' + (ok.ok === false ? ' disabled' : '') }, Screens.unitPortrait(id, 52, { pid: city.owner }),
+      const row = mk('div', { class: 'sc-row' + (ok.ok === false ? ' disabled' : ''), 'data-unit': id.id }, Screens.unitPortrait(id, 52, { pid: city.owner }),
         mk('div', { class: 'grow' }, mk('div', { class: 'name' }, L(id.name), ' ', mk('span', { class: 'sc-badge' }, 'T' + id.tier), ' ', icon('role_' + id.role, 16), mk('span', { class: 'sub' }, ' ' + t('role.' + id.role))), unitStatsLine(id)),
         mk('div', null, costRow(id.cost), mk('div', { class: 'sub', style: 'text-align:right' }, turnsText(turnsFor(itemCost(g, city, { type: 'unit', id: id.id }), perTurn)))),
         isOwn ? btn(t('city.recruit'), () => { const f = fn('Rules', 'enqueue'); if (!f) { toast('warn', t('sc.unavailable')); return; } result(f(g, city, { type: 'unit', id: id.id })); sfx('recruit'); after('city'); }, { kind: 'primary', small: true, disabled: ok.ok === false, tooltip: ok.ok === false ? reasonText(ok) : '' }) : null);
@@ -902,7 +927,7 @@
       const tab = ctx.state.tab || 'build';
       const setTab = (id) => { ctx.state.tab = id; refreshScreen('city'); };
       const garrisonCount = garrisonUnits(g, city).length;
-      const body = [cityHeader(ctx, g, city, player, isOwn), cityYieldRow(g, city), cityQueue(g, city, isOwn, perTurn),
+      const body = [cityHeader(ctx, g, city, player, isOwn), outpostBanner(g, city, player, isOwn), cityYieldRow(g, city), cityQueue(g, city, isOwn, perTurn),
         tabs([{ id: 'build', label: t('city.tab.build'), icon: 'city' }, { id: 'recruit', label: t('city.tab.recruit'), icon: 'draft' }, { id: 'provinces', label: t('city.tab.provinces'), icon: 'node', count: (city.provinces || []).length },
           { id: 'garrison', label: t('city.tab.garrison'), icon: 'army', count: garrisonCount }, { id: 'magic', label: t('city.tab.magic'), icon: 'mana', count: (city.enchantments || []).length }], tab, setTab)];
       if (tab === 'build') body.push(buildTab(ctx, g, city, player, isOwn, perTurn));
@@ -954,7 +979,7 @@
       const row = mk('div', { class: 'sc-shelf-row' }, mk('div', { class: 'sc-shelf-tier' }, t('research.tierRow', { n: tier })));
       for (const tm of list) {
         const st = tomeState(g, player, tm);
-        const b = mk('div', { class: 'sc-book' + (st.owned ? ' owned' : '') + (st.locked ? ' locked' : ''), onclick: () => { ctx.state.viewTome = tm.id; refreshScreen('research'); } },
+        const b = mk('div', { class: 'sc-book' + (st.owned ? ' owned' : '') + (st.locked ? ' locked' : ''), 'data-tome': tm.id, onclick: () => { ctx.state.viewTome = tm.id; refreshScreen('research'); } },
           tomeIcon(tm.id, 44), mk('div', { class: 'affs' }, affIcons(tm.affinity, 9)),
           st.locked ? mk('span', { class: 'lock' }, icon('lock', 12)) : null,
           mk('div', { class: 'bname' }, L(tm.name)));
@@ -983,6 +1008,8 @@
         if (result(f(g, player, tome.id))) sfx('coin');
         after('research');
       }, { kind: 'primary', disabled: st.locked, tooltip: st.locked ? st.reason : t('research.selectTip'), style: 'margin-top:8px' }));
+      // why it cannot be picked yet, spelled out (not only in the disabled button's tooltip)
+      if (st.locked && st.reason) box.appendChild(mk('div', { class: 'sub bad sc-lockreason', style: 'margin-top:6px' }, icon('lock', 12), ' ' + st.reason));
     }
     box.appendChild(mk('div', { class: 'sc-h', style: 'margin-top:12px' }, t('research.contents')));
     const done = new Set((player.research && player.research.done) || []);
@@ -1121,7 +1148,7 @@
       else if (hero.dead) lockReason = t('hero.dead');
       else if (sk.tome || tomeOfSkill(sk.id)) { const tid = sk.tome || tomeOfSkill(sk.id), tm = get('tomes', tid); lockReason = t('hero.needTome', { name: tm ? L(tm.name) : tid }); }
     }
-    const card = mk('div', { class: cls },
+    const card = mk('div', { class: cls, 'data-skill': sk.id },
       mk('div', { class: 'sname' }, sk.signature ? icon('star', 12) : null, ' ', L(sk.name)),
       mk('div', { class: 'sdesc' }, L(sk.desc)),
       learned ? mk('span', { class: 'sc-badge good' }, t('hero.learned'))
@@ -1167,7 +1194,7 @@
     if (!list.length) { box.appendChild(emptyNote(t('hero.inventoryEmpty'))); return box; }
     for (const it of list) {
       const equippedHere = hero.items && hero.items[it.slot] === it.id;
-      const row = mk('div', { class: 'sc-row' }, icon(it.icon || ('item_' + it.slot), 30),
+      const row = mk('div', { class: 'sc-row', 'data-item': it.id }, icon(it.icon || ('item_' + it.slot), 30),
         mk('div', { class: 'grow' }, mk('div', { class: 'name c-' + it.rarity }, L(it.name), ' ', mk('span', { class: 'sc-badge' }, t('rarity.' + it.rarity))), mk('div', { class: 'sub' }, Screens.effectsText(it.effects) || L(it.desc))),
         equippedHere
           ? btn(t('hero.unequip'), () => { const f = fn('Rules', 'unequipItem'); if (!f) { toast('warn', t('sc.unavailable')); return; } result(f(game, hero, it.slot)); after('hero'); }, { small: true, kind: 'danger' })
@@ -1255,7 +1282,7 @@
       const prereqOk = (n.prereq || []).every(p => owned.has(p));
       const affOk = empireAffinityMeets(player, n);
       const canBuy = !isOwned && prereqOk && affOk;
-      const cell = mk('div', { class: 'sc-node' + (isOwned ? ' owned' : (canBuy ? ' available' : ' locked')) + (n.rite ? ' rite' : ''), style: { left: pos[n.id].x + 'px', top: pos[n.id].y + 'px' } },
+      const cell = mk('div', { class: 'sc-node' + (isOwned ? ' owned' : (canBuy ? ' available' : ' locked')) + (n.rite ? ' rite' : ''), 'data-empire': n.id, style: { left: pos[n.id].x + 'px', top: pos[n.id].y + 'px' } },
         mk('div', { class: 'nname' }, n.rite ? icon('star', 12) : null, L(n.name)),
         mk('div', { class: 'nsub' }, res('imperium', n.cost && n.cost.imperium, { size: 12 })),
         isOwned ? mk('span', { class: 'sc-badge good' }, t('sc.owned'))
@@ -1392,17 +1419,39 @@
   const proposalQueue = [];
   Screens.showProposal = function (proposal) {
     const g = game(); if (!g || !proposal) return;
+    // a proposal the engine no longer has pending (superseded by a newer one of the same kind) is not shown
+    const stillPending = p => !g.pendingProposals || p.id === undefined || g.pendingProposals.some(x => x.id === p.id);
+    if (!stillPending(proposal)) {
+      if (!(proposalModal && proposalModal.closed === false)) { const next = proposalQueue.shift(); if (next) Screens.showProposal(next); }
+      return;
+    }
     if (proposalModal && proposalModal.closed === false) {   // (=== false: the fallback modal has no such flag)
+      // one queued modal per realm and kind: a re-sent proposal replaces the waiting one
+      for (let i = proposalQueue.length - 1; i >= 0; i--) if (proposalQueue[i].from === proposal.from && proposalQueue[i].kind === proposal.kind) proposalQueue.splice(i, 1);
       if (!proposalQueue.some(p => p === proposal || (p.id !== undefined && p.id === proposal.id))) proposalQueue.push(proposal);
       return;
     }
     const from = g.players[proposal.from];
     const kindNameFn = fn('Diplomacy', 'kindName');
     const answer = (accept) => { const f = fn('Diplomacy', 'resolve'); if (f) f(g, proposal, accept); refreshUI(); refreshScreen('diplomacy'); };
+    // what is actually on the table, from the recipient's side: the proposer's mood, what we get / give
+    const me = human(g);
+    const resList = (obj) => Object.keys(obj || {}).filter(k => num(obj[k]) > 0).map(k => (AOW.I18n.has('ui.res_' + k) ? t('ui.res_' + k) : k) + ' ' + fmt(obj[k])).join(', ');
+    const terms = proposal.terms || {};
+    const lines = [];
+    const opFn = fn('Diplomacy', 'opinion'), labFn = fn('Diplomacy', 'opinionLabel');
+    if (from && me && opFn) { const op = opFn(g, from.id, me.id); lines.push(mk('div', { class: 'sub' }, t('dip.theirOpinion', { name: from.name }) + ': ', mk('b', null, (labFn ? t('dip.opinion.' + labFn(op).key) + ' ' : '') + '(' + fmtSigned(op) + ')'))); }
+    if (proposal.kind === 'trade') {
+      if (resList(terms.give)) lines.push(mk('div', { class: 'sub good' }, t('dip.receive') + ': ' + resList(terms.give)));
+      if (resList(terms.get)) lines.push(mk('div', { class: 'sub bad' }, t('dip.give') + ': ' + resList(terms.get)));
+      if (terms.turns) lines.push(mk('div', { class: 'sub' }, t('dip.turns', { n: terms.turns })));
+    } else if (proposal.kind === 'demand' && resList(terms)) lines.push(mk('div', { class: 'sub bad' }, t('dip.give') + ': ' + resList(terms)));
+    else if (proposal.kind === 'gift' && resList(terms)) lines.push(mk('div', { class: 'sub good' }, t('dip.receive') + ': ' + resList(terms)));
+    else if (proposal.kind === 'peace' && num(terms.gold) > 0) lines.push(mk('div', { class: 'sub good' }, t('dip.receive') + ': ' + resList({ gold: terms.gold })));
     proposalModal = modal({
       title: t('dip.incoming', { name: from ? from.name : '?' }), icon: 'diplomacy', width: 420,
-      body: mk('div', null, mk('div', { class: 'sc-h' }, kindNameFn ? L(kindNameFn(proposal.kind)) : proposal.kind),
-        proposalQueue.length ? mk('div', { class: 'sub' }, '+' + proposalQueue.length) : null),
+      body: mk('div', { class: 'sc-proposal' }, mk('div', { class: 'sc-h' }, kindNameFn ? L(kindNameFn(proposal.kind)) : proposal.kind), lines,
+        proposalQueue.length ? mk('div', { class: 'sub dim', style: 'margin-top:6px' }, t('dip.moreWaiting', { n: proposalQueue.length })) : null),
       buttons: [
         { label: t('dip.decline'), kind: 'ghost', onClick: () => answer(false) },
         { label: t('dip.accept'), kind: 'primary', onClick: () => answer(true) },
@@ -1443,10 +1492,15 @@
         const rows = [mk('tr', null, mk('th', null, t('vic.player')), mk('th', null, t('vic.cities')), mk('th', null, t('vic.units')), mk('th', null, t('vic.territory')), mk('th', null, t('vic.score')))];
         for (const pl of g.players) {
           const isWinner = winner && pl.id === winner.id;
-          rows.push(mk('tr', null,
-            mk('td', { style: isWinner ? 'color:var(--gold-light);font-weight:700' : '' }, pl.name + (isWinner ? ' ★' : '')),
-            mk('td', null, String(num(pl.stats && pl.stats.cities))), mk('td', null, String(num(pl.stats && pl.stats.units))),
-            mk('td', null, String(num(pl.stats && pl.stats.territory))), mk('td', null, String(num(pl.stats && pl.stats.score)))));
+          const dead = pl.alive === false;
+          // live counts (a fallen realm's cached stats still show what it had before it fell)
+          const cities = g.cities.filter(c => c.owner === pl.id && c.tier >= 1).length;
+          const units = g.units.filter(u => u.owner === pl.id).length;
+          const land = g.provinces.filter(q => q.owner === pl.id).length;
+          rows.push(mk('tr', { style: dead ? 'opacity:.55' : '' },
+            mk('td', { style: isWinner ? 'color:var(--gold-light);font-weight:700' : '' }, pl.name + (isWinner ? ' ★' : ''), dead ? mk('span', { class: 'sub' }, ' (' + t('dip.dead') + ')') : null),
+            mk('td', null, String(cities)), mk('td', null, String(units)),
+            mk('td', null, String(land)), mk('td', null, String(num(pl.stats && pl.stats.score)))));
         }
         box.appendChild(mk('div', { class: 'sub' }, t('vic.turns') + ': ' + g.turn));
         box.appendChild(mk('table', null, rows));

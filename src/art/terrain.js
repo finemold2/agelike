@@ -6,7 +6,8 @@
 //   TerrainArt.drawRivers(ctx, x, y, info)           info.river bitmask (bit d = edge toward dir d)
 //   TerrainArt.drawRoads(ctx, x, y, info)            info.road bitmask
 //   TerrainArt.drawHexDecor(ctx, x, y, info, zoom)   trees, hills, peaks, ruins, crystals… (call after all bases, row order)
-//   TerrainArt.drawWater(ctx, x, y, info, t)         cheap animated shimmer (t seconds)
+//   TerrainArt.drawWater(ctx, x, y, info, t, batch?) cheap animated shimmer (t seconds); with batch = TerrainArt.waterBatch()
+//                                                    the strokes are bucketed and drawn by TerrainArt.flushWaterBatch(ctx, batch)
 //   TerrainArt.drawFog(ctx, x, y, kind)              'unexplored' | 'explored' (one hex; prefer fillFog for regions)
 //   TerrainArt.fillFog(ctx, x, y, w, h)              seamless unexplored parchment over a whole rect (world-aligned
 //                                                    pattern, no hex clip) — the caller masks & feathers it
@@ -391,14 +392,38 @@
   };
 
   // ================================================================ water shimmer
-  TerrainArt.drawWater = function (ctx, x, y, info, t) {
+  // Batched shimmer: pass `batch` (from TerrainArt.waterBatch()) to drawWater and the ripples/foam of every hex
+  // are appended to a few Path2D buckets keyed by (quantised) alpha instead of being stroked one by one;
+  // TerrainArt.flushWaterBatch(ctx, batch) then strokes each bucket once — a screen of ocean goes from ~700
+  // tiny strokes to ~30, which is what made the 15 Hz water redraw cost 50–80 ms under software raster.
+  const WATER_Q = 48;                               // alpha quantisation steps per 1.0 (≈0.02)
+  TerrainArt.waterBatch = function () { return { ripple: new Map(), foam: new Map() }; };
+  function waterBucket(map, alpha) {
+    const q = Math.round(alpha * WATER_Q);
+    if (q <= 0) return null;
+    let p = map.get(q);
+    if (!p) { p = new Path2D(); map.set(q, p); }
+    return p;
+  }
+  function pathSink(p) { return { beginPath() {}, moveTo(x, y) { p.moveTo(x, y); }, lineTo(x, y) { p.lineTo(x, y); } }; }
+  TerrainArt.flushWaterBatch = function (ctx, batch, keep) {   // keep: stroke but leave the buckets for reuse
+    if (!batch) return;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 0.9;
+    for (const [q, p] of batch.ripple) { ctx.strokeStyle = 'rgba(210,240,255,' + (q / WATER_Q).toFixed(3) + ')'; ctx.stroke(p); }
+    ctx.lineWidth = 1.4;
+    for (const [q, p] of batch.foam) { ctx.strokeStyle = 'rgba(255,255,255,' + (q / WATER_Q).toFixed(3) + ')'; ctx.stroke(p); }
+    ctx.restore();
+    if (!keep) { batch.ripple.clear(); batch.foam.clear(); }
+  };
+  TerrainArt.drawWater = function (ctx, x, y, info, t, batch) {
     const terr = info.terrain || 'ocean';
     if (!WATER[terr]) return;
     const s = info.size || Hex.SIZE;
     const rng = rngFor(info, 40);
     const time = t || 0;
-    ctx.save();
-    ctx.lineCap = 'round';
+    if (!batch) { ctx.save(); ctx.lineCap = 'round'; }
     const n = terr === 'ocean' ? 4 : 3;
     for (let i = 0; i < n; i++) {
       let px, py;
@@ -407,6 +432,11 @@
       const a = 0.5 + 0.5 * Math.sin(time * spd + ph);
       if (a < 0.08) continue;
       const drift = Math.sin(time * 0.5 + ph) * 2;
+      if (batch) {
+        const p = waterBucket(batch.ripple, a * 0.34);
+        if (p) { p.moveTo(x + px - len / 2 + drift, y + py); p.quadraticCurveTo(x + px + drift, y + py - 1.6, x + px + len / 2 + drift, y + py); }
+        continue;
+      }
       ctx.strokeStyle = 'rgba(210,240,255,' + (a * 0.34).toFixed(3) + ')';
       ctx.lineWidth = 0.9;
       ctx.beginPath();
@@ -422,12 +452,17 @@
       const ph = rng.next() * TAU;
       const a = 0.5 + 0.5 * Math.sin(time * 1.1 + ph);
       if (a < 0.15) continue;
+      if (batch) {
+        const p = waterBucket(batch.foam, a * 0.3);
+        if (p) wavyEdgeLine(pathSink(p), x, y, s, d, rngFor(info, 50 + d), -0.14 - 0.05 * a, 0.03, 8);
+        continue;
+      }
       ctx.strokeStyle = 'rgba(255,255,255,' + (a * 0.3).toFixed(3) + ')';
       ctx.lineWidth = 1.4;
       wavyEdgeLine(ctx, x, y, s, d, rngFor(info, 50 + d), -0.14 - 0.05 * a, 0.03, 8);
       ctx.stroke();
     }
-    ctx.restore();
+    if (!batch) ctx.restore();
   };
 
   // ================================================================ fog

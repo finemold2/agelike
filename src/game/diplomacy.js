@@ -82,6 +82,20 @@
     });
   }
   const t = (key, params) => (typeof AOW.t === 'function' ? AOW.t(key, params) : key);
+  /** the same message in both languages ({ko,en}) so a stored notification follows a later language switch;
+   *  params.kindId is resolved per language through 'dip.kind.<id>' */
+  const tL = (key, params) => {
+    const out = {};
+    for (const lang of ['ko', 'en']) {
+      const d = (AOW.I18n && AOW.I18n.dict && AOW.I18n.dict[lang]) || {};
+      const p = Object.assign({}, params);
+      if (p.kindId) p.kind = d['dip.kind.' + p.kindId] || p.kindId;
+      const tpl = d[key] !== undefined ? d[key] : t(key);
+      out[lang] = AOW.I18n && AOW.I18n.fill ? AOW.I18n.fill(tpl, p) : tpl;
+    }
+    return out;
+  };
+  const Lx = o => (AOW.L ? AOW.L(o) : o.en);
   Diplomacy.stateName = state => R(t('dip.state.' + state), (AOW.I18n && AOW.I18n.dict && AOW.I18n.dict.en['dip.state.' + state]) || state);
   Diplomacy.kindName = kind => R(t('dip.kind.' + kind), (AOW.I18n && AOW.I18n.dict && AOW.I18n.dict.en['dip.kind.' + kind]) || kind);
   const pname = (game, pid) => { const p = game.players[pid]; return p ? p.name : ('#' + pid); };
@@ -136,7 +150,7 @@
     // through Rules.notify so it also lands in the HUD notification list
     if (AOW.Rules && typeof AOW.Rules.notify === 'function') { try { AOW.Rules.notify(game, hp, kind, text, 'diplomacy', null, opts); } catch (e) { /* ignore */ } return; }
     if (!AOW.Events) return;
-    try { AOW.Events.emit('notify', { kind, text, icon: 'diplomacy', low: !!(opts && opts.low) }); } catch (e) { /* ignore */ }
+    try { AOW.Events.emit('notify', { kind, text: typeof text === 'object' ? Lx(text) : text, icon: 'diplomacy', low: !!(opts && opts.low) }); } catch (e) { /* ignore */ }
   }
   function emit(name, payload) { if (AOW.Events) { try { AOW.Events.emit(name, payload); } catch (e) { /* ignore */ } } }
 
@@ -382,7 +396,7 @@
     const ra = Diplomacy.rel(game, a, b), rb = Diplomacy.rel(game, b, a);
     ra.mood -= 10; rb.mood -= 20;
     logLine(game, a, t('dip.msg.warDeclared', { from: pname(game, a), to: pname(game, b) }));
-    if (!opts.silent) notify(game, [a, b], 'bad', t('dip.msg.warDeclared', { from: pname(game, a), to: pname(game, b) }));
+    if (!opts.silent) notify(game, [a, b], 'bad', tL('dip.msg.warDeclared', { from: pname(game, a), to: pname(game, b) }));
     // drag allies
     for (const c of others(game, a)) {
       if (c === b) continue;
@@ -390,11 +404,11 @@
       if ((cb === 'alliance' || cb === 'defensive_pact') && ca !== 'alliance' && ca !== 'war' && Diplomacy.canDeclareWar(game, c, a).ok) {
         Diplomacy.declareWar(game, c, a, { justified: true, viaAlly: true, silent: true });
         logLine(game, c, t('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, a) }));
-        notify(game, [c, a], 'warn', t('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, a) }));
+        notify(game, [c, a], 'warn', tL('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, a) }));
       } else if (ca === 'alliance' && cb !== 'alliance' && cb !== 'defensive_pact' && cb !== 'war' && !opts.viaAlly && Diplomacy.canDeclareWar(game, c, b).ok && FRIENDLY[cb] <= 0) {
         Diplomacy.declareWar(game, c, b, { justified: justified, viaAlly: true, silent: true });
         logLine(game, c, t('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, b) }));
-        notify(game, [c, b], 'warn', t('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, b) }));
+        notify(game, [c, b], 'warn', tL('dip.msg.joinedWar', { who: pname(game, c), to: pname(game, b) }));
       }
     }
     return { ok: true, reason: null };
@@ -411,7 +425,7 @@
     ra.warScore = rb.warScore = 0;
     ra.mood += 5; rb.mood += 5;
     logLine(game, a, t('dip.msg.peace', { a: pname(game, a), b: pname(game, b) }));
-    notify(game, [a, b], 'good', t('dip.msg.peace', { a: pname(game, a), b: pname(game, b) }));
+    notify(game, [a, b], 'good', tL('dip.msg.peace', { a: pname(game, a), b: pname(game, b) }));
     return { ok: true };
   };
 
@@ -477,16 +491,16 @@
     if (isAI(game, to)) {
       const ans = Diplomacy.aiRespond(game, proposal);
       if (ans.accept) applyProposal(game, proposal); else refuseProposal(game, proposal);
-      const msg = t(ans.accept ? 'dip.msg.accepted' : 'dip.msg.declined', { who: pname(game, to), kind: AOW.L ? AOW.L(Diplomacy.kindName(kind)) : kind });
-      logLine(game, to, msg);
+      const msg = tL(ans.accept ? 'dip.msg.accepted' : 'dip.msg.declined', { who: pname(game, to), kindId: kind });
+      logLine(game, to, Lx(msg));
       notify(game, [from, to], ans.accept ? 'good' : 'warn', msg);
       return { ok: true, accepted: !!ans.accept, reason: ans.reason, proposal };
     }
     if (!game.pendingProposals) game.pendingProposals = [];
     game.pendingProposals = game.pendingProposals.filter(p => !(p.from === from && p.to === to && p.kind === kind));
     game.pendingProposals.push(proposal);
-    const msg = t('dip.msg.proposal', { from: pname(game, from), kind: AOW.L ? AOW.L(Diplomacy.kindName(kind)) : kind });
-    logLine(game, from, msg);
+    const msg = tL('dip.msg.proposal', { from: pname(game, from), kindId: kind });
+    logLine(game, from, Lx(msg));
     emit('diplomacy:proposal', { from, to, kind, terms, proposal });
     notify(game, [to], 'info', msg, { low: true });   // the proposal modal is the loud part
     return { ok: true, pending: true, accepted: false, reason: null, proposal };
@@ -535,16 +549,16 @@
         Diplomacy.addGrievance(game, to, from, 'broken_treaty', tr === 'open_borders' || tr === 'trade' ? 10 : C.GRIEVANCE.broken_treaty);
         bumpReputation(game, from, tr === 'open_borders' || tr === 'trade' ? -3 : C.REPUTATION_BREAK);
         const r = Diplomacy.rel(game, to, from); if (r) r.mood -= 15;
-        const msg = t('dip.msg.treatyBroken', { who: pname(game, from), kind: AOW.L ? AOW.L(Diplomacy.kindName(tr)) : tr });
-        logLine(game, from, msg); notify(game, [from, to], 'warn', msg);
+        const msg = tL('dip.msg.treatyBroken', { who: pname(game, from), kindId: tr });
+        logLine(game, from, Lx(msg)); notify(game, [from, to], 'warn', msg);
         break;
       }
       case 'gift': {
         transfer(game, from, to, terms);
         const r = Diplomacy.rel(game, to, from);
         if (r) { r.gifts = Math.min(C.GIFT_CAP + 10, (r.gifts || 0) + resourceValue(terms) / 8); r.mood += 3; }
-        const msg = t('dip.msg.gift', { from: pname(game, from), to: pname(game, to) });
-        logLine(game, from, msg); notify(game, [from, to], 'good', msg);
+        const msg = tL('dip.msg.gift', { from: pname(game, from), to: pname(game, to) });
+        logLine(game, from, Lx(msg)); notify(game, [from, to], 'good', msg);
         break;
       }
       default: break;
