@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AOW audio test harness</title>
+</head>
+<body>
+<!-- tools/audio_test.html — headless test harness for src/audio/{synth,music,sfx}.js.
+     Renders everything through OfflineAudioContext (no real playback needed) and analyzes the
+     resulting PCM to check for silence, clipping, NaNs, note timing/drift and basic spectral
+     sanity. Run with:
+       node tools/shot.js tools/audio_test.html /tmp/a.png --eval "window.runAudioTest()"
+     window.runAudioTest() returns a Promise<object> (a compact JSON report); shot.js prints it. -->
+<script src="../src/core/util.js"></script>
+<script src="../src/core/events.js"></script>
+<script src="../src/audio/notation.js"></script>
+<script src="../src/audio/synth.js"></script>
+<script src="../src/audio/music.js"></script>
+<script src="../src/audio/sfx.js"></script>
+<script src="../src/audio/songs/set_a.js"></script>
+<script src="../src/audio/songs/set_b.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------- sample-level helpers
+  function toMono(buf) {
+    const n = buf.length;
+    const L = buf.getChannelData(0), R = buf.numberOfChannels > 1 ? buf.getChannelData(1) : L;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = (L[i] + R[i]) * 0.5;
+    return out;
+  }
+  function slice(mono, sr, t0, t1) {
+    const i0 = Math.max(0, Math.floor(t0 * sr)), i1 = Math.min(mono.length, Math.ceil(t1 * sr));
+    return i1 > i0 ? mono.subarray(i0, i1) : new Float32Array(0);
+  }
+  function rms(arr) { if (!arr.length) return 0; let s = 0; for (let i = 0; i < arr.length; i++) s += arr[i] * arr[i]; return Math.sqrt(s / arr.length); }
+  function peakOf(arr) { let m = 0; for (let i = 0; i < arr.length; i++) { const a = Math.abs(arr[i]); if (a > m) m = a; } return m; }
+  function findNaN(arr) { for (let i = 0; i < arr.length; i++) if (!isFinite(arr[i])) return i; return -1; }
+  function maxStep(arr) { let m = 0; for (let i = 1; i < arr.length; i++) { const d = Math.abs(arr[i] - arr[i - 1]); if (d > m) m = d; } return m; }
+  /** single-frequency magnitude via Goertzel, normalized by window length */
+  function goertzel(samples, sr, freq) {
+    const N = samples.length; if (!N) return 0;
+    const k = Math.round(freq * N / sr);
+    const w = 2 * Math.PI * k / N, cosW = Math.cos(w), coeff = 2 * cosW;
+    let q0 = 0, q1 = 0, q2 = 0;
+    for (let i = 0; i < N; i++) { q0 = coeff * q1 - q2 + samples[i]; q2 = q1; q1 = q0; }
+    return Math.sqrt(q1 * q1 + q2 * q2 - q1 * q2 * coeff) / N;
+  }
+  /** amplitude-onset detector: short-time RMS, flag rising edges above a floor, de-duplicated by a min gap */
+  function detectOnsets(mono, sr, t0, t1, opts) {
+    opts = opts || {};
+    const frame = opts.frame || 1024, hop = opts.hop || 256;
+    const i0 = Math.floor(t0 * sr), i1 = Math.floor(t1 * sr);
+    const energies = [], times = [];
+    for (let i = i0; i + frame <= i1; i += hop) {
+      let s = 0; for (let k = 0; k < frame; k++) { const v = mono[i + k]; s += v * v; }
+      energies.push(Math.sqrt(s / frame));
+      times.push(i / sr);
+    }
+    const thresh = opts.threshold === undefined ? 0.006 : opts.threshold;
+    const floor = opts.floor === undefined ? 0.004 : opts.floor;
+    const minGap = Math.round((opts.minGapSec === undefined ? 0.05 : opts.minGapSec) * sr / hop);
+    const onsets = [];
+    let lastIdx = -Infinity;
+    for (let i = 1; i < energies.length; i++) {
+      const rise = energies[i] - energies[i - 1];
+      if (rise > thresh && energies[i] > floor && (i - lastIdx) >= minGap) { onsets.push(times[i]); lastIdx = i; }
+    }
+    return onsets;
+  }
+  function songOnsetTimes(song, maxT) {
+    const spb = 60 / (song.bpm || 90);
+    const set = new Map();
+    for (const tr of song.tracks || []) for (const n of tr.notes || []) {
+      const t = n[0] * spb;
+      if (t >= 0 && t < maxT) set.set(Math.round(t * 1000 / 8) * 8, true);
+    }
+    return Array.from(set.keys()).map(k => k / 1000).sort((a, b) => a - b);
+  }
+  function nearestDiff(expected, detected) {
+    // for each expected time, nearest detected time; returns array of |diff|
+    return expected.map(e => {
+      let best = Infinity;
+      for (const d of detected) { const df = Math.abs(d - e); if (df < best) best = df; }
+      return best;
+    });
+  }
+
+  const checks = [];
+  function check(name, pass, detail) { checks.push({ name, pass: !!pass, detail: detail === undefined ? '' : String(detail) }); return !!pass; }
+
+  // ---------------------------------------------------------------- SPEC §8 name lists
+  const SPEC_INSTRUMENTS = ['piano', 'strings', 'cello', 'harp', 'flute', 'oboe', 'horn', 'choir', 'celesta', 'bass', 'pad', 'organ'];
+  const SPEC_SFX = ('ui_click,ui_hover,ui_open,ui_close,end_turn,turn_start,coin,build_complete,recruit,research_complete,'
+    + 'spell_cast_order,spell_cast_chaos,spell_cast_nature,spell_cast_materium,spell_cast_astral,spell_cast_shadow,'
+    + 'spell_hit_physical,spell_hit_fire,spell_hit_frost,spell_hit_lightning,spell_hit_blight,spell_hit_spirit,'
+    + 'sword_hit,axe_hit,blunt_hit,arrow_shoot,arrow_hit,bow_draw,shield_block,crit,'
+    + 'death_human,death_beast,death_undead,death_monster,footsteps_grass,footsteps_stone,footsteps_snow,footsteps_water,'
+    + 'cavalry_charge,battle_start,battle_win,battle_lose,level_up,city_founded,city_captured,alert,notification,'
+    + 'victory_fanfare,defeat,dragon_roar,giant_stomp,magic_summon,heal,morale_break').split(',');
+
+  async function runAudioTest() {
+    checks.length = 0;
+    const SR = 44100;
+
+    // ================================================================ 0. static API surface
+    check('Audio_exists', !!AOW.Audio && typeof AOW.Audio.init === 'function');
+    check('Synth_exists', !!AOW.Synth && typeof AOW.Synth.instrument === 'function');
+    check('Music_exists', !!AOW.Music);
+    check('SFX_exists', !!AOW.SFX && typeof AOW.SFX.play === 'function');
+    const musicFns = ['play', 'next', 'prev', 'pause', 'resume', 'stop', 'setMood', 'isPlaying', 'nowPlaying', 'setVolume', 'onChange', 'list', 'renderOffline'];
+    check('Music_api', musicFns.every(f => typeof AOW.Music[f] === 'function'), musicFns.filter(f => typeof AOW.Music[f] !== 'function').join(','));
+    const instList = AOW.Synth.list().slice().sort();
+    check('Synth_instruments', SPEC_INSTRUMENTS.slice().sort().every((n, i) => instList[i] === n) && instList.length === SPEC_INSTRUMENTS.length,
+      instList.join(','));
+    const sfxList = AOW.SFX.list();
+    const missingSfx = SPEC_SFX.filter(n => sfxList.indexOf(n) < 0);
+    check('SFX_names_complete', missingSfx.length === 0, missingSfx.join(','));
+    check('SFX_list_fn', JSON.stringify(sfxList.slice().sort()) === JSON.stringify(SPEC_SFX.slice().sort()) || missingSfx.length === 0);
+    const songIds = Object.keys(AOW.Songs || {});
+    check('songs_loaded', songIds.length >= 9, songIds.length);
+    check('bach_prelude_c_present', !!AOW.Songs.bach_prelude_c);
+
+    // ================================================================ 1. voice cap (pure logic, no render needed)
+    {
+      const ctx0 = new OfflineAudioContext(2, SR * 2, SR);
+      AOW.Audio.init({ ctx: ctx0, force: true });
+      const dump = ctx0.createGain(); dump.gain.value = 0; // deliberately not connected onward: silent, isolated
+      const capInst = AOW.Synth.instrument('piano', { dest: dump, reverbDest: dump });
+      for (let i = 0; i < 60; i++) capInst.noteOn(60 + (i % 12), 1.0, 0.6, 1.5);
+      const vc = AOW.Synth.voiceCount();
+      check('voice_cap_enforced', vc > 0 && vc <= AOW.Synth.MAX_VOICES, 'voiceCount=' + vc + ' cap=' + AOW.Synth.MAX_VOICES);
+    }
+
+    // ================================================================ 2. RENDER A — scheduler: 8s of bach_prelude_c
+    let onsetReport = {};
+    {
+      const ctxA = new OfflineAudioContext(2, SR * 12, SR);
+      const musicSec = 8;
+      const bufA = await AOW.Music.renderOffline('bach_prelude_c', musicSec, ctxA);
+      const monoA = toMono(bufA);
+      const nanAt = findNaN(monoA);
+      check('musicA_no_nan', nanAt < 0, 'firstNaNSample=' + nanAt);
+      const fullPeak = peakOf(monoA);
+      check('musicA_peak_lt_1', fullPeak < 1.0, 'peak=' + fullPeak.toFixed(3));
+      const segStart = 0.05, segEnd = musicSec;
+      const musicSeg = slice(monoA, SR, segStart, segEnd);
+      const segRms = rms(musicSeg);
+      check('musicA_rms_gt_0.01', segRms > 0.01, 'rms=' + segRms.toFixed(4));
+
+      const detected = detectOnsets(monoA, SR, segStart, segEnd, { threshold: 0.006, floor: 0.004, minGapSec: 0.045 });
+      const song = AOW.Songs.bach_prelude_c;
+      const expected = songOnsetTimes(song, musicSec).map(t => t + 0.02); // renderOffline's entry.startTime offset
+      const expectedInRange = expected.filter(t => t >= segStart && t < segEnd);
+      const minExpectedDetections = Math.max(10, Math.floor(expectedInRange.length * 0.35));
+      check('musicA_onset_count', detected.length >= minExpectedDetections,
+        'detected=' + detected.length + ' groundTruth=' + expectedInRange.length + ' need>=' + minExpectedDetections);
+
+      // no-drift: nearest-neighbour timing error should stay small and not grow over the window
+      const diffs = nearestDiff(expectedInRange, detected).filter(d => isFinite(d));
+      const firstHalf = diffs.slice(0, Math.floor(diffs.length / 2));
+      const secondHalf = diffs.slice(Math.floor(diffs.length / 2));
+      const meanFirst = firstHalf.length ? firstHalf.reduce((a, b) => a + b, 0) / firstHalf.length : 0;
+      const meanSecond = secondHalf.length ? secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length : 0;
+      const maxDiff = diffs.length ? Math.max.apply(null, diffs) : 0;
+      check('musicA_no_drift', maxDiff < 0.06 && meanSecond < meanFirst + 0.02,
+        'maxDiff=' + maxDiff.toFixed(3) + ' meanFirst=' + meanFirst.toFixed(3) + ' meanSecond=' + meanSecond.toFixed(3));
+      onsetReport = { detected: detected.length, groundTruth: expectedInRange.length, maxTimingDiff: +maxDiff.toFixed(3) };
+
+      const stepA = maxStep(slice(monoA, SR, 0, segEnd));
+      check('musicA_no_gross_discontinuity', stepA < 0.6, 'maxStep=' + stepA.toFixed(3));
+    }
+
+    // ================================================================ 3. RENDER B — instruments: piano/strings spectral
+    //    sanity (clean isolated windows) + a short scale for every other instrument (audibility only).
+    let pianoReport = {}, stringsReport = {};
+    {
+      const ctxB = new OfflineAudioContext(2, SR * 12, SR);
+      AOW.Audio.init({ ctx: ctxB, force: true });
+
+      // --- strings: attack should be slow (>=150ms), i.e. envelope should still be low ~140ms in
+      const strInst = AOW.Synth.instrument('strings');
+      strInst.noteOn(60, 0.05, 0.5, 0.12); strInst.noteOn(64, 0.2, 0.5, 0.12); // tiny warm-up notes
+      const strOnset = 0.4, strDur = 1.0, strVel = 0.6;
+      strInst.noteOn(69, strOnset, strVel, strDur);
+
+      // --- piano: A4 (440Hz) with harmonics at 880/1320Hz, should decay (RMS@1.5s < RMS@0.1s)
+      const pnInst = AOW.Synth.instrument('piano');
+      pnInst.noteOn(60, 1.7, 0.6, 0.15); pnInst.noteOn(64, 1.9, 0.6, 0.15); pnInst.noteOn(67, 2.1, 0.6, 0.15);
+      const pnOnset = 2.35, pnDur = 1.7, pnVel = 0.9;
+      pnInst.noteOn(69, pnOnset, pnVel, pnDur); // A4 = midi 69 = 440Hz
+
+      // --- the other 10 instruments: short scale each, sequential, non-overlapping windows
+      const OTHERS = [
+        ['cello', [[48, 0.14], [55, 0.28]]],
+        ['harp', [[60, 0.1], [67, 0.1], [72, 0.35]]],
+        ['flute', [[67, 0.12], [74, 0.35]]],
+        ['oboe', [[64, 0.12], [72, 0.35]]],
+        ['horn', [[48, 0.15], [55, 0.4]]],
+        ['choir', [[60, 0.18], [67, 0.5]]],
+        ['celesta', [[72, 0.1], [79, 0.1], [84, 0.3]]],
+        ['bass', [[36, 0.12], [43, 0.3]]],
+        ['pad', [[55, 0.22], [60, 0.55]]],
+        ['organ', [[55, 0.12], [64, 0.3]]],
+      ];
+      let t = 4.0;
+      const otherWindows = [];
+      for (const [name, notes] of OTHERS) {
+        const inst = AOW.Synth.instrument(name);
+        const t0 = t;
+        for (const [m, d] of notes) { inst.noteOn(m, t, 0.75, d); t += d + 0.02; }
+        otherWindows.push([name, t0, t]);
+        t += 0.08;
+      }
+      check('render_B_fits', t < 11.8, 'lastEnd=' + t.toFixed(2));
+
+      const bufB = await ctxB.startRendering();
+      const monoB = toMono(bufB);
+      check('musicB_no_nan', findNaN(monoB) < 0);
+      check('musicB_peak_lt_1', peakOf(monoB) < 1.0, peakOf(monoB).toFixed(3));
+
+      // strings attack check: RMS in [onset,onset+0.14] should be much lower than the sustained
+      // plateau RMS in [onset+0.4, onset+0.55] — i.e. it hasn't ramped up yet by 150ms.
+      const strEarly = rms(slice(monoB, SR, strOnset, strOnset + 0.14));
+      const strPlateau = rms(slice(monoB, SR, strOnset + 0.4, strOnset + 0.55));
+      check('strings_attack_ge_150ms', strEarly < strPlateau * 0.5, 'early=' + strEarly.toFixed(4) + ' plateau=' + strPlateau.toFixed(4));
+      stringsReport = { early: +strEarly.toFixed(4), plateau: +strPlateau.toFixed(4) };
+
+      // piano spectral check: energy at 440/880/1320Hz shortly after onset
+      const pnFreqWin = slice(monoB, SR, pnOnset + 0.04, pnOnset + 0.04 + 4096 / SR);
+      const m440 = goertzel(pnFreqWin, SR, 440), m880 = goertzel(pnFreqWin, SR, 880), m1320 = goertzel(pnFreqWin, SR, 1320);
+      const winRms = rms(pnFreqWin);
+      check('piano_A4_harmonics', m440 > winRms * 0.15 && m880 > winRms * 0.03 && m1320 > winRms * 0.01,
+        'm440=' + m440.toFixed(4) + ' m880=' + m880.toFixed(4) + ' m1320=' + m1320.toFixed(4) + ' winRms=' + winRms.toFixed(4));
+      // piano decay check: RMS@0.1s post-onset vs RMS@1.5s post-onset
+      const pn01 = rms(slice(monoB, SR, pnOnset + 0.08, pnOnset + 0.14));
+      const pn15 = rms(slice(monoB, SR, pnOnset + 1.45, pnOnset + 1.55));
+      check('piano_decays', pn15 < pn01, 'rms@0.1s=' + pn01.toFixed(4) + ' rms@1.5s=' + pn15.toFixed(4));
+      pianoReport = { m440: +m440.toFixed(4), m880: +m880.toFixed(4), m1320: +m1320.toFixed(4), rmsAt0_1: +pn01.toFixed(4), rmsAt1_5: +pn15.toFixed(4) };
+
+      // every other instrument: audible (non-silent) in its own scheduled window
+      const quiet = [];
+      for (const [name, w0, w1] of otherWindows) {
+        const r = rms(slice(monoB, SR, w0, w1));
+        if (!(r > 0.003)) quiet.push(name + '(' + r.toFixed(4) + ')');
+      }
+      check('other_instruments_audible', quiet.length === 0, quiet.join(','));
+
+      // node cleanup: after the whole buffer has rendered, no voice should still be "alive"
+      const vcAfter = AOW.Synth.voiceCount();
+      check('voices_cleaned_up_after_render', vcAfter === 0, 'voiceCount=' + vcAfter);
+
+      const stepB = maxStep(slice(monoB, SR, 0, t));
+      check('musicB_no_gross_discontinuity', stepB < 0.6, 'maxStep=' + stepB.toFixed(3));
+    }
+
+    // ================================================================ 4. RENDER M — Music mood/playlist/pause logic.
+    //    Runs (and is rendered) in its OWN small context so the live scheduler's notes — which, in
+    //    offline mode, get scheduled for the song's *entire* length in one go (see Music.play's use of
+    //    the tick() horizon) — can never bleed into the SFX render that follows.
+    {
+      const ctxM = new OfflineAudioContext(2, SR * 2, SR);
+      AOW.Audio.init({ ctx: ctxM, force: true });
+      AOW.Music.play('satie_gymnopedie_1');
+      check('music_isPlaying', AOW.Music.isPlaying() === true);
+      check('music_nowPlaying_id', AOW.Music.nowPlaying() && AOW.Music.nowPlaying().id === 'satie_gymnopedie_1');
+      AOW.Music.setMood('victory'); // immediate mood: current song isn't tagged 'victory' → should switch now
+      const npVictory = AOW.Music.nowPlaying();
+      check('music_immediate_mood_switch', !!npVictory && (npVictory.moods || []).indexOf('victory') >= 0, JSON.stringify(npVictory && npVictory.moods));
+      const idAfterVictory = npVictory && npVictory.id;
+      AOW.Music.setMood('tension'); // non-immediate: must NOT interrupt the current song
+      const npAfterTension = AOW.Music.nowPlaying();
+      check('music_nonimmediate_mood_no_interrupt', npAfterTension && npAfterTension.id === idAfterVictory, npAfterTension && npAfterTension.id);
+      check('music_getMood_tracks', AOW.Music.getMood() === 'tension');
+      AOW.Music.pause();
+      check('music_pause', AOW.Music.isPaused() === true && AOW.Music.isPlaying() === false);
+      AOW.Music.resume();
+      check('music_resume', AOW.Music.isPaused() === false);
+      // visibility hook: simulate document.hidden flipping and confirm it drives pause/resume
+      try {
+        Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+        document.dispatchEvent(new Event('visibilitychange'));
+        check('music_visibility_pause', AOW.Music.isPaused() === true);
+        Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+        document.dispatchEvent(new Event('visibilitychange'));
+        check('music_visibility_resume', AOW.Music.isPaused() === false);
+      } catch (e) { check('music_visibility_hook', false, e.message); }
+      const playlistAll = AOW.Music.playlist();
+      check('music_playlist_by_mood', playlistAll && Array.isArray(playlistAll.peace) && playlistAll.peace.length > 0);
+      const listAll = AOW.Music.list();
+      check('music_list', Array.isArray(listAll) && listAll.length === Object.keys(AOW.Songs).length);
+
+      // shuffle without immediate repeat: 'peace' has several songs loaded (set_a+set_b) — walk next()
+      // several times and require no two consecutive picks share an id (pickNext always excludes current).
+      AOW.Music.setMood('peace');
+      AOW.Music.next();
+      const seq = [AOW.Music.nowPlaying() && AOW.Music.nowPlaying().id];
+      let onChangeCount = 0;
+      const offChange = AOW.Music.onChange(() => { onChangeCount++; });
+      for (let i = 0; i < 5; i++) { AOW.Music.next(); seq.push(AOW.Music.nowPlaying() && AOW.Music.nowPlaying().id); }
+      offChange();
+      let immediateRepeat = false;
+      for (let i = 1; i < seq.length; i++) if (seq[i] === seq[i - 1]) immediateRepeat = true;
+      check('music_shuffle_no_immediate_repeat', !immediateRepeat, seq.join(','));
+      check('music_onChange_fires', onChangeCount >= 5, 'count=' + onChangeCount);
+
+      const beforePrev = AOW.Music.nowPlaying() && AOW.Music.nowPlaying().id;
+      AOW.Music.prev();
+      const afterPrev = AOW.Music.nowPlaying() && AOW.Music.nowPlaying().id;
+      check('music_prev_changes_song', !!afterPrev && afterPrev !== beforePrev, beforePrev + '->' + afterPrev);
+
+      AOW.Music.setVolume(0.55);
+      const volAfter = AOW.Audio.getVolume();
+      check('music_setVolume', Math.abs(volAfter.music - 0.55) < 0.001, 'music=' + volAfter.music);
+      AOW.Music.setVolume(0.7); // restore default-ish so it doesn't leak into later volume expectations
+
+      AOW.Music.stop();
+      // drain the scheduler fully inside ctxM (disposes 'current'/'retiring' entries using ctxM's own
+      // clock) before handing AOW.Audio to a fresh context, so no stray tick() ever touches ctxC.
+      await ctxM.startRendering();
+    }
+
+    // ================================================================ 5. RENDER C — SFX bank (clean context)
+    let sfxReport = [];
+    {
+      const ctxC = new OfflineAudioContext(2, SR * 12, SR);
+      AOW.Audio.init({ ctx: ctxC, force: true });
+
+      // regression guard: organ/oboe build a cached PeriodicWave (module-level, keyed by name).
+      // ctxB above already primed that cache; confirm reusing it after a force-reinit onto this
+      // fresh context doesn't throw (Audio.init's force path also clears the cache defensively).
+      let waveCrossContextOk = true, waveErr = '';
+      try { AOW.Synth.instrument('organ').noteOn(60, 0.05, 0.5, 0.1); AOW.Synth.instrument('oboe').noteOn(64, 0.05, 0.5, 0.1); }
+      catch (e) { waveCrossContextOk = false; waveErr = e.message; }
+      check('periodicwave_survives_context_switch', waveCrossContextOk, waveErr);
+
+      // rate limiting: two calls to the same name back-to-back → second is dropped (<40ms apart).
+      // Uses names outside SFX_PLAN below so this doesn't eat the later representative-SFX calls.
+      const first = AOW.SFX.play('ui_close', { delay: 0.5 });
+      const second = AOW.SFX.play('ui_close', { delay: 0.5 });
+      check('sfx_rate_limited', first === true && second === false, 'first=' + first + ' second=' + second);
+      const different = AOW.SFX.play('ui_hover', { delay: 0.5 });
+      check('sfx_rate_limit_is_per_name', different === true);
+
+      // 12 representative SFX, each in its own clean window
+      const SFX_PLAN = [
+        ['ui_click', 1.0], ['sword_hit', 1.6], ['arrow_shoot', 2.1], ['crit', 2.6], ['heal', 3.1],
+        ['end_turn', 3.7], ['level_up', 4.4], ['spell_cast_order', 5.3], ['spell_cast_chaos', 6.7],
+        ['city_founded', 8.1], ['battle_start', 10.3], ['victory_fanfare', 11.7],
+      ];
+      for (const [name, delay] of SFX_PLAN) AOW.SFX.play(name, { delay });
+
+      const bufC = await ctxC.startRendering();
+      const monoC = toMono(bufC);
+      check('sfxC_no_nan', findNaN(monoC) < 0);
+      const peakC = peakOf(monoC);
+      check('sfxC_peak_lt_1', peakC < 1.0, peakC.toFixed(3));
+
+      for (const [name, delay] of SFX_PLAN) {
+        const t0 = 0.01 + delay;
+        const win = slice(monoC, SR, t0, t0 + 0.4);
+        const p = peakOf(win), r = rms(win);
+        const ok = p > 0.01 && p < 0.9;
+        check('sfx_' + name, ok, 'peak=' + p.toFixed(3) + ' rms=' + r.toFixed(4));
+        sfxReport.push({ name, peak: +p.toFixed(3), rms: +r.toFixed(4) });
+      }
+      const clickStep = maxStep(slice(monoC, SR, 0.0, 12.0));
+      check('sfxC_no_gross_discontinuity', clickStep < 0.6, 'maxStep=' + clickStep.toFixed(3));
+    }
+
+    // ================================================================ summary
+    const failed = checks.filter(c => !c.pass);
+    return {
+      ok: failed.length === 0,
+      passed: checks.length - failed.length,
+      total: checks.length,
+      failed: failed.map(c => ({ name: c.name, detail: c.detail })),
+      music: onsetReport,
+      piano: pianoReport,
+      strings: stringsReport,
+      sfxSample: sfxReport.slice(0, 4),
+    };
+  }
+
+  window.runAudioTest = runAudioTest;
+})();
+</script>
+</body>
+</html>
